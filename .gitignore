@@ -1,69 +1,21 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
+# ROS 2 / colcon build output and logs (same rules as the Demo)
+build
+install
+log
 *.log
-*.bak
-*.swp
 
-# vcpkg
-vcpkg_installed/
+# Machine-specific configuration (same rules as the Demo)
+brain_local.yaml
+vision_local.yaml
 
-# debug information files
-*.dwo
+# Local editor settings (same rule as the Demo)
+.vscode
 
-# test output & cache
-Testing/
-.cache/
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Keep the bundled .so and .a dependencies in src/vision/thirdparty/lib.
+# Ignore build output by directory, not all library files by extension.
