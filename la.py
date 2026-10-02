@@ -6,7 +6,8 @@ from vision_interface.msg import Detections
 # import cv2
 import os
 import numpy as np
-
+import matplotlib.pyplot as plt
+from collections import deque
 
 # please write a py file that sub to a ros2 topic named /align_depth
 # which is a standard ros topic that contains depth image.
@@ -148,14 +149,12 @@ class DepthImageSubscriber(Node):
     # cv2.imshow('Color Image', cv_image)
     # cv2.waitKey(1)
 
-
 def main(args=None):
     rclpy.init(args=args)
     depth_image_subscriber = DepthImageSubscriber()
     rclpy.spin(depth_image_subscriber)
     depth_image_subscriber.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
