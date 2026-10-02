@@ -161,18 +161,18 @@ void CalibrationNode::Init(const std::string cfg_path, bool is_offline, std::str
     std::string color_topic;
     std::string intrin_topic;
     if (camera_type_.find("zed") != std::string::npos) {
-        color_topic = "/zed/zed_node/left/image_rect_color";
-        intrin_topic = "/zed/zed_node/left/camera_info";
+        color_topic = "/boostercamera/head/rgb";
+        intrin_topic = "/boostercamera/head/depth/camera_info";
     } else if (camera_type_ == "d-robotics") {
-        color_topic = "/booster_camera_bridge/StereoNetNode/rectified_image";
-        intrin_topic = "/booster_camera_bridge/image_left_raw/camera_info";
+        color_topic = "/boostercamera/head/rgb";
+        intrin_topic = "/boostercamera/head/depth/camera_info";
     } else if (camera_type_ == "orbbec") {
-        color_topic = "/camera/color/image_raw";
-        intrin_topic = "/camera/color/camera_info";
+        color_topic = "/boostercamera/head/rgb";
+        intrin_topic = "/boostercamera/head/depth/camera_info";
     } else {
         // realsense
-        color_topic = "/camera/camera/color/image_raw";
-        intrin_topic = "/camera/camera/color/camera_info";
+        color_topic = "/boostercamera/head/rgb";
+        intrin_topic = "/boostercamera/head/depth/camera_info";
     }
 
     it_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
@@ -392,7 +392,7 @@ void CalibrationNode::RunExtrinsicCalibrationProcess(const SyncedDataBlock &data
                 }
                 std::ofstream sys_cfg("/opt/booster/vision.yaml");
                 if (!sys_cfg) {
-                    std::cerr << "failed to open /opt/booster/vision.yaml for writing (permission required?)" << std::endl;
+                    // std::cerr << "failed to open /opt/booster/vision.yaml for writing (permission required?)" << std::endl;
                     // fallback: write to /tmp and print next-step command
                     std::ostringstream oss;
                     oss << new_cfg_node;
@@ -613,7 +613,7 @@ void CalibrationNode::RunExtrinsicOffsetCalibrationProcess(const SyncedDataBlock
                 }
                 std::ofstream sys_cfg("/opt/booster/vision.yaml");
                 if (!sys_cfg) {
-                    std::cerr << "failed to open /opt/booster/vision.yaml for writing (permission required?)" << std::endl;
+                    // std::cerr << "failed to open /opt/booster/vision.yaml for writing (permission required?)" << std::endl;
                     // fallback: write to /tmp and print next-step command
                     std::ostringstream oss;
                     oss << new_cfg_node;

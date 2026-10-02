@@ -9,29 +9,20 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
-find_package(std_msgs REQUIRED)
 
 # 生成消息文件
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BoosterApiReqMsg.msg"
   "msg/BoosterApiRespMsg.msg"
-  "msg/ButtonEventMsg.msg"
   "msg/MotorState.msg"
   "msg/MotorCmd.msg"
   "msg/LowCmd.msg"
   "msg/ImuState.msg"
   "msg/LowState.msg"
   "msg/RawBytesMsg.msg"
-  "msg/RawBytesStamped.msg"
   "msg/Odometer.msg"
-  "msg/FallDownState.msg"
   "msg/RemoteControllerState.msg"
-  "msg/HandCommand.msg"
-  "msg/HandDdsMsg.msg"
-  "msg/HandParam.msg"
   "srv/RpcService.srv"
-  "srv/AgentService.srv"
-  DEPENDENCIES std_msgs
 )
 
 # 安装头文件

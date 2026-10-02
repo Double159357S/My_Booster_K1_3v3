@@ -12,6 +12,10 @@
          </ReactiveSequence>
          <ReactiveSequence _while="!gc_is_sub_state_kickoff_side" name="移动到防守点球位置">
             <CamTrackBall _while="ball_location_known" />
+            <CamFindBall
+               _while="gc_opponent_set_play_search_direction != 0 &amp;&amp; !ball_location_known" />
+            <MoveToFarSetPlaySearchArea
+               _while="gc_opponent_set_play_search_direction != 0" />
             <CalcKickDir />
             <SubTree ID="FindBall" _while="!(ball_location_known || tm_ball_pos_reliable)" _autoremap="true" />
             <GoToFreekickPosition _while="ball_location_known || tm_ball_pos_reliable" side="defense" />

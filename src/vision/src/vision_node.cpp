@@ -1,9 +1,15 @@
 #include "booster_vision/vision_node.h"
 
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <functional>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <fstream>
 
@@ -24,6 +30,90 @@
 
 namespace booster_vision {
 
+namespace {
+
+bool IntrinsicsEquivalent(const Intrinsics &lhs, const Intrinsics &rhs) {
+    constexpr float kTolerance = 1e-5f;
+    const auto nearly_equal = [kTolerance](float a, float b) {
+        return std::abs(a - b) <= kTolerance * std::max(1.0f, std::max(std::abs(a), std::abs(b)));
+    };
+    if (!nearly_equal(lhs.fx, rhs.fx) || !nearly_equal(lhs.fy, rhs.fy) ||
+        !nearly_equal(lhs.cx, rhs.cx) || !nearly_equal(lhs.cy, rhs.cy) ||
+        lhs.model != rhs.model || lhs.distortion_coeffs.size() != rhs.distortion_coeffs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.distortion_coeffs.size(); ++i) {
+        if (!nearly_equal(lhs.distortion_coeffs[i], rhs.distortion_coeffs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string NormalizeCameraInfoModel(std::string model) {
+    std::transform(model.begin(), model.end(), model.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    model.erase(std::remove_if(model.begin(), model.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }), model.end());
+    return model;
+}
+
+void DrawPositionLabels(cv::Mat &image,
+                        const std::vector<DetectionRes> &detections,
+                        const std::vector<cv::Point2f> &positions) {
+    const size_t count = std::min(detections.size(), positions.size());
+    constexpr double kFontScale = 0.5;
+    constexpr int kTextThickness = 1;
+    constexpr int kPadding = 3;
+
+    for (size_t i = 0; i < count; ++i) {
+        const auto &position = positions[i];
+        if (!std::isfinite(position.x) || !std::isfinite(position.y)) {
+            continue;
+        }
+
+        std::ostringstream stream;
+        stream << std::fixed << std::setprecision(2)
+               << "x=" << position.x << "m y=" << position.y << "m";
+        const std::string label = stream.str();
+
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(
+            label, cv::FONT_HERSHEY_SIMPLEX, kFontScale, kTextThickness, &baseline);
+        const auto &bbox = detections[i].bbox;
+        const int max_text_x = std::max(0, image.cols - text_size.width - 2 * kPadding);
+        const int text_x = std::clamp(bbox.x, 0, max_text_x) + kPadding;
+
+        int text_y = bbox.y + bbox.height + text_size.height + 2 * kPadding;
+        if (text_y + baseline + kPadding >= image.rows) {
+            text_y = bbox.y - 2 * kPadding;
+        }
+        text_y = std::clamp(
+            text_y, text_size.height + kPadding,
+            std::max(text_size.height + kPadding, image.rows - baseline - kPadding));
+
+        const cv::Point background_top_left(
+            text_x - kPadding, text_y - text_size.height - kPadding);
+        const cv::Point background_bottom_right(
+            text_x + text_size.width + kPadding, text_y + baseline + kPadding);
+        cv::rectangle(image, background_top_left, background_bottom_right,
+                      cv::Scalar(0, 0, 0), cv::FILLED);
+        cv::putText(image, label, cv::Point(text_x, text_y),
+                    cv::FONT_HERSHEY_SIMPLEX, kFontScale,
+                    cv::Scalar(255, 255, 255), kTextThickness, cv::LINE_AA);
+    }
+}
+
+bool IsFiniteProjection(const std::vector<float> &position) {
+    return position.size() >= 3 &&
+           std::all_of(position.begin(), position.begin() + 3,
+                       [](float value) { return std::isfinite(value); });
+}
+
+} // namespace
+
 VisionNode::VisionNode(const std::string &node_name) :
     rclcpp::Node(node_name) {
     this->declare_parameter<bool>("offline_mode", false);
@@ -35,6 +125,8 @@ VisionNode::VisionNode(const std::string &node_name) :
     this->declare_parameter<std::string>("detection_model_path", "");
     this->declare_parameter<std::string>("segmentation_model_path", "");
     this->declare_parameter<std::string>("camera_type", "");
+    this->declare_parameter<std::string>("camera_info_topic", "");
+    this->declare_parameter<double>("intrinsics_wait_timeout_sec", -1.0);
 }
 
 // TODO(GW): oneline offline
@@ -114,7 +206,28 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
             std::cout << "camera type not overridden by launch file, using default: " << node["camera"]["type"].as<std::string>() << std::endl;
             camera_type_ = node["camera"]["type"].as<std::string>();
         }
-        intr_ = Intrinsics(node["camera"]["intrin"]);
+        yaml_intr_ = Intrinsics(node["camera"]["intrin"]);
+        intr_ = yaml_intr_;
+        const std::string configured_camera_info_topic = as_or<std::string>(
+            node["camera"]["camera_info_topic"], camera_info_topic_);
+        if (!configured_camera_info_topic.empty()) {
+            camera_info_topic_ = configured_camera_info_topic;
+        }
+        intrinsics_wait_timeout_sec_ = std::max(
+            0.0, as_or<double>(
+                node["camera"]["intrin_wait_timeout_sec"], intrinsics_wait_timeout_sec_));
+        std::string camera_info_topic_override;
+        double intrinsics_wait_timeout_override = -1.0;
+        this->get_parameter<std::string>("camera_info_topic", camera_info_topic_override);
+        this->get_parameter<double>(
+            "intrinsics_wait_timeout_sec", intrinsics_wait_timeout_override);
+        if (!camera_info_topic_override.empty()) {
+            camera_info_topic_ = camera_info_topic_override;
+        }
+        if (std::isfinite(intrinsics_wait_timeout_override) &&
+            intrinsics_wait_timeout_override >= 0.0) {
+            intrinsics_wait_timeout_sec_ = intrinsics_wait_timeout_override;
+        }
         p_eye2head_ = as_or<Pose>(node["camera"]["extrin"], Pose());
 
         float pitch_comp = as_or<float>(node["camera"]["pitch_compensation"], 0.0);
@@ -166,7 +279,9 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
     bool save_data_nonstationary = as_or<bool>(node["misc"]["save_data_nonstationary"], true);
     std::string log_root = std::string(std::getenv("HOME")) + "/Workspace/vision_log/" + getTimeString();
     data_logger_ = save_data_ ? std::make_shared<DataLogger>(log_root, save_data_nonstationary) : nullptr;
-    data_logger_->LogYAML(node, "vision_local.yaml");
+    if (data_logger_) {
+        data_logger_->LogYAML(node, "vision_local.yaml");
+    }
     seg_data_syncer_ = std::make_shared<DataSyncer>(false);
 
     // init robot color classifier
@@ -197,24 +312,42 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
         line_segment_area_threshold_ = as_or<int>(node["field_marker_pose_estimator"]["line_segment_area_threshold"], 75);
     }
 
+    intrinsics_wait_start_ = std::chrono::steady_clock::now();
+    if (offline_mode_) {
+        intrinsics_source_ = IntrinsicsSource::kYamlFallback;
+        RCLCPP_INFO(
+            get_logger(),
+            "[vision][intrinsics] offline mode: using YAML intrinsics "
+            "fx=%.6f fy=%.6f cx=%.6f cy=%.6f",
+            yaml_intr_.fx, yaml_intr_.fy, yaml_intr_.cx, yaml_intr_.cy);
+    } else {
+        intrinsics_fallback_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),
+            [this]() { ActivateYamlIntrinsicsIfTimedOut(); });
+        RCLCPP_INFO(
+            get_logger(),
+            "[vision][intrinsics] waiting up to %.3f s for CameraInfo topic %s",
+            intrinsics_wait_timeout_sec_, camera_info_topic_.c_str());
+    }
+
     // init ros related
 
     std::cout << "current camera_type : " << camera_type_ << std::endl;
     std::string color_topic;
     std::string depth_topic;
     if (camera_type_.find("zed") != std::string::npos) {
-        color_topic = "/zed/zed_node/left/image_rect_color";
-        depth_topic = "/zed/zed_node/depth/depth_registered";
+        color_topic = "/boostercamera/head/rgb";
+        depth_topic = "/boostercamera/head/depth";
     } else if (camera_type_ == "d-robotics") {
-        color_topic = "/booster_camera_bridge/StereoNetNode/rectified_image";
-        depth_topic = "/booster_camera_bridge/StereoNetNode/stereonet_depth";
+        color_topic = "/boostercamera/head/rgb";
+        depth_topic = "/boostercamera/head/depth";
     } else if (camera_type_ == "orbbec") {
-        color_topic = "/camera/color/image_raw";
-        depth_topic = "/camera/depth/image_raw";
+        color_topic = "/boostercamera/head/rgb";
+        depth_topic = "/boostercamera/head/depth";
     } else {
         // realsense
-        color_topic = "/camera/camera/color/image_raw";
-        depth_topic = "/camera/camera/aligned_depth_to_color/image_raw";
+        color_topic = "/boostercamera/head/rgb";
+        depth_topic = "/boostercamera/head/depth";
     }
 
     callback_group_sub_1_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -248,6 +381,13 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
     } 
     if (use_depth_) {
         depth_sub_ = it_->subscribe(depth_topic, 2, &VisionNode::DepthCallback, this, nullptr, sub_opt_3);
+    }
+
+    if (!offline_mode_) {
+        const auto camera_info_qos = rclcpp::SensorDataQoS();
+        camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+            camera_info_topic_, camera_info_qos,
+            std::bind(&VisionNode::CameraInfoCallback, this, std::placeholders::_1), sub_opt_1);
     }
 
     // auto qos_profile = rclcpp::QoS(rclcpp::KeepLast(1))
@@ -289,7 +429,232 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
     }
 }
 
+void VisionNode::UpdatePoseEstimatorIntrinsicsLocked() {
+    for (auto &item : pose_estimator_map_) {
+        if (item.second) {
+            item.second->SetIntrinsics(intr_);
+        }
+    }
+}
+
+void VisionNode::ApplyRuntimeIntrinsics(const Intrinsics &intrinsics, IntrinsicsSource source,
+                                        uint32_t image_width, uint32_t image_height) {
+    if (!std::isfinite(intrinsics.fx) || !std::isfinite(intrinsics.fy) ||
+        !std::isfinite(intrinsics.cx) || !std::isfinite(intrinsics.cy) ||
+        intrinsics.fx <= 0.0f || intrinsics.fy <= 0.0f) {
+        return;
+    }
+
+    bool changed = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(intrinsics_mutex_);
+        if (image_width > 0 && image_height > 0 && active_camera_image_width_ > 0 &&
+            active_camera_image_height_ > 0 &&
+            (active_camera_image_width_ != image_width || active_camera_image_height_ != image_height)) {
+            return;
+        }
+
+        if (source == IntrinsicsSource::kTopic) {
+            camera_info_width_ = image_width;
+            camera_info_height_ = image_height;
+        }
+        changed = intrinsics_source_ != source || !IntrinsicsEquivalent(intr_, intrinsics);
+        if (changed) {
+            intr_ = intrinsics;
+            UpdatePoseEstimatorIntrinsicsLocked();
+            intrinsics_source_ = source;
+        }
+    }
+
+    if (source == IntrinsicsSource::kTopic && intrinsics_fallback_timer_) {
+        intrinsics_fallback_timer_->cancel();
+    }
+    if (changed) {
+        RCLCPP_INFO(
+            get_logger(),
+            "[vision][intrinsics] using %s intrinsics: fx=%.6f fy=%.6f cx=%.6f cy=%.6f",
+            source == IntrinsicsSource::kTopic ? "CameraInfo topic" : "YAML fallback",
+            intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy);
+    }
+}
+
+void VisionNode::UpdateActiveCameraImageSize(uint32_t image_width, uint32_t image_height) {
+    if (image_width == 0 || image_height == 0) {
+        return;
+    }
+
+    bool reverted_to_yaml = false;
+    uint32_t info_width = 0;
+    uint32_t info_height = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(intrinsics_mutex_);
+        active_camera_image_width_ = image_width;
+        active_camera_image_height_ = image_height;
+        if (intrinsics_source_ == IntrinsicsSource::kTopic && camera_info_width_ > 0 &&
+            camera_info_height_ > 0 &&
+            (camera_info_width_ != image_width || camera_info_height_ != image_height)) {
+            info_width = camera_info_width_;
+            info_height = camera_info_height_;
+            intr_ = yaml_intr_;
+            UpdatePoseEstimatorIntrinsicsLocked();
+            intrinsics_source_ = IntrinsicsSource::kYamlFallback;
+            reverted_to_yaml = true;
+        }
+    }
+
+    if (reverted_to_yaml) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[vision][intrinsics] CameraInfo size %ux%u does not match image size %ux%u; "
+            "using YAML intrinsics for the current image",
+            info_width, info_height, image_width, image_height);
+    }
+}
+
+void VisionNode::ActivateYamlIntrinsicsIfTimedOut() {
+    const double elapsed_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - intrinsics_wait_start_).count();
+    if (elapsed_sec < intrinsics_wait_timeout_sec_) {
+        return;
+    }
+
+    bool activated = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(intrinsics_mutex_);
+        if (intrinsics_source_ == IntrinsicsSource::kWaiting) {
+            intr_ = yaml_intr_;
+            UpdatePoseEstimatorIntrinsicsLocked();
+            intrinsics_source_ = IntrinsicsSource::kYamlFallback;
+            activated = true;
+        }
+    }
+    if (intrinsics_fallback_timer_) {
+        intrinsics_fallback_timer_->cancel();
+    }
+    if (activated) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[vision][intrinsics] no valid CameraInfo received within %.3f s; "
+            "using YAML fallback (fx=%.6f fy=%.6f cx=%.6f cy=%.6f)",
+            intrinsics_wait_timeout_sec_, yaml_intr_.fx, yaml_intr_.fy, yaml_intr_.cx, yaml_intr_.cy);
+    }
+}
+
+bool VisionNode::EnsureIntrinsicsReady() {
+    {
+        std::shared_lock<std::shared_mutex> lock(intrinsics_mutex_);
+        if (intrinsics_source_ != IntrinsicsSource::kWaiting) {
+            return true;
+        }
+    }
+    ActivateYamlIntrinsicsIfTimedOut();
+    std::shared_lock<std::shared_mutex> lock(intrinsics_mutex_);
+    return intrinsics_source_ != IntrinsicsSource::kWaiting;
+}
+
+void VisionNode::CameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+    if (!msg) {
+        return;
+    }
+
+    const float fx = static_cast<float>(msg->k[0]);
+    const float fy = static_cast<float>(msg->k[4]);
+    const float cx = static_cast<float>(msg->k[2]);
+    const float cy = static_cast<float>(msg->k[5]);
+    if (msg->width == 0 || msg->height == 0 ||
+        !std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(cx) || !std::isfinite(cy) ||
+        fx <= 0.0f || fy <= 0.0f) {
+        RCLCPP_WARN(get_logger(), "[vision][intrinsics] ignoring invalid CameraInfo dimensions or K matrix");
+        return;
+    }
+
+    uint32_t image_width = 0;
+    uint32_t image_height = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(intrinsics_mutex_);
+        image_width = active_camera_image_width_;
+        image_height = active_camera_image_height_;
+    }
+    if (image_width > 0 && image_height > 0 &&
+        (image_width != msg->width || image_height != msg->height)) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[vision][intrinsics] ignoring CameraInfo size %ux%u for image size %ux%u",
+            msg->width, msg->height, image_width, image_height);
+        return;
+    }
+
+    const uint32_t effective_binning_x = msg->binning_x == 0 ? 1 : msg->binning_x;
+    const uint32_t effective_binning_y = msg->binning_y == 0 ? 1 : msg->binning_y;
+    const bool nontrivial_binning = effective_binning_x != 1 || effective_binning_y != 1;
+    const bool roi_dimensions_set = msg->roi.width != 0 || msg->roi.height != 0;
+    const bool roi_is_full_image =
+        msg->roi.x_offset == 0 && msg->roi.y_offset == 0 &&
+        (!roi_dimensions_set ||
+         (msg->roi.width == msg->width && msg->roi.height == msg->height));
+    const bool nontrivial_roi = !roi_is_full_image || msg->roi.do_rectify;
+    if (nontrivial_binning || nontrivial_roi) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[vision][intrinsics] ignoring CameraInfo with binning/ROI that does not match "
+            "the raw image (binning=%ux%u, roi=(%u,%u,%u,%u), rectify=%d)",
+            effective_binning_x, effective_binning_y,
+            msg->roi.x_offset, msg->roi.y_offset, msg->roi.width, msg->roi.height,
+            msg->roi.do_rectify ? 1 : 0);
+        return;
+    }
+
+    std::vector<float> distortion_coeffs(msg->d.begin(), msg->d.end());
+    if (std::any_of(distortion_coeffs.begin(), distortion_coeffs.end(),
+                    [](float coeff) { return !std::isfinite(coeff); })) {
+        RCLCPP_WARN(get_logger(), "[vision][intrinsics] ignoring CameraInfo with non-finite distortion coefficients");
+        return;
+    }
+
+    const std::string model_name = NormalizeCameraInfoModel(msg->distortion_model);
+    const bool has_distortion = std::any_of(
+        distortion_coeffs.begin(), distortion_coeffs.end(),
+        [](float coeff) { return std::abs(coeff) > std::numeric_limits<float>::epsilon(); });
+    Intrinsics::DistortionModel model = Intrinsics::DistortionModel::kNone;
+    size_t minimum_coefficients = 0;
+    if (model_name.empty() || model_name == "none") {
+        model = Intrinsics::DistortionModel::kNone;
+    } else if (model_name == "plumb_bob") {
+        model = Intrinsics::DistortionModel::kBrownConrady;
+        minimum_coefficients = 5;
+    } else if (model_name == "rational_polynomial") {
+        model = Intrinsics::DistortionModel::kBrownConrady;
+        minimum_coefficients = 8;
+    } else if (model_name == "inverse_brown_conrady") {
+        model = Intrinsics::DistortionModel::kInverseBrownConrady;
+        minimum_coefficients = 5;
+    } else {
+        RCLCPP_WARN(
+            get_logger(), "[vision][intrinsics] unsupported CameraInfo distortion_model '%s'",
+            msg->distortion_model.c_str());
+        return;
+    }
+    if (has_distortion && (model == Intrinsics::DistortionModel::kNone ||
+                           distortion_coeffs.size() < minimum_coefficients)) {
+        RCLCPP_WARN(
+            get_logger(),
+            "[vision][intrinsics] distortion_model '%s' has insufficient coefficients (%zu, need %zu)",
+            msg->distortion_model.c_str(), distortion_coeffs.size(), minimum_coefficients);
+        return;
+    }
+
+    if (!has_distortion) {
+        ApplyRuntimeIntrinsics(
+            Intrinsics(fx, fy, cx, cy), IntrinsicsSource::kTopic, msg->width, msg->height);
+    } else {
+        ApplyRuntimeIntrinsics(
+            Intrinsics(fx, fy, cx, cy, distortion_coeffs, model),
+            IntrinsicsSource::kTopic, msg->width, msg->height);
+    }
+}
+
 void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg::Detections &detection_msg) {
+    std::shared_lock<std::shared_mutex> intrinsics_lock(intrinsics_mutex_);
     double timestamp = synced_data.color_data.timestamp;
     double depth_time_diff = (timestamp - synced_data.depth_data.timestamp) * 1000;
     double pose_time_diff = (timestamp - synced_data.pose_data.timestamp) * 1000;
@@ -375,6 +740,7 @@ void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg
     }
 
     std::vector<booster_vision::DetectionRes> detections_for_display;
+    std::vector<cv::Point2f> positions_for_display;
     for (auto &detection : filtered_detections) {
         vision_interface::msg::DetectedObject detection_obj;
 
@@ -389,7 +755,15 @@ void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg
             std::cout << "filtered out ball detection by depth" << std::endl;
             continue;
         }
-        detection_obj.position_projection = pose_obj_by_color.getTranslationVec();
+        const auto projected_position = pose_obj_by_color.getTranslationVec();
+        if (pose_obj_by_color == Pose() || !IsFiniteProjection(projected_position)) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "discarding %s detection with invalid ground intersection",
+                detection.class_name.c_str());
+            continue;
+        }
+        detection_obj.position_projection = projected_position;
         detection_obj.position = pose_obj_by_depth.getTranslationVec();
 
         auto xyz = p_head2base.getTranslationVec();
@@ -415,6 +789,7 @@ void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg
         // publish detection
         detection_msg.detected_objects.push_back(detection_obj);
         detections_for_display.push_back(detection);
+        positions_for_display.emplace_back(projected_position[0], projected_position[1]);
     }
 
     // compute corner points positision
@@ -453,14 +828,13 @@ void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg
     ball_msg.confidence = 0;
     for (auto &detection : filtered_detections) {
         if (detection.class_name == "Ball" && detection.confidence > ball_msg.confidence) {
-            if (detection.confidence <= ball_msg.confidence) {
-               continue;
-            }
-
             auto pose_estimator = get_estimator(detection.class_name);
             Pose pose_obj_by_color = pose_estimator->EstimateByColor(p_eye2base, detection, color);
+            if (pose_obj_by_color == Pose()) {
+                continue;
+            }
             auto value = pose_obj_by_color.getTranslationVec();
-            if (value[0] < -2 || value[0] > 10 || value[1] < -5 || value[1] > 5) {
+            if (!IsFiniteProjection(value) || value[0] < -2 || value[0] > 10 || value[1] < -5 || value[1] > 5) {
                 continue;
             }
             ball_msg.x = value[0];
@@ -476,6 +850,7 @@ void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg
         cv::Mat color_rgb;
         cv::cvtColor(color, color_rgb, cv::COLOR_BGR2RGB);
         cv::Mat img_out = YoloV8Detector::DrawDetection(color_rgb, detections_for_display);
+        DrawPositionLabels(img_out, detections_for_display, positions_for_display);
         cv::imshow("Detection", img_out);
 
         // color jet depth_float and show
@@ -519,6 +894,15 @@ void VisionNode::ColorCallback(const sensor_msgs::msg::Image::ConstSharedPtr &ms
         return;
     }
 
+    UpdateActiveCameraImageSize(msg->width, msg->height);
+    if (!EnsureIntrinsicsReady()) {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "[vision][intrinsics] dropping color frame while waiting for CameraInfo topic %s",
+            camera_info_topic_.c_str());
+        return;
+    }
+
     if (camera_type_ == "realsense") {
         cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
     }
@@ -537,6 +921,7 @@ void VisionNode::ColorCallback(const sensor_msgs::msg::Image::ConstSharedPtr &ms
 }
 
 void VisionNode::ProcessSegmentationData(SyncedDataBlock &synced_data, vision_interface::msg::LineSegments &field_line_segs_msg) {
+    std::shared_lock<std::shared_mutex> intrinsics_lock(intrinsics_mutex_);
     double timestamp = synced_data.color_data.timestamp;
     cv::Mat color = synced_data.color_data.data;
     Pose p_head2base = synced_data.pose_data.data;
@@ -603,6 +988,15 @@ void VisionNode::SegmentationCallback(const sensor_msgs::msg::Image::ConstShared
         img = toCVMat(*msg).clone();
     } catch (std::exception &e) {
         std::cerr << "cv_bridge exception: " << e.what() << std::endl;
+        return;
+    }
+
+    UpdateActiveCameraImageSize(msg->width, msg->height);
+    if (!EnsureIntrinsicsReady()) {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "[vision][intrinsics] dropping segmentation frame while waiting for CameraInfo topic %s",
+            camera_info_topic_.c_str());
         return;
     }
 

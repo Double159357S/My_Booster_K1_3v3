@@ -1,5 +1,6 @@
 #include "brain_config.h"
 #include "utils/print.h"
+#include <cctype>
 
 void BrainConfig::calcMapLines() {
     auto fd = fieldDimensions;
@@ -224,6 +225,12 @@ void BrainConfig::calcMapMarkings() {
 
 void BrainConfig::handle()
 {
+    // playerStartPos[left, right]
+    if (playerStartPos != "left" && playerStartPos != "right")
+    {
+        throw invalid_argument("palyer_start_pos must be one of [left, right]. Got: " + playerStartPos);
+    }
+
     // playerRole [striker, goal_keeper]
     if (playerRole != "striker" && playerRole != "goal_keeper")
     {
@@ -245,7 +252,7 @@ void BrainConfig::handle()
     {
         fieldDimensions = FD_KIDSIZE;
     }
-    else if (fieldType == "robo_league")
+        else if (fieldType == "robo_league")
     {
         fieldDimensions = FD_ROBOLEAGUE;
     }
@@ -253,6 +260,28 @@ void BrainConfig::handle()
     {
         throw invalid_argument("[Error] fieldType must be one of [adult_size, kid_size, robo_league]. Got: " + fieldType);
     }
+
+    string getUpVersionLower;
+    getUpVersionLower.reserve(recoveryGetUpVersion.size());
+    for (unsigned char c : recoveryGetUpVersion) {
+        getUpVersionLower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    if (getUpVersionLower != "kv1" && getUpVersionLower != "v1" &&
+        getUpVersionLower != "kv2" && getUpVersionLower != "v2") {
+        throw invalid_argument(
+            "[Error] recovery.get_up_version must be one of [kV1, kV2]. Got: " +
+            recoveryGetUpVersion);
+    }
+
+    string verLower;
+    verLower.reserve(RLVisionKickVisualKickVersion.size());
+    for (unsigned char c : RLVisionKickVisualKickVersion) {
+        verLower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    if (verLower != "kv1" && verLower != "v1" && verLower != "kv2" && verLower != "v2") {
+        throw invalid_argument("[Error] RLVisionKick.visual_kick_version must be one of [kV1, kV2]. Got: " + RLVisionKickVisualKickVersion);
+    }
+
     calcMapLines();
     calcMapMarkings();
 }
@@ -266,6 +295,7 @@ void BrainConfig::print(ostream &os)
     os << "    playerId = " << playerId << endl;
     os << "    fieldType = " << fieldType << endl;
     os << "    playerRole = " << playerRole << endl;
+    os << "    playerStartPos = " << playerStartPos << endl;
     os << "    treatPersonAsRobot = " << treatPersonAsRobot << endl;
     os << "    numOfPlayers = " << numOfPlayers << endl;
     os << "----------------------------------------" << endl;
@@ -280,6 +310,8 @@ void BrainConfig::print(ostream &os)
     os << "----------------------------------------" << endl;
     os << "Strategy:" << endl;
     os << "    ballConfidenceThreshold = " << ballConfidenceThreshold << endl;
+    os << "    ballConfidenceDecayRate = " << ballConfidenceDecayRate << endl;
+
     os << "----------------------------------------" << endl;
     os << "Locator:" << endl;
     os << "    pfMinMarkerCnt = " << pfMinMarkerCnt << endl;
@@ -299,5 +331,11 @@ void BrainConfig::print(ostream &os)
     os << "Sound:" << endl;
     os << "    enable = " << soundEnable << endl;
     os << "    soundPack = " << soundPack << endl;
+    os << "----------------------------------------" << endl;
+    os << "Recovery:" << endl;
+    os << "    getUpVersion = " << recoveryGetUpVersion << endl;
+    os << "----------------------------------------" << endl;
+    os << "RLVisionKick:" << endl;
+    os << "    visualKickVersion = " << RLVisionKickVisualKickVersion << endl;
     os << "----------------------------------------" << endl;
 }

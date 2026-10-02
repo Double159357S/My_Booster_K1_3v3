@@ -4,7 +4,7 @@ cd `dirname $0`
 cd ..
 
 source ./install/setup.bash
-export FASTRTPS_DEFAULT_PROFILES_FILE=./configs/fastdds.xml
+#export FASTRTPS_DEFAULT_PROFILES_FILE=./configs/fastdds.xml
 
 ros2 run vision calibration_node handeye ./src/vision/config/vision.yaml
 sudo cp /tmp/vision.yaml /opt/booster/vision.yaml && \

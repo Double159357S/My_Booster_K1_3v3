@@ -33,16 +33,16 @@ if [ ! -d "$vision_config_src_dir" ]; then    # 注意这里修复了原来的�
     mkdir -p "$vision_config_src_dir"
 fi
 
-cp -r "$root_path/install" "$package_dir"
-cp -r "$root_path/scripts" "$package_dir"
-cp -r "$root_path/utils" "$package_dir"
-cp -r "$root_path/configs" "$package_dir"
-cp -r "$root_path/src/vision/model/"* "$vision_model_src_dir"
-cp -r "$root_path/src/vision/config/"* "$vision_config_src_dir"
+rsync -aL "$root_path/install/" "$package_dir/install/"
+rsync -aL "$root_path/scripts/" "$package_dir/scripts/"
+rsync -aL "$root_path/utils/" "$package_dir/utils/"
+rsync -aL "$root_path/configs/" "$package_dir/configs/"
+rsync -aL "$root_path/src/vision/model/" "$vision_model_src_dir"
+rsync -aL "$root_path/src/vision/config/" "$vision_config_src_dir"
 cp "$root_path/distribution/install.sh" "$package_dir"
 chmod +x "$root_path/distribution/install.sh"
 
 echo "Copy success"
 
-makeself "$package_dir" "$root_path/distribution/packages/robocup_$git_commit_id.run" "Booster Robocup Installer" "./install.sh"
+makeself --tar-format pax "$package_dir" "$root_path/distribution/packages/robocup_$git_commit_id.run" "Booster Robocup Installer" "./install.sh"
 echo "Installer generated."

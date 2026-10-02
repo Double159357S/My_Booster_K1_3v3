@@ -94,7 +94,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'segmentation_model_path',
-            default_value="model/best_seg_orin_10.3.engine",
+            default_value="",
             description="param to override segmentation_model.model_path. will not override if empty"
         ),
         DeclareLaunchArgument(

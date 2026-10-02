@@ -10,5 +10,5 @@ rm -rf /home/booster/Workspace/robocup
 mkdir -p /home/booster/Workspace/robocup
 
 cp -r $root_path/* /home/booster/Workspace/robocup
-bash /home/booster/Workspace/robocup/utils/install_auto_start_assist.sh
+bash /home/booster/Workspace/robocup/utils/install_auto_start_assist.sh #自启动
 echo "Install success"

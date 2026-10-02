@@ -1,12 +1,19 @@
-/*  作用：接收感知和比赛数据，更新记忆、定位相关状态、协作信息
-    何时修改：增加状态量、数据处理、全局判断
-*/
 #include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
 #include <string>
 #include <fstream>  // 添加这一行
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <cctype>
 #include <yaml-cpp/yaml.h>  // 添加这一行
 
 #include "brain.h"
+#include "utils/kick_geometry.h"
 #include "utils/print.h"
 #include "utils/math.h"
 #include "utils/misc.h"
@@ -18,6 +25,55 @@ using namespace std;
 using std::placeholders::_1;
 
 #define SUB_STATE_QUEUE_SIZE 1
+
+namespace
+{
+bool extractJsonIntField(const std::string &json, const std::string &field, int *value)
+{
+    if (value == nullptr)
+        return false;
+
+    const std::string key = "\"" + field + "\"";
+    size_t pos = json.find(key);
+    if (pos == std::string::npos)
+        return false;
+
+    pos = json.find(':', pos + key.size());
+    if (pos == std::string::npos)
+        return false;
+
+    ++pos;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+        ++pos;
+    if (pos < json.size() && json[pos] == '"')
+        ++pos;
+
+    const size_t start = pos;
+    if (pos < json.size() && (json[pos] == '-' || json[pos] == '+'))
+        ++pos;
+    while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos])))
+        ++pos;
+
+    if (pos == start ||
+        (pos == start + 1 && (json[start] == '-' || json[start] == '+')))
+        return false;
+
+    try {
+        *value = std::stoi(json.substr(start, pos - start));
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
+}
+
+double pitchToGroundObject(double robotHeight, double horizontalRange)
+{
+    // GameObject::range is the XY-plane distance, not the camera-to-object
+    // hypotenuse. atan2 is therefore the correct geometry and stays defined
+    // for a ground object directly below the robot (horizontalRange == 0).
+    return std::atan2(robotHeight, horizontalRange);
+}
+} // namespace
 
 Brain::Brain() : rclcpp::Node("brain_node")
 {
@@ -32,8 +88,14 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<string>("game.field_type", "");
 
     declare_parameter<string>("game.player_role", "");
+    declare_parameter<string>("game.player_start_pos", "left");
     declare_parameter<bool>("game.treat_person_as_robot", false);
     declare_parameter<int>("game.number_of_players", 2);
+
+    declare_parameter<double>("ball_predictor.step_interval", 100.0);
+    declare_parameter<int>("ball_predictor.step_cnt", 50);
+    declare_parameter<double>("ball_predictor.acceleration", -0.35);
+    declare_parameter<double>("ball_predictor.speed_friction_factor", 0.45);
 
     declare_parameter<double>("robot.robot_height", 1.0);
     declare_parameter<double>("robot.odom_factor", 1.0);
@@ -43,24 +105,64 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("robot.vy_limit", 0.4);
     declare_parameter<double>("robot.vtheta_limit", 1.0);
 
-    declare_parameter<double>("strategy.ball_confidence_threshold", 50.0);   
+    declare_parameter<double>("strategy.ball_confidence_threshold", 50.0);
+    declare_parameter<double>("strategy.ball_confidence_decay_rate", 3.0);
+    declare_parameter<bool>("strategy.enable_stable_kick", false);
     declare_parameter<double>("strategy.ball_memory_timeout", 3.0);
+    declare_parameter<double>("strategy.ball_lost_msecs", 1000.0);
     declare_parameter<double>("strategy.tm_ball_dist_threshold", 3.0);
     declare_parameter<bool>("strategy.limit_near_ball_speed", true);
     declare_parameter<double>("strategy.near_ball_speed_limit", 0.3);
     declare_parameter<double>("strategy.near_ball_range", 4.0);
+    declare_parameter<bool>("strategy.soft_kickoff", true);
+    declare_parameter<double>("strategy.soft_kickoff_speed", 0.3);
+    declare_parameter<double>("strategy.kick_range", 1.0);
+    declare_parameter<double>("strategy.kick_theta_range", 0.2);
     declare_parameter<bool>("strategy.abort_kick_when_ball_moved", false);
+    declare_parameter<double>("strategy.abort_kick_ball_move_threshold", 0.3);
+    declare_parameter<bool>("strategy.abort_shoot_when_ball_moved", true);
+    declare_parameter<bool>("strategy.limit_speed_near_border", false);
+    declare_parameter<double>("strategy.near_border_speed_limit", 0.5);
+    declare_parameter<double>("strategy.near_border_dist_threshold", -1.0);
     declare_parameter<bool>("strategy.enable_bypass", false);
     declare_parameter<bool>("strategy.enable_shoot", false);
     declare_parameter<bool>("strategy.enable_directional_kick", false);
 
-    declare_parameter<bool>("strategy.use_squat_block", false);
-    declare_parameter<double>("strategy.squat_block_msecs", 2000.0);
-    declare_parameter<bool>("strategy.use_move_block", true);
-    declare_parameter<double>("strategy.move_block_msecs", 2000.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 600.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 5.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_max_direction_error", 1.2);
+    declare_parameter<double>("strategy.goalie_simple_x_kp", 0.9);
+    declare_parameter<double>("strategy.goalie_simple_y_kp", 2.2);
+    declare_parameter<double>("strategy.goalie_simple_threat_vxf", -0.03);
+    declare_parameter<double>("strategy.goalie_simple_predict_min_vxf", 0.06);
+    declare_parameter<double>("strategy.goalie_simple_t_goal_max", 8.0);
+    declare_parameter<double>("strategy.goalie_simple_t_plane_min", 0.02);
+    declare_parameter<double>("strategy.goalie_simple_t_plane_max", 6.0);
+    declare_parameter<double>("strategy.goalie_simple_vy_max", 0.8);
+    declare_parameter<double>("strategy.goalie_simple_vx_max", 1.2);
+    declare_parameter<double>("strategy.goalie_simple_vtheta_kp", 1.4);
+    declare_parameter<double>("strategy.goalie_simple_vtheta_limit", 1.5);
     declare_parameter<bool>("strategy.enable_auto_visual_kick", false);
-    declare_parameter<bool>("strategy.enable_auto_visual_defend", false);
-
+    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.2);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 4.0);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.8);
+    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.35);
+    declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
+    declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
+    declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.45);
+    declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
+    declare_parameter<bool>("strategy.auto_visual_kick.allow_memory_kick_msg", true);
+    declare_parameter<double>("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", 650.0);
+    declare_parameter<double>("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", 0.45);
+    declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 80.0);
+    declare_parameter<double>("strategy.auto_visual_kick.exit_decelerate_ms", 140.0);
+    declare_parameter<int>("strategy.auto_visual_kick.max_parallel_count", 1);
+    declare_parameter<double>("strategy.auto_visual_kick.yield_my_cost_min", 4.0);
+    declare_parameter<double>("strategy.auto_visual_kick.no_progress_timeout_ms", 3500.0);
+    declare_parameter<double>("strategy.auto_visual_kick.progress_range_delta", 0.12);
+    declare_parameter<double>("strategy.auto_visual_kick.progress_ball_forward_delta", 0.15);
+    declare_parameter<double>("strategy.auto_visual_kick.max_total_ms", 14000.0);
+    declare_parameter<int>("strategy.auto_visual_kick.max_extra_rounds", 1);
     declare_parameter<bool>("strategy.power_shoot.enable", false);
     declare_parameter<bool>("strategy.power_shoot.use_for_kickoff", false);
     declare_parameter<double>("strategy.power_shoot.xmin", 0.5);
@@ -74,6 +176,23 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.shoot.ymax", 0.5);
     declare_parameter<bool>("strategy.cooperation.enable_role_switch", true);
     declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 10.0);
+    declare_parameter<double>("strategy.cooperation.goalie_comm_fresh_msecs", 2200.0);
+    declare_parameter<double>("strategy.cooperation.goalie_comm_stable_msecs", 1000.0);
+    declare_parameter<double>("strategy.cooperation.goalie_distance_tie_margin", 0.15);
+    declare_parameter<bool>("strategy.cooperation.goalie_fallback_use_gc_goalie", true);
+    declare_parameter<bool>("strategy.cooperation.goalie_attack_handoff", true);
+    declare_parameter<bool>("strategy.far_set_play_search.enable", true);
+    declare_parameter<double>("strategy.far_set_play_search.trigger_x", 0.0);
+    declare_parameter<double>("strategy.far_set_play_search.field_target_x_ratio", 0.25);
+    declare_parameter<double>("strategy.far_set_play_search.lane_y_ratio", 0.28);
+    declare_parameter<double>("strategy.far_set_play_search.max_move_secs", 30.0);
+    declare_parameter<double>("strategy.far_set_play_search.vx_limit", 0.7);
+    declare_parameter<double>("strategy.far_set_play_search.vy_limit", 0.4);
+    declare_parameter<double>("strategy.set_play_stand.corridor_half_width", 0.6);
+    declare_parameter<double>("strategy.set_play_stand.corridor_forward_range", 3.0);
+    declare_parameter<double>("strategy.set_play_stand.side_margin", 0.2);
+
+    declare_parameter<double>("RLVisionKick.goalie_clearance_power", 2.5);
 
     declare_parameter<int>("obstacle_avoidance.depth_sample_step", 16);
     declare_parameter<double>("obstacle_avoidance.obstacle_min_height", 0.15);
@@ -97,6 +216,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("obstacle_avoidance.avoid_during_kick", false);
     declare_parameter<double>("obstacle_avoidance.kick_ao_safe_dist", 1.0);
     declare_parameter<bool>("obstacle_avoidance.kick_ao_use_shoot", false);
+    declare_parameter<bool>("obstacle_avoidance.always_turn_left", false);
     
     declare_parameter<int>("locator.min_marker_count", 5);
     declare_parameter<double>("locator.max_residual", 0.3);
@@ -109,6 +229,17 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<string>("rerunLog.log_dir", "");
     declare_parameter<double>("rerunLog.max_log_file_mins", 5.0);
     declare_parameter<int>("rerunLog.img_interval", 10);
+
+    declare_parameter<bool>("debug.log_ball_pos", false);
+    declare_parameter<bool>("debug.low_frequency_status.enable", false);
+    declare_parameter<bool>("debug.low_frequency_status.mode_enable", true);
+    declare_parameter<bool>("debug.low_frequency_status.field_ascii_enable", true);
+    declare_parameter<double>("debug.low_frequency_status.log_interval_ms", 2000.0);
+    declare_parameter<double>("debug.low_frequency_status.mode_query_interval_ms", 2000.0);
+    declare_parameter<double>("debug.low_frequency_status.mode_query_timeout_ms", 1000.0);
+    declare_parameter<double>("debug.low_frequency_status.field_ascii_interval_ms", 5000.0);
+    declare_parameter<double>("debug.low_frequency_status.field_ascii_char_aspect", 2.0);
+    declare_parameter<int>("debug.low_frequency_status.field_ascii_width", 45);
 
     declare_parameter<bool>("sound.enable", false);
     declare_parameter<string>("sound.sound_pack", "espeak");
@@ -127,6 +258,9 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<string>("vision_config_local_path", "");
 
     declare_parameter<int>("recovery.retry_max_count", 2);
+    declare_parameter<string>("recovery.get_up_version", "kV1");
+
+    declare_parameter<string>("RLVisionKick.visual_kick_version", "kV2");
 }
 
 Brain::~Brain()
@@ -141,6 +275,7 @@ void Brain::init()
     loadConfig();
 
     data = std::make_shared<BrainData>();
+    ballStateEstimator = std::make_unique<ball_state_estimator::BallStateEstimator>();
     locator = std::make_shared<Locator>();
     log = std::make_shared<BrainLog>(this);
     tree = std::make_shared<BrainTree>(this);
@@ -160,29 +295,35 @@ void Brain::init()
     
 
     
-    communication->initCommunication();
+    // Finish all shared-state initialization before communication threads are
+    // allowed to read and publish it.
+    const auto now = get_clock()->now();
+    data->lastSuccessfulLocalizeTime = now;
+    data->timeLastDet = now;
+    data->timeLastLineDet = now;
+    data->timeLastGamecontrolMsg = now;
+    data->ball.timePoint = now;
 
-    data->lastSuccessfulLocalizeTime = get_clock()->now();
-    data->timeLastDet = get_clock()->now();
-    data->timeLastLineDet = get_clock()->now();
-    data->timeLastGamecontrolMsg = get_clock()->now();
-    data->ball.timePoint = get_clock()->now();
-
-    
-    auto now = get_clock()->now();
     for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
         data->tmStatus[i].isAlive = false;
         data->tmStatus[i].timeLastCom = now;
     }
     data->tmLastCmdChangeTime = now;
 
+    communication->initCommunication();
+
    
     detectionsSubscription = create_subscription<vision_interface::msg::Detections>("/booster_vision/detection", SUB_STATE_QUEUE_SIZE, bind(&Brain::detectionsCallback, this, _1));
     subFieldLine = create_subscription<vision_interface::msg::LineSegments>("/booster_vision/line_segments", SUB_STATE_QUEUE_SIZE, bind(&Brain::fieldLineCallback, this, _1));
-    odometerSubscription = create_subscription<booster_interface::msg::Odometer>("/odometer_state", SUB_STATE_QUEUE_SIZE, bind(&Brain::odometerCallback, this, _1));
-    lowStateSubscription = create_subscription<booster_interface::msg::LowState>("/low_state", SUB_STATE_QUEUE_SIZE, bind(&Brain::lowStateCallback, this, _1));
-    headPoseSubscription = create_subscription<geometry_msgs::msg::Pose>("/head_pose", SUB_STATE_QUEUE_SIZE, bind(&Brain::headPoseCallback, this, _1));
-    recoveryStateSubscription = create_subscription<booster_interface::msg::RawBytesMsg>("fall_down_recovery_state", SUB_STATE_QUEUE_SIZE, bind(&Brain::recoveryStateCallback, this, _1));
+
+    // 传感器只保留最新样本，并使用 best-effort，和 Booster 发布端的传感器 QoS 对齐。
+    // 默认 reliable 订阅在发布端为 best-effort 时会完全匹配失败，表现为“里程计不更新”。
+    const auto latestSensorQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+    const auto latestReliableQos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+    odometerSubscription = create_subscription<booster_interface::msg::Odometer>("/odometer_state", latestSensorQos, bind(&Brain::odometerCallback, this, _1));
+    lowStateSubscription = create_subscription<booster_interface::msg::LowState>("/low_state", latestSensorQos, bind(&Brain::lowStateCallback, this, _1));
+    headPoseSubscription = create_subscription<geometry_msgs::msg::Pose>("/head_pose", latestSensorQos, bind(&Brain::headPoseCallback, this, _1));
+    recoveryStateSubscription = create_subscription<booster_interface::msg::RawBytesMsg>("fall_down_recovery_state", latestReliableQos, bind(&Brain::recoveryStateCallback, this, _1));
 
     if (config->rerunLogEnableFile || config->rerunLogEnableTCP) {
         string imageTopic = get_parameter("vision.image_topic").as_string();
@@ -193,6 +334,8 @@ void Brain::init()
     
     pubSoundPlay = create_publisher<std_msgs::msg::String>("/play_sound", 10);
     pubSpeak = create_publisher<std_msgs::msg::String>("/speak", 10);
+    pubKickBall = create_publisher<brain::msg::Kick>("/kick_ball", 10);
+    setupLowFrequencyDiagnostics();
 }
 
 void Brain::loadConfig()
@@ -201,6 +344,7 @@ void Brain::loadConfig()
     get_parameter("game.player_id", config->playerId);
     get_parameter("game.field_type", config->fieldType);
     get_parameter("game.player_role", config->playerRole);
+    get_parameter("game.player_start_pos", config->playerStartPos);
     get_parameter("game.treat_person_as_robot", config->treatPersonAsRobot);
     get_parameter("game.number_of_players", config->numOfPlayers);
 
@@ -213,6 +357,8 @@ void Brain::loadConfig()
     get_parameter("robot.vtheta_limit", config->vthetaLimit);
 
     get_parameter("strategy.ball_confidence_threshold", config->ballConfidenceThreshold);
+    get_parameter("strategy.ball_confidence_decay_rate", config->ballConfidenceDecayRate);
+    get_parameter("strategy.enable_stable_kick", config->enableStableKick);
     get_parameter("strategy.tm_ball_dist_threshold", config->tmBallDistThreshold);
     get_parameter("strategy.limit_near_ball_speed", config->limitNearBallSpeed);
     get_parameter("strategy.near_ball_speed_limit", config->nearBallSpeedLimit);
@@ -237,6 +383,9 @@ void Brain::loadConfig()
 
     get_parameter("sound.enable", config->soundEnable);
     get_parameter("sound.sound_pack", config->soundPack);
+
+    get_parameter("recovery.get_up_version", config->recoveryGetUpVersion);
+    get_parameter("RLVisionKick.visual_kick_version", config->RLVisionKickVisualKickVersion);
 
     get_parameter("tree_file_path", config->treeFilePath);
 
@@ -296,6 +445,10 @@ void Brain::loadConfig()
 
 void Brain::tick()
 {
+    // main.cpp 中 tick 与 ROS executor 分线程运行；串行化共享 BrainData，避免
+    // odometerCallback/calibrateOdom 在同一帧互相覆盖半更新的 Pose2D。
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     // 输出 debug & log 相关信息
     logDebugInfo();
     // logObstacleDistance(); // 计算量大, 仅需要时使用
@@ -310,6 +463,113 @@ void Brain::tick()
     handleCooperation();
 
     tree->tick();
+    // 行为树先写入守门员拦截目标，本帧立即发布给运控。
+    pubKickMsg();
+    if (lowFrequencyStatusEnable_) {
+        const auto now = get_clock()->now();
+        sendModeQueryIfNeeded(now);
+        logLowFrequencyDiagnostics(now);
+    }
+}
+
+void Brain::pubKickMsg() {
+    if (!pubKickBall) return;
+    const bool goalieVisualKick =
+        tree->getEntry<string>("player_role") == "goal_keeper" &&
+        (data->goalieVisualKickSubState == "block_kick" ||
+         data->goalieVisualKickSubState == "intercept_kick");
+    const bool goalieInterceptTarget =
+        goalieVisualKick &&
+        data->goalieVisualKickSubState == "intercept_kick" &&
+        data->goalieVisualKickTargetValid &&
+        std::isfinite(data->goalieVisualKickTargetField.x) &&
+        std::isfinite(data->goalieVisualKickTargetField.y);
+
+    const double realBallAgeMs = data->ball.timePoint.nanoseconds() > 0
+        ? msecsSince(data->ball.timePoint)
+        : std::numeric_limits<double>::infinity();
+    double realBallMaxAgeMs = 650.0;
+    double predictedRejectRange = 0.45;
+    bool allowPredicted = true;
+    bool allowMemory = true;
+    get_parameter("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", realBallMaxAgeMs);
+    get_parameter("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", predictedRejectRange);
+    get_parameter("strategy.auto_visual_kick.allow_predicted_kick_msg", allowPredicted);
+    get_parameter("strategy.auto_visual_kick.allow_memory_kick_msg", allowMemory);
+    realBallMaxAgeMs = std::clamp(realBallMaxAgeMs, 50.0, 1000.0);
+    predictedRejectRange = std::clamp(predictedRejectRange, 0.3, 3.0);
+
+    const bool realBallFresh = data->ballDetected &&
+        (!data->tmImInVisualKick ||
+         (realBallAgeMs >= 0.0 && realBallAgeMs <= realBallMaxAgeMs));
+    const double predictedRange = std::hypot(
+        data->ball.reliablePredictPosToRobot.x,
+        data->ball.reliablePredictPosToRobot.y);
+    const bool predictedBallUsable = allowPredicted && data->reliableBallPredict &&
+        std::isfinite(predictedRange) &&
+        (!data->tmImInVisualKick || predictedRange > predictedRejectRange);
+    const bool memoryBallUsable = allowMemory &&
+        tree->getEntry<bool>("ball_location_known") &&
+        realBallAgeMs >= 0.0 && realBallAgeMs <= 1000.0 &&
+        std::isfinite(data->ball.posToRobot.x) &&
+        std::isfinite(data->ball.posToRobot.y) &&
+        (!data->tmImInVisualKick || data->ball.range > predictedRejectRange);
+
+    Point ballField;
+    Pose2D ballRobot;
+    if (goalieInterceptTarget) {
+        ballField = data->goalieVisualKickTargetField;
+        ballRobot = data->field2robot({ballField.x, ballField.y, 0.0});
+    } else if (realBallFresh) {
+        ballField = data->ball.posToField;
+        ballRobot = {data->ball.posToRobot.x, data->ball.posToRobot.y, 0.0};
+    } else if (predictedBallUsable) {
+        ballField = data->ball.reliablePredictPosToField;
+        ballRobot = {data->ball.reliablePredictPosToRobot.x,
+                     data->ball.reliablePredictPosToRobot.y, 0.0};
+    } else if (memoryBallUsable) {
+        ballField = data->ball.posToField;
+        ballRobot = {data->ball.posToRobot.x, data->ball.posToRobot.y, 0.0};
+    } else {
+        return;
+    }
+
+    brain::msg::Kick kickMsg;
+    kickMsg.header.stamp = get_clock()->now();
+    kickMsg.x = ballRobot.x;
+    kickMsg.y = ballRobot.y;
+
+    double goal_x = config->fieldDimensions.length / 2;
+    double goal_y = 0.0;
+    const double clearanceDir = kick_geometry::directionToOpponentGoal(
+        ballField.x, ballField.y, goal_x);
+    kickMsg.dir = toPInPI((goalieVisualKick ? clearanceDir : data->kickDir)
+                         - data->robotPoseToField.theta);
+    Pose2D goalPose;
+    goalPose.x = goal_x;
+    goalPose.y = goal_y;
+    double ball_x = ballField.x;
+    double ball_y = ballField.y;
+    double dist = std::sqrt((goal_x - ball_x) * (goal_x - ball_x) + (goal_y - ball_y) * (goal_y - ball_y));
+    dist = std::abs(dist);
+    double power = 0.0;
+
+    if (goalieVisualKick) {
+        power = get_parameter("RLVisionKick.goalie_clearance_power").as_double();
+    } else if (dist > 6.0) {
+        power = 3.0;
+    } else {
+        power = 6.0;
+    }
+    kickMsg.power = power;
+
+    auto goalPose_r = data->field2robot(goalPose);
+    kickMsg.goal_x = goalPose_r.x;
+    kickMsg.goal_y = goalPose_r.y;
+
+    kickMsg.robot_theta_to_field = data->robotPoseToField.theta;
+
+    pubKickBall->publish(kickMsg);
 }
 
 void Brain::handleSpecialStates() {
@@ -322,14 +582,27 @@ void Brain::handleSpecialStates() {
     bool isFreekickKickoffSide = tree->getEntry<bool>("gc_is_sub_state_kickoff_side");
     auto now = get_clock()->now();
 
-    if (gameState == "SET" && isKickoffSide) {
-        data->isKickingOff = true;
-        data->kickoffStartTime = now;
+    const bool normalKickoffState = gameSubStateType == "NONE";
+    if (gameState == "SET" && normalKickoffState
+        && !tree->getEntry<bool>("gc_play_stopped")) {
+        if (isKickoffSide) {
+            data->isKickingOff = true;
+            data->kickoffStartTime = now;
+            data->isOpponentKickingOff = false;
+        } else {
+            data->isOpponentKickingOff = true;
+            data->opponentKickoffStartTime = now;
+            data->isKickingOff = false;
+        }
     } else if (msecsSince(data->kickoffStartTime) > KICKOFF_DURATION * 1000) {
         data->isKickingOff = false;
     }
+    if (msecsSince(data->opponentKickoffStartTime) > KICKOFF_DURATION * 1000) {
+        data->isOpponentKickingOff = false;
+    }
 
-    if (gameState == "PLAY" && gameSubStateType == "FREE_KICK" && isFreekickKickoffSide) {
+    if (gameState == "PLAY" && gameSubStateType == "FREE_KICK"
+        && isFreekickKickoffSide && !tree->getEntry<bool>("gc_play_stopped")) {
         data->isFreekickKickingOff = true;
         data->freekickKickoffStartTime = now;
     } else if (msecsSince(data->freekickKickoffStartTime) > KICKOFF_DURATION * 1000) {
@@ -347,6 +620,106 @@ void Brain::handleSpecialStates() {
     }
 }
 
+int Brain::selectGoaliePlayerId(bool *communicationHealthy,
+                                bool *stableEnough,
+                                bool *usedFallback)
+{
+    if (communicationHealthy) *communicationHealthy = false;
+    if (stableEnough) *stableEnough = false;
+    if (usedFallback) *usedFallback = true;
+
+    double freshMs = get_parameter("strategy.cooperation.goalie_comm_fresh_msecs").as_double();
+    double stableMs = get_parameter("strategy.cooperation.goalie_comm_stable_msecs").as_double();
+    double tieMargin = get_parameter("strategy.cooperation.goalie_distance_tie_margin").as_double();
+    const bool useGcFallback = get_parameter(
+        "strategy.cooperation.goalie_fallback_use_gc_goalie").as_bool();
+    freshMs = std::clamp(freshMs, 400.0, 10000.0);
+    stableMs = std::clamp(stableMs, 0.0, 10000.0);
+    tieMargin = std::clamp(tieMargin, 0.0, 0.8);
+
+    const int playerCount = std::clamp(config->numOfPlayers, 1, HL_MAX_NUM_PLAYERS);
+    const int selfIdx = config->playerId - 1;
+    auto poseUsable = [](const Pose2D &pose) {
+        return std::isfinite(pose.x) && std::isfinite(pose.y);
+    };
+    auto distanceToGoal = [&](const Pose2D &pose) {
+        return std::hypot(pose.x + config->fieldDimensions.length / 2.0, pose.y);
+    };
+
+    int eligibleCount = 0;
+    int freshPoseCount = 0;
+    int selected = 0;
+    double selectedDistance = std::numeric_limits<double>::infinity();
+    int selectedNotKicking = 0;
+    double selectedNotKickingDistance = std::numeric_limits<double>::infinity();
+    auto consider = [&](int id, const Pose2D &pose, bool inVisualKick) {
+        const double distance = distanceToGoal(pose);
+        if (distance < selectedDistance - tieMargin ||
+            (std::abs(distance - selectedDistance) <= tieMargin &&
+             (selected == 0 || id < selected))) {
+            selected = id;
+            selectedDistance = distance;
+        }
+        if (!inVisualKick &&
+            (distance < selectedNotKickingDistance - tieMargin ||
+             (std::abs(distance - selectedNotKickingDistance) <= tieMargin &&
+              (selectedNotKicking == 0 || id < selectedNotKicking)))) {
+            selectedNotKicking = id;
+            selectedNotKickingDistance = distance;
+        }
+    };
+
+    for (int i = 0; i < playerCount; ++i) {
+        if (data->penalty[i] != PENALTY_NONE) continue;
+        ++eligibleCount;
+        if (i == selfIdx) {
+            if (poseUsable(data->robotPoseToField)) {
+                consider(i + 1, data->robotPoseToField, data->tmImInVisualKick);
+                ++freshPoseCount;
+            }
+            continue;
+        }
+        const auto &tm = data->tmStatus[i];
+        const double ageMs = tm.timeLastCom.nanoseconds() > 0
+            ? msecsSince(tm.timeLastCom)
+            : std::numeric_limits<double>::infinity();
+        if (!tm.isAlive || !std::isfinite(ageMs) || ageMs > freshMs ||
+            !poseUsable(tm.robotPoseToField)) continue;
+        consider(i + 1, tm.robotPoseToField, tm.isInVisualKick);
+        ++freshPoseCount;
+    }
+    if (selectedNotKicking > 0) selected = selectedNotKicking;
+
+    const bool healthy = eligibleCount > 0 && freshPoseCount == eligibleCount;
+    if (communicationHealthy) *communicationHealthy = healthy;
+    static bool healthySinceValid = false;
+    static rclcpp::Time healthySince;
+    if (healthy) {
+        if (!healthySinceValid) {
+            healthySince = get_clock()->now();
+            healthySinceValid = true;
+        }
+        const bool stable = msecsSince(healthySince) >= stableMs;
+        if (stableEnough) *stableEnough = stable;
+        if (stable && selected > 0) {
+            if (usedFallback) *usedFallback = false;
+            return selected;
+        }
+    } else {
+        healthySinceValid = false;
+    }
+
+    if (useGcFallback && data->goalkeeperPlayerId >= 1 &&
+        data->goalkeeperPlayerId <= playerCount &&
+        data->penalty[data->goalkeeperPlayerId - 1] == PENALTY_NONE) {
+        return data->goalkeeperPlayerId;
+    }
+    for (int i = 0; i < playerCount; ++i) {
+        if (data->penalty[i] == PENALTY_NONE) return i + 1;
+    }
+    return 0;
+}
+
 void Brain::handleCooperation() {
     auto log_ = [=](string msg) {
         log->setTimeNow();
@@ -359,7 +732,7 @@ void Brain::handleCooperation() {
 
     int selfId = config->playerId;
     int selfIdx = selfId - 1;
-    int numOfPlayers = config->numOfPlayers;
+    int numOfPlayers = std::clamp(config->numOfPlayers, 1, HL_MAX_NUM_PLAYERS);
 
     vector<int> aliveTmIdxs = {}; 
 
@@ -372,7 +745,7 @@ void Brain::handleCooperation() {
 
     
     int gcAliveCount = 0; 
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++)
+    for (int i = 0; i < numOfPlayers; i++)
     {
         if (data->penalty[i] == PENALTY_NONE) {
             gcAliveCount++;
@@ -398,7 +771,7 @@ void Brain::handleCooperation() {
     }
     log_(format("gcAliveCnt: %d", gcAliveCount));
 
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+    for (int i = 0; i < numOfPlayers; i++) {
         if (i == selfIdx) continue; 
 
         if (
@@ -407,6 +780,7 @@ void Brain::handleCooperation() {
         ) {
             data->tmStatus[i].isAlive = false;
             data->tmStatus[i].isLead = false;
+            data->tmStatus[i].isInVisualKick = false;
         }
         
         if (data->tmStatus[i].isAlive) {
@@ -450,10 +824,13 @@ void Brain::handleCooperation() {
 
         tree->setEntry<bool>("tm_ball_pos_reliable", true);
         lastTmBallPosTime = get_clock()->now();
-        if (!tree->getEntry<bool>("ball_location_known")) { 
+        if (!tree->getEntry<bool>("ball_location_known")) {
             log_("update ball.posToField");
             data->ball.posToField = data->tmBall.posToField;
             updateRelativePos(data->ball);
+            data->robotBallAngleToField = atan2(
+                data->ball.posToField.y - data->robotPoseToField.y,
+                data->ball.posToField.x - data->robotPoseToField.x);
         }
     } else {
         log_("TM reported NO BALL or can not be trusted");
@@ -465,81 +842,176 @@ void Brain::handleCooperation() {
 
     bool switchRole;
     get_parameter("strategy.cooperation.enable_role_switch", switchRole);
-    if (switchRole) {
-        if (data->penalty[selfIdx] == PENALTY_NONE) { 
-            if (gcAliveCount < numOfPlayers) { 
-                log_("Not full team. I must be Striker");
-                tree->setEntry<string>("player_role", "striker"); 
-            }
-        } else { 
-            if (gcAliveCount == numOfPlayers - 1) { 
-                log_("I am only on under penalty, I must be goal keeper");
-                tree->setEntry<string>("player_role", "goal_keeper"); 
-            }
-    
+    static int directedGoalieId = 0;
+    static rclcpp::Time directedGoalieUntil;
+    bool teamVisualKickActive = data->tmImInVisualKick;
+    for (int tmIdx : aliveTmIdxs) {
+        teamVisualKickActive = teamVisualKickActive || data->tmStatus[tmIdx].isInVisualKick;
+    }
+    if (directedGoalieId > 0 && teamVisualKickActive) {
+        directedGoalieUntil = get_clock()->now() +
+            rclcpp::Duration::from_nanoseconds(2000000000LL);
+    }
+    if (directedGoalieId > 0 && msecsSince(directedGoalieUntil) > 0.0) {
+        if (data->tmMyCmd == 10 + directedGoalieId) {
+            data->tmMyCmd = 0;
+            ++data->tmCmdId;
+            data->tmMyCmdId = data->tmCmdId;
+        }
+        directedGoalieId = 0;
+    }
+    bool goalieCommHealthy = false;
+    bool goalieStable = false;
+    bool goalieFallback = true;
+    int selectedGoalieId = selectGoaliePlayerId(
+        &goalieCommHealthy, &goalieStable, &goalieFallback);
+    if (directedGoalieId > 0 && directedGoalieId <= numOfPlayers &&
+        data->penalty[directedGoalieId - 1] == PENALTY_NONE) {
+        selectedGoalieId = directedGoalieId;
+    }
+    data->activeGoaliePlayerId = selectedGoalieId;
+
+    if (tree->getEntry<string>("gc_game_state") == "INITIAL" || !switchRole) {
+        tree->setEntry<string>("player_role", config->playerRole);
+    } else if (data->tmImAlive && selectedGoalieId > 0) {
+        tree->setEntry<string>("player_role",
+            selectedGoalieId == selfId ? "goal_keeper" : "striker");
+    }
+    log_(format("goalie election: selected=%d gc=%d healthy=%d stable=%d fallback=%d role=%s",
+        selectedGoalieId, data->goalkeeperPlayerId,
+        goalieCommHealthy ? 1 : 0, goalieStable ? 1 : 0, goalieFallback ? 1 : 0,
+        tree->getEntry<string>("player_role").c_str()));
+
+
+    constexpr double COST_TIE_EPS = 0.05;
+    int myCostRank = 0;
+    int myStrikerCostRank = 0;
+    int myStrikerIDRank = 0;
+    const bool selfIsStriker = tree->getEntry<string>("player_role") == "striker";
+    for (int tmIdx : aliveTmIdxs) {
+        const auto &tm = data->tmStatus[tmIdx];
+        const bool teammateRanksAhead =
+            tm.cost < data->tmMyCost - COST_TIE_EPS ||
+            (std::fabs(tm.cost - data->tmMyCost) <= COST_TIE_EPS && tmIdx + 1 < selfId);
+        if (teammateRanksAhead) ++myCostRank;
+        if (selfIsStriker && tm.role == "striker" && teammateRanksAhead) {
+            ++myStrikerCostRank;
+        }
+        if (tmIdx < selfIdx && tm.role == "striker") ++myStrikerIDRank;
+    }
+    data->tmMyCostRank = myCostRank;
+    data->tmMyStrikerCostRank = selfIsStriker ? myStrikerCostRank : 0;
+    data->myStrikerIDRank = myStrikerIDRank;
+
+    const bool kickoffTacticalPhase =
+        (data->isKickingOff || data->isOpponentKickingOff) &&
+        tree->getEntry<string>("gc_game_state") == "PLAY";
+    if (!data->isKickingOff && !data->isOpponentKickingOff) {
+        data->kickoffStrikerGroupRank = -1;
+        data->kickoffStrikerGroupLatched = false;
+        data->kickoffBallHalf = 0;
+    } else if (kickoffTacticalPhase && selfIsStriker
+        && !data->kickoffStrikerGroupLatched) {
+        // 开球阶段只在第一次进入 PLAY 时确定分组，避免 cost 变化导致机器人互换半区任务。
+        data->kickoffStrikerGroupRank = myStrikerCostRank;
+        data->kickoffStrikerGroupLatched = true;
+    }
+
+    struct BallOwnerCandidate {
+        int id = 0;
+        double cost = 1e9;
+        bool visualKick = false;
+    };
+    vector<BallOwnerCandidate> ownerCandidates;
+    const double goalieClaimBallX = -config->fieldDimensions.circleRadius - 2.0;
+    const string selfRole = tree->getEntry<string>("player_role");
+    const bool selfGoalieClaimsBall =
+        selfRole == "goal_keeper" &&
+        (data->tmImInVisualKick ||
+         (data->ballDetected && !data->lose_ball && std::isfinite(data->ball.range) &&
+          data->ball.range < 1.5 && data->ball.posToField.x < goalieClaimBallX));
+    if (selfRole == "striker" || selfGoalieClaimsBall) {
+        ownerCandidates.push_back({selfId, data->tmMyCost, data->tmImInVisualKick});
+    }
+    for (int tmIdx : aliveTmIdxs) {
+        const auto &tm = data->tmStatus[tmIdx];
+        const bool teammateGoalieClaimsBall =
+            tm.role == "goal_keeper" &&
+            (tm.isInVisualKick ||
+             (tm.ballDetected && std::isfinite(tm.ballRange) && tm.ballRange < 1.5 &&
+              tm.ballPosToField.x < goalieClaimBallX));
+        if (tm.role == "striker" || teammateGoalieClaimsBall) {
+            ownerCandidates.push_back({tmIdx + 1,
+                std::isfinite(tm.cost) ? tm.cost : 1e9,
+                tm.isInVisualKick});
         }
     }
-
-    if (tree->getEntry<string>("gc_game_state") == "INITIAL") {
-        tree->setEntry<string>("player_role", config->playerRole);
+    if (ownerCandidates.empty() && data->tmImAlive) {
+        ownerCandidates.push_back({selfId, data->tmMyCost, data->tmImInVisualKick});
     }
 
-
-    double tmMinCost = 1e5;
-    for (int i = 0; i < aliveTmIdxs.size(); i++) {
-        int tmIdx = aliveTmIdxs[i];
-        auto tmStatus = data->tmStatus[tmIdx];
-        if (tmStatus.cost < tmMinCost) tmMinCost = tmStatus.cost;
+    auto betterOwner = [](const BallOwnerCandidate &lhs, const BallOwnerCandidate &rhs) {
+        return lhs.cost < rhs.cost - COST_TIE_EPS ||
+            (std::fabs(lhs.cost - rhs.cost) <= COST_TIE_EPS && lhs.id < rhs.id);
+    };
+    BallOwnerCandidate bestOwner;
+    BallOwnerCandidate activeVisualKickOwner;
+    for (const auto &candidate : ownerCandidates) {
+        if (bestOwner.id == 0 || betterOwner(candidate, bestOwner)) bestOwner = candidate;
+        if (candidate.visualKick &&
+            (activeVisualKickOwner.id == 0 || betterOwner(candidate, activeVisualKickOwner))) {
+            activeVisualKickOwner = candidate;
+        }
     }
-    double BALL_CONTROL_COST_THRESHOLD = 3.0;
-    get_parameter("strategy.cooperation.ball_control_cost_threshold", BALL_CONTROL_COST_THRESHOLD);
-
-    if (tmMinCost < BALL_CONTROL_COST_THRESHOLD && data->tmMyCost > tmMinCost) {
-
-        data->tmImLead = false;
-        tree->setEntry<bool>("is_lead", false);
-        log_("I am not lead");
-
-    } else {
-        data->tmImLead = true;
-        tree->setEntry<bool>("is_lead", true);
-        log_("I am Lead");
-    }
-    log_(format("tmMinCost: %.1f, myCost: %.1f", tmMinCost, data->tmMyCost));
+    const int ownerId = activeVisualKickOwner.id > 0
+        ? activeVisualKickOwner.id
+        : bestOwner.id;
+    data->tmImLead = data->tmImAlive && ownerId == selfId;
+    tree->setEntry<bool>("is_lead", data->tmImLead);
+    log_(format("ball owner: %d, myCost: %.1f, myCostRank: %d, myStrikerCostRank: %d, kickoffGroupRank: %d, myStrikerIDRank: %d",
+        ownerId, data->tmMyCost, myCostRank, myStrikerCostRank,
+        data->kickoffStrikerGroupRank, myStrikerIDRank));
 
 
+    const bool goalieAttackHandoffEnabled = get_parameter(
+        "strategy.cooperation.goalie_attack_handoff").as_bool();
     if (
+        goalieAttackHandoffEnabled &&
         data->tmImAlive 
         && tree->getEntry<string>("player_role") == "goal_keeper"
-        && data->tmImLead 
+        && data->ballDetected
+        && !data->lose_ball
+        && data->ball.range < 1.2
+        && (data->tmImLead || data->tmImInVisualKick)
         && msecsSince(data->tmLastCmdChangeTime) > CMD_COOLDOWN 
     ) {
         auto distToGoal = [=](Pose2D pose) {
             return norm(pose.x + config->fieldDimensions.length / 2.0, pose.y);
         };
-        double maxDist = 0.0;
         double minDist = 1e6;
         int minIndex = -1; 
         double myDist = distToGoal(data->robotPoseToField);
         for (int i = 0; i < aliveTmIdxs.size(); i++) {
             int tmIdx = aliveTmIdxs[i];
             auto tmPose = data->tmStatus[tmIdx].robotPoseToField;
+            if (!std::isfinite(tmPose.x) || !std::isfinite(tmPose.y)) continue;
             double dist = distToGoal(tmPose);
-            if (dist > maxDist) maxDist = dist;
             if (dist < minDist) {
                 minIndex = tmIdx;
                 minDist = dist;
             }
         }
-        if (minIndex >= 0 && myDist > maxDist) {
+        if (minIndex >= 0) {
             data->tmLastCmdChangeTime = get_clock()->now();
             data->tmMyCmd = 10 + minIndex + 1; 
             data->tmCmdId += 1;
             data->tmMyCmdId = data->tmCmdId;
+            directedGoalieId = minIndex + 1;
+            directedGoalieUntil = get_clock()->now() + rclcpp::Duration::from_nanoseconds(6000000000LL);
             tree->setEntry<string>("player_role", "striker");
-            log_(format("goalie: i am too far from goal, i ask player %d to attack", minIndex + 1));
+            log_(format("goalie: clearance handoff, ask player %d to guard goal", minIndex + 1));
         } else {
-            log_(format("goalie: i am close enough to goal, no need to attack, my dist: %.2f", myDist));
+            log_(format("goalie: no teammate available for handoff, my dist: %.2f", myDist));
         }
     }
 
@@ -547,9 +1019,15 @@ void Brain::handleCooperation() {
     auto cmd = data->tmReceivedCmd;
     if (cmd != 0) {
         log_(format("received cmd %d from teammate", cmd));
-        if (cmd > 10 && cmd < 20) { 
+        if (cmd == 100) { // 队友要控球
+            data->tmImLead = false;
+            tree->setEntry<bool>("is_lead", false);
+            log_("teammate wants to take lead, i'll assist");
+        } else if (cmd > 10 && cmd < 20) { 
             log_("goalie wants to attack");
             int newGoalieId = cmd - 10;
+            directedGoalieId = newGoalieId;
+            directedGoalieUntil = get_clock()->now() + rclcpp::Duration::from_nanoseconds(6000000000LL);
             if (newGoalieId == selfId) { 
                 log_("i become goalie");
                 tree->setEntry<string>("player_role", "goal_keeper");
@@ -565,15 +1043,6 @@ void Brain::handleCooperation() {
     }
 
     tree->setEntry<bool>("is_lead", data->tmImLead);
-
-    if (
-        (tree->getEntry<string>("gc_game_state") == "READY" || tree->getEntry<string>("gc_game_sub_state") == "GET_READY") 
-        && gcAliveCount == numOfPlayers
-    ) {
-       
-        tree->setEntry<string>("player_role", config->playerRole);
-        log_(format("all teammates on field. Back to initial role: %s", config->playerRole.c_str()));
-    }
 
     return;
 }
@@ -603,10 +1072,12 @@ void Brain::updateObstacleMemory() {
     }
 
 
-    if (
-        (get_parameter("obstacle_avoidance.enable_freekick_avoid").as_bool() && isFreekickStartPlacing())
-        || tree->getEntry<string>("gc_game_state") == "READY"
-    ) {
+    const bool ballLocationKnown =
+        tree->getEntry<bool>("ball_location_known") ||
+        tree->getEntry<bool>("tm_ball_pos_reliable");
+    if (ballLocationKnown &&
+        ((get_parameter("obstacle_avoidance.enable_freekick_avoid").as_bool() && isFreekickStartPlacing())
+         || tree->getEntry<string>("gc_game_state") == "READY")) {
         obs_new.push_back(data->ball);
     }
 
@@ -622,16 +1093,48 @@ void Brain::updateBallMemory()
     double ballMemTimeout;
     get_parameter("strategy.ball_memory_timeout", ballMemTimeout);
 
-    if (secs > ballMemTimeout) 
-    { 
+    if (secs > ballMemTimeout)
+    {
         tree->setEntry<bool>("ball_location_known", false);
-        tree->setEntry<bool>("ball_out", false); 
+        tree->setEntry<bool>("ball_out", false);
     }
 
-    
-    updateRelativePos(data->ball);
-    updateRelativePos(data->tmBall);
-    tree->setEntry<double>("ball_range", data->ball.range);
+    const bool ballLocationKnown =
+        tree->getEntry<bool>("ball_location_known") ||
+        tree->getEntry<bool>("tm_ball_pos_reliable");
+    if (ballLocationKnown) {
+        updateRelativePos(data->ball);
+        data->robotBallAngleToField = atan2(
+            data->ball.posToField.y - data->robotPoseToField.y,
+            data->ball.posToField.x - data->robotPoseToField.x);
+    } else {
+        data->robotBallAngleToField = 0.0;
+    }
+    if (tree->getEntry<bool>("tm_ball_pos_reliable")) {
+        updateRelativePos(data->tmBall);
+    }
+
+    data->reliableBallPredict = false;
+    if (!data->ballDetected && !data->predictedBallPos.empty() &&
+        data->ballPosPredictTime.nanoseconds() > 0) {
+        const double stepMs = std::max(1.0, get_parameter("ball_predictor.step_interval").as_double());
+        const double ageMs = msecsSince(data->ballPosPredictTime);
+        const double horizonMs = stepMs * static_cast<double>(data->predictedBallPos.size() - 1);
+        if (std::isfinite(ageMs) && ageMs >= 0.0 && ageMs <= std::min(1000.0, horizonMs)) {
+            const int idx = std::clamp(
+                static_cast<int>(ageMs / stepMs),
+                0,
+                static_cast<int>(data->predictedBallPos.size()) - 1);
+            const auto &pred = data->predictedBallPos[idx];
+            if (std::isfinite(pred[0]) && std::isfinite(pred[1])) {
+                data->ball.reliablePredictPosToField = {pred[0], pred[1], 0.0};
+                const auto predRobot = data->field2robot({pred[0], pred[1], 0.0});
+                data->ball.reliablePredictPosToRobot = {predRobot.x, predRobot.y, 0.0};
+                data->reliableBallPredict = true;
+            }
+        }
+    }
+    tree->setEntry<double>("ball_range", ballLocationKnown ? data->ball.range : 0.0);
 
 
 
@@ -650,6 +1153,89 @@ void Brain::updateBallMemory()
         tree->getEntry<bool>("tm_ball_pos_reliable"),
         tree->getEntry<bool>("tm_ball_pos_reliable")
         );
+}
+
+void Brain::updateBallPrediction()
+{
+    const auto now = data->ball.timePoint;
+    const Point current = data->ball.posToField;
+
+    const double stepSec = std::max(0.001,
+        get_parameter("ball_predictor.step_interval").as_double() / 1000.0);
+    const int stepCnt = std::max(1,
+        static_cast<int>(get_parameter("ball_predictor.step_cnt").as_int()));
+    const double acceleration = std::min(-1e-3,
+        get_parameter("ball_predictor.acceleration").as_double());
+    const double speedFrictionFactor = std::max(0.0,
+        get_parameter("ball_predictor.speed_friction_factor").as_double());
+
+    ballStateEstimator->setFriction(acceleration);
+    ballStateEstimator->setMinSpeedThreshold(0.1);
+    ballStateEstimator->update(current.x, current.y, now, 0.05);
+
+    const auto estimatePosition = ballStateEstimator->getEstimatedPosition();
+    auto estimateVelocity = ballStateEstimator->getEstimatedVelocity();
+    ball_state_estimator::BallPhysics::clampVelocity(estimateVelocity.x, estimateVelocity.y);
+    data->ballEstVelX = estimateVelocity.x;
+    data->ballEstVelY = estimateVelocity.y;
+    data->ballEstSpeed = estimateVelocity.norm();
+    data->ballEstIsRolling = ballStateEstimator->isRolling() && data->ballEstSpeed >= 0.1;
+
+    const auto endPosition = ball_state_estimator::BallPhysics::getEndPositionWithSpeedFriction(
+        estimatePosition.x, estimatePosition.y,
+        estimateVelocity.x, estimateVelocity.y,
+        acceleration, speedFrictionFactor);
+    data->ballEstEndPos = {
+        std::clamp(endPosition.x, -config->fieldDimensions.length / 2.0,
+                   config->fieldDimensions.length / 2.0),
+        std::clamp(endPosition.y, -config->fieldDimensions.width / 2.0,
+                   config->fieldDimensions.width / 2.0)};
+
+    vector<array<double, 2>> predictions;
+    predictions.reserve(stepCnt);
+    double px = estimatePosition.x;
+    double py = estimatePosition.y;
+    double vx = estimateVelocity.x;
+    double vy = estimateVelocity.y;
+    const auto &fd = config->fieldDimensions;
+    for (int i = 0; i < stepCnt; ++i) {
+        predictions.push_back({
+            std::clamp(px, -fd.length / 2.0, fd.length / 2.0),
+            std::clamp(py, -fd.width / 2.0, fd.width / 2.0)});
+        ball_state_estimator::BallPhysics::propagateWithSpeedFriction(
+            px, py, vx, vy, stepSec, acceleration, speedFrictionFactor);
+    }
+
+    data->predictedBallPos = std::move(predictions);
+    data->ballPosPredictTime = now;
+
+    int closestIdx = 0;
+    double closestDist = std::numeric_limits<double>::infinity();
+    data->ballWillBreach = false;
+    for (int i = 0; i < static_cast<int>(data->predictedBallPos.size()); ++i) {
+        const auto &p = data->predictedBallPos[i];
+        const auto pr = data->field2robot({p[0], p[1], 0.0});
+        const double dist = std::hypot(pr.x, pr.y);
+        if (dist < closestDist) {
+            closestDist = dist;
+            closestIdx = i;
+        }
+        if (i == 0 && pr.x < 0.0) {
+            data->ballWillBreach = false;
+            break;
+        }
+        if (i > 0 && pr.x < 0.0) {
+            data->ballWillBreach = true;
+            data->ballBreachPoint = {p[0], p[1]};
+            data->ballBreachTime = now + rclcpp::Duration::from_nanoseconds(
+                static_cast<int64_t>(i * stepSec * 1e9));
+            break;
+        }
+    }
+    const auto &closest = data->predictedBallPos[closestIdx];
+    data->ballInterceptPoint = {closest[0], closest[1]};
+    data->ballInterceptTime = now + rclcpp::Duration::from_nanoseconds(
+        static_cast<int64_t>(closestIdx * stepSec * 1e9));
 }
 
 void Brain::updateRobotMemory() {
@@ -675,6 +1261,7 @@ void Brain::updateRobotMemory() {
 void Brain::updateKickoffMemory() {
     
     static Point ballPos;
+    static bool waitingForOpponentPrimaryKickoff = false;
     const double BALL_MOVE_THRESHOLD_FACTOR = 0.15; 
     const double BALL_MOVE_THRESHOLD_MIN = 0.3; 
     auto ballMoved = [=]() {
@@ -685,27 +1272,62 @@ void Brain::updateKickoffMemory() {
         return posChange > threshold;
     };
     static rclcpp::Time kickOffTime;
+    static bool opponentSetPlayLatched = false;
     const double TIMEOUT = 1000 * 10; 
     auto timeReached = [=]() {
         return msecsSince(kickOffTime) > TIMEOUT;
     };
-    bool isWaitingForKickoff = (
+    bool isWaitingForKickoffPreparation = (
         (tree->getEntry<string>("gc_game_state") == "SET"  || tree->getEntry<string>("gc_game_state") == "READY")
         && !tree->getEntry<bool>("gc_is_kickoff_side")
     );
-    bool isWaitingForFreekickKickoff = (
+    bool isWaitingForLegacyFreekickPreparation = (
         (tree->getEntry<string>("gc_game_sub_state") == "SET" || tree->getEntry<string>("gc_game_sub_state") == "GET_READY")
         && !tree->getEntry<bool>("gc_is_sub_state_kickoff_side")
     );
-    if ( isWaitingForFreekickKickoff || isWaitingForKickoff) {
+    const bool opponentSetPlay =
+        tree->getEntry<int>("gc_set_play") != 0
+        && !tree->getEntry<bool>("gc_is_sub_state_kickoff_side");
+    const bool isWaitingForV20SetPlayPreparation =
+        opponentSetPlay && tree->getEntry<bool>("gc_play_stopped");
+    const bool isNewOpponentSetPlay = opponentSetPlay && !opponentSetPlayLatched;
+    const bool isV20OpponentSetPlayFinished =
+        tree->getEntry<int>("gc_protocol_version") >= 20
+        && !opponentSetPlay
+        && opponentSetPlayLatched;
+
+    if (isV20OpponentSetPlayFinished) {
+        // 新版裁判机用 set_play 从非 0 变为 0 表示定位球结束，即 Ball Free。
+        tree->setEntry<bool>("wait_for_opponent_kickoff", false);
+        waitingForOpponentPrimaryKickoff = false;
+    } else if (isWaitingForLegacyFreekickPreparation
+        || isWaitingForKickoffPreparation
+        || isWaitingForV20SetPlayPreparation
+        || isNewOpponentSetPlay) {
         ballPos = data->ball.posToRobot;
         kickOffTime = get_clock()->now();
         tree->setEntry<bool>("wait_for_opponent_kickoff", true);
+        waitingForOpponentPrimaryKickoff = isWaitingForKickoffPreparation;
     } else if (tree->getEntry<bool>("wait_for_opponent_kickoff")) {
-        if (ballMoved() || timeReached()) {
+        // v20 的 secondaryTime 是距离 Ball Free 的剩余时间。
+        // 对方普通开球时优先服从裁判机，避免视觉位置抖动导致提前进入追球逻辑。
+        const bool isV20PrimaryKickoff =
+            waitingForOpponentPrimaryKickoff
+            && tree->getEntry<int>("gc_protocol_version") >= 20;
+        const bool gameControllerSaysBallFree =
+            tree->getEntry<string>("gc_game_state") == "PLAY"
+            && tree->getEntry<int>("gc_secondary_time") <= 0;
+        const bool legacyOrSetPlayReleased =
+            !isV20PrimaryKickoff && (ballMoved() || timeReached());
+
+        if ((isV20PrimaryKickoff && gameControllerSaysBallFree)
+            || legacyOrSetPlayReleased) {
             tree->setEntry<bool>("wait_for_opponent_kickoff", false);
+            waitingForOpponentPrimaryKickoff = false;
         }
     }
+
+    opponentSetPlayLatched = opponentSetPlay;
 }
 
 vector<double> Brain::getGoalPostAngles(const double margin)
@@ -764,56 +1386,64 @@ void Brain::updateCostToKick() {
     double cost = 0.;
 
 
-    // if (!data->ballDetected) cost += 2.0;
-    double secsSinceBallDet = msecsSince(data->ball.timePoint) / 1000;
-    cost += secsSinceBallDet;
-    log_(format("ball not dectect cost: %.1f", secsSinceBallDet));
+    // Keep the time since this robot last saw the ball as an ownership cost.
+    // This intentionally keeps growing while only a teammate supplies the ball.
+    const double localBallAgeCost = std::max(
+        0.0, msecsSince(data->ball.timePoint) / 1000.0);
+    cost += localBallAgeCost;
+    log_(format("local ball age cost: %.1f", localBallAgeCost));
 
 
-    if (!tree->getEntry<bool>("ball_location_known")) {
+    const bool localBallKnown = tree->getEntry<bool>("ball_location_known");
+    const bool ballLocationKnown =
+        localBallKnown || tree->getEntry<bool>("tm_ball_pos_reliable");
+    if (!localBallKnown) {
         cost += 5.0;
         log_(format("ball lost cost: %.1f", 5.0));
     }
 
+    // Ball-dependent terms are meaningful only after a local or teammate ball
+    // position has been validated. Unknown data must not influence strategy.
+    if (ballLocationKnown) {
+        cost += data->ball.range;
+        log_(format("ball range cost: %.1f", data->ball.range));
 
-    cost += data->ball.range;
-    log_(format("ball range cost: %.1f", data->ball.range));
-    
-    
-
-    if (distToObstacle(data->ball.yawToRobot) < 1.5) {
-        log_(format("obstacle cost: %.1f", 2.0));
-        cost += 2.0;
-    }
-
-
-    cost += fabs(data->ball.yawToRobot) / 1.0; 
-    log_(format("ball yaw cost: %.1f", fabs(data->ball.yawToRobot) / 1.0));
-
-
-
-    int selfIdx = config->playerId - 1;
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        if (i == selfIdx) continue; 
-
-        auto status = data->tmStatus[i]; 
-        if (!status.isAlive) continue; 
-
-        double theta_tm2ball = atan2(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double range_tm2ball = norm(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double theta_me2ball = data->robotBallAngleToField;
-        double range_me2ball = data->ball.range;
-        double deltaTheta = fabs(toPInPI(theta_tm2ball - theta_me2ball));
-
-        const double BUMP_DIST = 1.0;
-        if (range_tm2ball < range_me2ball && sin(deltaTheta) * range_tm2ball < BUMP_DIST) {
-            cost += 2.0;
-            log_(format("bump cost: %.1f", 2.0));  
+        if (distToObstacle(data->ball.yawToRobot) < 1.5) {
+            constexpr double OBSTACLE_COST = 0.5;
+            cost += OBSTACLE_COST;
+            log_(format("obstacle cost: %.1f", OBSTACLE_COST));
         }
-    }
 
-    cost += fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3; 
-    log_(format("ajust cost: %.1f", fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3));
+        cost += fabs(data->ball.yawToRobot);
+        log_(format("ball yaw cost: %.1f", fabs(data->ball.yawToRobot)));
+
+        int selfIdx = config->playerId - 1;
+        for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+            if (i == selfIdx) continue;
+
+            auto status = data->tmStatus[i];
+            if (!status.isAlive || !status.ballLocationKnown) continue;
+
+            double theta_tm2ball = atan2(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
+            double range_tm2ball = norm(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
+            double theta_me2ball = data->robotBallAngleToField;
+            double range_me2ball = data->ball.range;
+            double deltaTheta = fabs(toPInPI(theta_tm2ball - theta_me2ball));
+
+            const double BUMP_DIST = 1.0;
+            if (range_tm2ball < range_me2ball && sin(deltaTheta) * range_tm2ball < BUMP_DIST) {
+                cost += 2.0;
+                log_(format("bump cost: %.1f", 2.0));
+            }
+        }
+
+        const double alignmentError =
+            fabs(toPInPI(data->kickDir - data->robotBallAngleToField));
+        const double alignmentCost = alignmentError * 0.4 / 0.3;
+        cost += alignmentCost;
+        log_(format("alignment cost: %.1f (error: %.2f rad)",
+                    alignmentCost, alignmentError));
+    }
     
 
     if (data->recoveryState == RobotRecoveryState::HAS_FALLEN) {
@@ -829,7 +1459,7 @@ void Brain::updateCostToKick() {
     }
     
     double lastCost = data->tmMyCost;
-    data->tmMyCost = lastCost * 0.5 + cost * 0.5;
+    data->tmMyCost = lastCost * 0.8 + cost * 0.2;
     log_(format("lastCost: %.1f, newCost: %.1f, smoothCost: %.1f", lastCost, cost, data->tmMyCost));
 
     return;
@@ -845,13 +1475,13 @@ bool Brain::isAngleGood(double goalPostMargin, string type) {
     double theta_l = goalPostAngles[0]; 
     double theta_r = goalPostAngles[1]; 
     
-    if (theta_l - theta_r < M_PI / 3 * 2) { 
+    if (kick_geometry::minorArcWidth(theta_l, theta_r) < M_PI / 3 * 2) {
         goalPostAngles = getGoalPostAngles(0.5);
-        theta_l = goalPostAngles[0]; 
-        theta_r = goalPostAngles[1]; 
+        theta_l = goalPostAngles[0];
+        theta_r = goalPostAngles[1];
     }
 
-    return (theta_l > angle && theta_r < angle);
+    return kick_geometry::isAngleWithinMinorArc(angle, theta_l, theta_r);
 }
 
 bool Brain::isPrimaryStriker() {
@@ -946,13 +1576,175 @@ bool Brain::isDefensing() {
     return isFreeKick && (!isKickoffSide);
 }
 
-void Brain::calibrateOdom(double x, double y, double theta)
+bool Brain::isTrueFallRecoveryState(RobotRecoveryState state) const
 {
+    return state == RobotRecoveryState::IS_FALLING ||
+           state == RobotRecoveryState::HAS_FALLEN ||
+           state == RobotRecoveryState::IS_GETTING_UP;
+}
+
+bool Brain::isFallLocalizationHoldActive() const
+{
+    return fallLocalizationHoldActive_;
+}
+
+void Brain::updateFallLocalizationHoldState(bool holdActive)
+{
+    if (holdActive && !fallLocalizationHoldActive_) {
+        fallLocalizationHoldActive_ = true;
+        fallLocalizationHoldPose_ = data->robotPoseToField;
+        fallLocalizationHoldOdomToField_ = data->odomToField;
+        RCLCPP_WARN(
+            get_logger(),
+            "Freezing field localization during fall recovery at (%.3f, %.3f, %.3f)",
+            fallLocalizationHoldPose_.x,
+            fallLocalizationHoldPose_.y,
+            fallLocalizationHoldPose_.theta);
+    } else if (!holdActive && fallLocalizationHoldActive_) {
+        fallLocalizationHoldActive_ = false;
+        RCLCPP_INFO(
+            get_logger(),
+            "Released fall localization hold at (%.3f, %.3f, %.3f)",
+            fallLocalizationHoldPose_.x,
+            fallLocalizationHoldPose_.y,
+            fallLocalizationHoldPose_.theta);
+    }
+}
+
+void Brain::reanchorFrozenPoseToCurrentOdom(const Pose2D &targetPose)
+{
+    const double xOr =
+        -cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x -
+        sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
+    const double yOr =
+        sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x -
+        cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
+    const double thetaOr = -data->robotPoseToOdom.theta;
+    transCoord(
+        xOr, yOr, thetaOr,
+        targetPose.x, targetPose.y, targetPose.theta,
+        data->odomToField.x, data->odomToField.y, data->odomToField.theta);
+    data->robotPoseToField = targetPose;
+}
+
+void Brain::storeRobotPoseToOdomSample(const rclcpp::Time &stamp, const Pose2D &pose)
+{
+    if (stamp.nanoseconds() <= 0)
+        return;
+
+    constexpr int64_t kOdomPoseBufferNs = 5'000'000'000LL;
+    std::lock_guard<std::mutex> lock(odomPoseBufferMutex_);
+    odomPoseBuffer_.push_back(OdomPoseSample{stamp, pose});
+    const int64_t newestNs = stamp.nanoseconds();
+    while (!odomPoseBuffer_.empty() &&
+           odomPoseBuffer_.front().stamp.get_clock_type() == stamp.get_clock_type() &&
+           newestNs - odomPoseBuffer_.front().stamp.nanoseconds() > kOdomPoseBufferNs) {
+        odomPoseBuffer_.pop_front();
+    }
+    while (odomPoseBuffer_.size() > 1000)
+        odomPoseBuffer_.pop_front();
+}
+
+bool Brain::lookupRobotPoseToOdomAt(
+    const rclcpp::Time &stamp, Pose2D &pose, double *ageMs) const
+{
+    if (ageMs != nullptr)
+        *ageMs = -1.0;
+    if (stamp.nanoseconds() <= 0)
+        return false;
+
+    constexpr int64_t kMaxLookupAgeNs = 500'000'000LL;
+    std::lock_guard<std::mutex> lock(odomPoseBufferMutex_);
+    if (odomPoseBuffer_.empty())
+        return false;
+
+    const int64_t targetNs = stamp.nanoseconds();
+    auto upperIt = std::lower_bound(
+        odomPoseBuffer_.begin(), odomPoseBuffer_.end(), targetNs,
+        [](const OdomPoseSample &sample, int64_t target) {
+            return sample.stamp.nanoseconds() < target;
+        });
+
+    if (upperIt != odomPoseBuffer_.end() && upperIt != odomPoseBuffer_.begin()) {
+        const auto lowerIt = std::prev(upperIt);
+        if (lowerIt->stamp.get_clock_type() == stamp.get_clock_type() &&
+            upperIt->stamp.get_clock_type() == stamp.get_clock_type()) {
+            const int64_t lowerNs = lowerIt->stamp.nanoseconds();
+            const int64_t upperNs = upperIt->stamp.nanoseconds();
+            const int64_t nearestAbsDiffNs = std::min(targetNs - lowerNs, upperNs - targetNs);
+            if (nearestAbsDiffNs >= 0 && nearestAbsDiffNs <= kMaxLookupAgeNs) {
+                const double denom = static_cast<double>(upperNs - lowerNs);
+                const double alpha = denom > 0.0
+                    ? static_cast<double>(targetNs - lowerNs) / denom : 0.0;
+                pose.x = lowerIt->pose.x + alpha * (upperIt->pose.x - lowerIt->pose.x);
+                pose.y = lowerIt->pose.y + alpha * (upperIt->pose.y - lowerIt->pose.y);
+                pose.theta = toPInPI(
+                    lowerIt->pose.theta +
+                    alpha * toPInPI(upperIt->pose.theta - lowerIt->pose.theta));
+                if (ageMs != nullptr)
+                    *ageMs = static_cast<double>(nearestAbsDiffNs) / 1e6;
+                return true;
+            }
+        }
+    }
+
+    auto bestIt = odomPoseBuffer_.end();
+    int64_t bestAbsDiffNs = std::numeric_limits<int64_t>::max();
+    for (auto it = odomPoseBuffer_.begin(); it != odomPoseBuffer_.end(); ++it) {
+        if (it->stamp.get_clock_type() != stamp.get_clock_type())
+            continue;
+        const int64_t absDiffNs = std::llabs(it->stamp.nanoseconds() - targetNs);
+        if (absDiffNs < bestAbsDiffNs) {
+            bestAbsDiffNs = absDiffNs;
+            bestIt = it;
+        }
+    }
+    if (bestIt == odomPoseBuffer_.end() || bestAbsDiffNs > kMaxLookupAgeNs)
+        return false;
+    pose = bestIt->pose;
+    if (ageMs != nullptr)
+        *ageMs = static_cast<double>(bestAbsDiffNs) / 1e6;
+    return true;
+}
+
+void Brain::calibrateOdom(double x, double y, double theta, bool alignToVisionTime)
+{
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
+    updateFallLocalizationHoldState(isTrueFallRecoveryState(data->recoveryState));
+    if (isFallLocalizationHoldActive()) {
+        reanchorFrozenPoseToCurrentOdom(fallLocalizationHoldPose_);
+        fallLocalizationHoldOdomToField_ = data->odomToField;
+        return;
+    }
+
+    auto markings = data->getMarkings();
+    Pose2D calibrationOdom = data->robotPoseToOdom;
+    bool odomTimeMatched = false;
+    double odomTimeAgeMs = -1.0;
+
+    // 定位器使用的是标志物被拍摄时的机器人坐标。使用同一时刻的 odom
+    // 建立 odom->field，再由当前 odom 推进到当前场地位姿。
+    rclcpp::Time localizationFrameTime;
+    for (const auto &marking : markings) {
+        if (marking.timePoint.nanoseconds() <= 0)
+            continue;
+        if (localizationFrameTime.nanoseconds() <= 0 ||
+            marking.timePoint.nanoseconds() > localizationFrameTime.nanoseconds()) {
+            localizationFrameTime = marking.timePoint;
+        }
+    }
+
+    if (alignToVisionTime && localizationFrameTime.nanoseconds() > 0 &&
+        data->timeLastOdom.nanoseconds() > 0 &&
+        data->timeLastOdom.get_clock_type() == localizationFrameTime.get_clock_type())
+        odomTimeMatched = lookupRobotPoseToOdomAt(
+            localizationFrameTime, calibrationOdom, &odomTimeAgeMs);
 
     double x_or, y_or, theta_or; // or = odom to robot
-    x_or = -cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x - sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
-    y_or = sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x - cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
-    theta_or = -data->robotPoseToOdom.theta;
+    x_or = -cos(calibrationOdom.theta) * calibrationOdom.x - sin(calibrationOdom.theta) * calibrationOdom.y;
+    y_or = sin(calibrationOdom.theta) * calibrationOdom.x - cos(calibrationOdom.theta) * calibrationOdom.y;
+    theta_or = -calibrationOdom.theta;
 
     
     transCoord(x_or, y_or, theta_or,
@@ -988,10 +1780,26 @@ void Brain::calibrateOdom(double x, double y, double theta)
     }
     
     // markers
-    auto markings = data->getMarkings();
     for (int i = 0; i < markings.size(); i++) {
         updateFieldPos(markings[i]);
     }
+
+    log->setTimeNow();
+    log->log(
+        "debug/odom_calibration",
+        rerun::TextLog(format(
+            "vision_odom_matched=%d age_ms=%.1f source=(%.3f, %.3f, %.3f) current=(%.3f, %.3f, %.3f) field=(%.3f, %.3f, %.3f)",
+            odomTimeMatched ? 1 : 0,
+            odomTimeAgeMs,
+            calibrationOdom.x,
+            calibrationOdom.y,
+            calibrationOdom.theta,
+            data->robotPoseToOdom.x,
+            data->robotPoseToOdom.y,
+            data->robotPoseToOdom.theta,
+            data->robotPoseToField.x,
+            data->robotPoseToField.y,
+            data->robotPoseToField.theta)));
 
     // relog
     log->setTimeNow();
@@ -1076,21 +1884,18 @@ double Brain::msecsSince(rclcpp::Time time)
 
 rclcpp::Time Brain::timePointFromHeader(std_msgs::msg::Header header) {
     auto stamp = header.stamp;
-    // NOTE 似乎无论 use_sim_time 是否为真, 都使用的是 ROS_TIME 
-    auto sec = stamp.sec;
-    auto nanosec = stamp.nanosec;
-    if (sec <= 0 || nanosec <= 0) {
-        sec = 1;
-        nanosec = 1;
-        prtErr(format("Negative time: sec: %d nanosec: %d"));
-    }
-    return rclcpp::Time(sec, nanosec, RCL_ROS_TIME); // should not crash
-    // return rclcpp::Time(stamp.sec, stamp.nanosec, RCL_ROS_TIME);  // should crash sometimes
+    // nanosec == 0 是合法时间戳；旧代码把它改成 1ns，导致视觉帧无法
+    // 与同一时刻的 odom 样本对齐。零时间戳保留为无效值，由调用方回退。
+    if (stamp.sec < 0 || (stamp.sec == 0 && stamp.nanosec == 0))
+        return rclcpp::Time(0, 0, RCL_ROS_TIME);
+    return rclcpp::Time(stamp.sec, stamp.nanosec, RCL_ROS_TIME);
 }
 
 
 void Brain::joystickCallback(const booster_interface::msg::RemoteControllerState &joy)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     auto log_ = [=](string msg) {
         log->setTimeNow();
         log->log("debug/joystick", rerun::TextLog(msg));
@@ -1204,7 +2009,14 @@ void Brain::joystickCallback(const booster_interface::msg::RemoteControllerState
 
 void Brain::gameControlCallback(const game_controller_interface::msg::GameControlData &msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     data->timeLastGamecontrolMsg = get_clock()->now();
+    communication->setGameControllerProtocolVersion(msg.version);
+    tree->setEntry<bool>("gc_play_stopped", msg.stopped);
+    tree->setEntry<int>("gc_set_play", static_cast<int>(msg.set_play));
+    tree->setEntry<int>("gc_protocol_version", static_cast<int>(msg.version));
+    tree->setEntry<int>("gc_secondary_time", static_cast<int>(msg.secondary_time));
 
     // 处理比赛的一级状态
     auto lastGameState = tree->getEntry<string>("gc_game_state"); // 比赛的一级状态
@@ -1215,6 +2027,10 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
         "PLAY",    // 正常比赛
         "END"      // 比赛结束
     };
+    if (msg.state >= gameStateMap.size()) {
+        prtErr(format("received invalid game controller state %d", msg.state));
+        return;
+    }
     string gameState = gameStateMap[static_cast<int>(msg.state)];
     tree->setEntry<string>("gc_game_state", gameState);
     bool isKickOffSide = (msg.kick_off_team == config->teamId); // 我方是否是开球方
@@ -1267,14 +2083,75 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
             break;
         default:
             gameSubStateType = "FREE_KICK";
+            data->realGameSubState = "UNKNOWN_SET_PLAY";
             break;
     }
     vector<string> gameSubStateMap = {"STOP", "GET_READY", "SET"};                               // STOP: 停下来; -> GET_READY: 移动到进攻或防守位置; -> SET: 站住不动
-    string gameSubState = gameSubStateMap[static_cast<int>(msg.secondary_state_info[1])];
+    string gameSubState;
+    if (msg.version >= 20 && (msg.game_phase == 1 || msg.game_phase == 2)) {
+        gameSubStateType = "NONE";
+        data->realGameSubState = msg.game_phase == 1 ? "PENALTYSHOOT" : "OVERTIME";
+    }
+    const bool isSubStateKickOffSide =
+        msg.version >= 20
+        ? static_cast<int>(msg.kick_off_team) == config->teamId
+        : static_cast<int>(msg.secondary_state_info[0]) == config->teamId;
+
+    if (msg.version >= 20) {
+        if (gameSubStateType == "FREE_KICK") {
+            if (msg.stopped) {
+                gameSubState = "STOP";
+            } else if (isSubStateKickOffSide) {
+                // 我方定位球恢复后沿用原来的普通进攻树，由我方完成开球。
+                gameSubStateType = "NONE";
+                gameSubState = "PLAY";
+                data->isFreekickKickingOff = true;
+                data->freekickKickoffStartTime = get_clock()->now();
+            } else {
+                // 对方定位球恢复后只运行找球/防守站位树；Ball Free 前禁止进入 Kick。
+                gameSubState = "GET_READY";
+            }
+        } else {
+            gameSubState = msg.stopped ? "STOP" : "PLAY";
+        }
+    } else {
+        const auto legacySubState = static_cast<unsigned char>(msg.secondary_state_info[1]);
+        gameSubState = legacySubState < gameSubStateMap.size()
+            ? gameSubStateMap[legacySubState]
+            : "STOP";
+    }
     tree->setEntry<string>("gc_game_sub_state_type", gameSubStateType);
     tree->setEntry<string>("gc_game_sub_state", gameSubState);
-    bool isSubStateKickOffSide = (static_cast<int>(msg.secondary_state_info[0]) == config->teamId); // 在二级状态下, 我方是否是开球方. 例如, 当前二级状态为任意球, 我方是否是开任意球的一方
     tree->setEntry<bool>("gc_is_sub_state_kickoff_side", isSubStateKickOffSide);
+    const bool penaltyKickActive = gameState == "PLAY" &&
+        (data->realGameSubState == "PENALTY_KICK" ||
+         data->realGameSubState == "PENALTYSHOOT");
+    tree->setEntry<bool>("penalty_kick_active", penaltyKickActive);
+    tree->setEntry<bool>("penalty_kick_defending",
+        penaltyKickActive && !isSubStateKickOffSide);
+
+    int setPlaySearchDirection = 0;
+    const bool farSetPlaySearchEnabled =
+        get_parameter("strategy.far_set_play_search.enable").as_bool();
+    const bool isActiveSetPlay =
+        msg.version >= 20
+        && msg.set_play != 0;
+    if (farSetPlaySearchEnabled && isActiveSetPlay) {
+        if (data->realGameSubState == "GOAL_KICK") {
+            // 门球位于获得门球一方所防守的半场：
+            // 我方门球去我方半场，对方门球去对方半场。
+            setPlaySearchDirection =
+                isSubStateKickOffSide ? -1 : 1;
+        } else if (data->realGameSubState == "CORNER_KICK") {
+            // 角球位于获得角球一方所进攻的半场：
+            // 我方角球去对方半场，对方角球去我方半场。
+            setPlaySearchDirection =
+                isSubStateKickOffSide ? 1 : -1;
+        }
+    }
+    tree->setEntry<int>(
+        "gc_opponent_set_play_search_direction",
+        setPlaySearchDirection);
 
     // cout << "game state: " << gameState << " game sub state type: " << gameSubStateType << endl;
     // 找到队的信息
@@ -1297,6 +2174,8 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
             msg.teams[0].team_number, msg.teams[1].team_number, config->teamId));
         return;
     }
+
+    data->goalkeeperPlayerId = static_cast<int>(myTeamInfo.goalkeeper);
 
     int liveCount = 0;
     int oppoLiveCount = 0;
@@ -1331,8 +2210,8 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
     log->setTimeNow();
     log->logToScreen(
         "tick/gamecontrol",
-        format("Player: %d  Role: %s PrimaryStriker: %s GameState: %s  SubStateType: %s  SubState: %s UnderPenalty: %d isKickoff: %d isSubStateKickoff: %d", 
-            config->playerId, tree->getEntry<string>("player_role").c_str(), isPrimaryStriker() ? "Yes" : "No", gameState.c_str(), gameSubStateType.c_str(), gameSubState.c_str(), isUnderPenalty, isKickOffSide, isSubStateKickOffSide
+        format("Player: %d  Role: %s PrimaryStriker: %s GameState: %s  SubStateType: %s  SubState: %s UnderPenalty: %d isKickoff: %d isSubStateKickoff: %d SetPlaySearchDir: %d", 
+            config->playerId, tree->getEntry<string>("player_role").c_str(), isPrimaryStriker() ? "Yes" : "No", gameState.c_str(), gameSubStateType.c_str(), gameSubState.c_str(), isUnderPenalty, isKickOffSide, isSubStateKickOffSide, setPlaySearchDirection
             ),
         0xFFFFFFFF,
         30.0
@@ -1345,7 +2224,7 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
 
 void Brain::detectionsCallback(const vision_interface::msg::Detections &msg)
 {
-    // std::lock_guard<std::mutex> guard(data->brainMutex);
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
     
     // auto detection_time_stamp = msg.header.stamp;
     // rclcpp::Time timePoint(detection_time_stamp.sec, detection_time_stamp.nanosec);
@@ -1409,6 +2288,8 @@ void Brain::updateLinePosToField(FieldLine& line) {
 
 void Brain::fieldLineCallback(const vision_interface::msg::LineSegments &msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     // auto timestamp = msg.header.stamp;
     // rclcpp::Time timePoint(timestamp.sec, timestamp.nanosec);
     auto timePoint = timePointFromHeader(msg.header);
@@ -1555,20 +2436,35 @@ void Brain::fieldLineCallback(const vision_interface::msg::LineSegments &msg)
 
 void Brain::odometerCallback(const booster_interface::msg::Odometer &msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
+    const rclcpp::Time callbackTime = get_clock()->now();
+    data->timeLastOdom = callbackTime;
+    ++data->odomUpdateCount;
+    data->odomBuffer.add(msg, callbackTime);
 
     data->robotPoseToOdom.x = msg.x * config->robotOdomFactor;
     data->robotPoseToOdom.y = msg.y * config->robotOdomFactor;
     data->robotPoseToOdom.theta = msg.theta;
+    storeRobotPoseToOdomSample(callbackTime, data->robotPoseToOdom);
 
-    // 根据 Odom 信息, 更新机器人在 Field 坐标系中的位置
-    transCoord(
-        data->robotPoseToOdom.x, data->robotPoseToOdom.y, data->robotPoseToOdom.theta,
-        data->odomToField.x, data->odomToField.y, data->odomToField.theta,
-        data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta);
+    updateFallLocalizationHoldState(isTrueFallRecoveryState(data->recoveryState));
+    if (isFallLocalizationHoldActive()) {
+        // 起身/倒地时底层 odom 可能跳变；保持最后可信的场地位姿，同时
+        // 每帧重锚定 odom->field，使恢复后不会把跳变一次性带入场地坐标。
+        reanchorFrozenPoseToCurrentOdom(fallLocalizationHoldPose_);
+        fallLocalizationHoldOdomToField_ = data->odomToField;
+    } else {
+        // 根据 Odom 信息, 更新机器人在 Field 坐标系中的位置
+        transCoord(
+            data->robotPoseToOdom.x, data->robotPoseToOdom.y, data->robotPoseToOdom.theta,
+            data->odomToField.x, data->odomToField.y, data->odomToField.theta,
+            data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta);
+    }
 
     // 发布tf变换
     geometry_msgs::msg::TransformStamped transform;
-    transform.header.stamp = this->get_clock()->now();
+    transform.header.stamp = callbackTime;
     transform.header.frame_id = "odom";
     transform.child_frame_id = "base_link";
     
@@ -1586,7 +2482,7 @@ void Brain::odometerCallback(const booster_interface::msg::Odometer &msg)
     transform.transform.rotation.w = q.w();
 
     log->setTimeNow();
-    log->log("debug/odom_callback", rerun::TextLog(format("x: %.1f, y: %.1f, z: %.1f", data->robotPoseToOdom.x, data->robotPoseToOdom.y, data->robotPoseToOdom.theta)));
+    log->log("debug/odom_callback", rerun::TextLog(format("x: %.3f, y: %.3f, theta: %.3f update_count: %llu", data->robotPoseToOdom.x, data->robotPoseToOdom.y, data->robotPoseToOdom.theta, static_cast<unsigned long long>(data->odomUpdateCount))));
     
     // 广播tf变换
     tf_broadcaster_->sendTransform(transform);
@@ -1603,6 +2499,8 @@ void Brain::odometerCallback(const booster_interface::msg::Odometer &msg)
 
 void Brain::lowStateCallback(const booster_interface::msg::LowState &msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     data->headYaw = msg.motor_state_serial[0].q;
     data->headPitch = msg.motor_state_serial[1].q;
     log->log("debug/head_angles", rerun::TextLog(format("pitch: %.1f, yaw: %.1f", data->headYaw, data->headPitch)));
@@ -1666,6 +2564,8 @@ void Brain::imageCallback(const sensor_msgs::msg::Image &msg)
 
 void Brain::headPoseCallback(const geometry_msgs::msg::Pose& msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     // 计算 head_to_base 矩阵
     Eigen::Matrix4d headToBase = Eigen::Matrix4d::Identity();
     
@@ -1698,14 +2598,23 @@ void Brain::headPoseCallback(const geometry_msgs::msg::Pose& msg)
 
 void Brain::recoveryStateCallback(const booster_interface::msg::RawBytesMsg &msg)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+
     // uint8_t state; // IS_READY = 0, IS_FALLING = 1, HAS_FALLEN = 2, IS_GETTING_UP = 3,  
     // uint8_t is_recovery_available; // 1 for available, 0 for not available
     // 使用 RobotRecoveryState 结构，将msg里面的msg转换为RobotRecoveryState
     try
     {
         const std::vector<unsigned char>& buffer = msg.msg;
+        if (buffer.size() < sizeof(RobotRecoveryStateData)) {
+            RCLCPP_WARN(
+                get_logger(),
+                "Invalid recovery state message size: %zu < %zu",
+                buffer.size(), sizeof(RobotRecoveryStateData));
+            return;
+        }
         RobotRecoveryStateData recoveryState;
-        memcpy(&recoveryState, buffer.data(), buffer.size());
+        memcpy(&recoveryState, buffer.data(), sizeof(RobotRecoveryStateData));
 
         vector<RobotRecoveryState> recoveryStateMap = {
             RobotRecoveryState::IS_READY,
@@ -1713,10 +2622,24 @@ void Brain::recoveryStateCallback(const booster_interface::msg::RawBytesMsg &msg
             RobotRecoveryState::HAS_FALLEN,
             RobotRecoveryState::IS_GETTING_UP
         };
+        if (recoveryState.state >= recoveryStateMap.size()) {
+            RCLCPP_WARN(get_logger(), "Invalid recovery state value: %u", static_cast<unsigned int>(recoveryState.state));
+            return;
+        }
+        const auto previousState = this->data->recoveryState;
         this->data->recoveryState = recoveryStateMap[static_cast<int>(recoveryState.state)];
         this->data->isRecoveryAvailable = static_cast<bool>(recoveryState.is_recovery_available);
         this->data->currentRobotModeIndex = static_cast<int>(recoveryState.current_planner_index);
-        
+
+        const bool wasRecovering = isTrueFallRecoveryState(previousState);
+        const bool isRecovering = isTrueFallRecoveryState(this->data->recoveryState);
+        if (wasRecovering && !isRecovering && fallLocalizationHoldActive_)
+            reanchorFrozenPoseToCurrentOdom(fallLocalizationHoldPose_);
+        updateFallLocalizationHoldState(isRecovering);
+        if (isRecovering && !wasRecovering) {
+            RCLCPP_WARN(get_logger(), "Recovery state entered: %u", static_cast<unsigned int>(recoveryState.state));
+        }
+
         // cout << "recoveryState: " << static_cast<int>(recoveryState.state) << endl;
         // cout << "recovery is available: " << static_cast<int>(recoveryState.is_recovery_available) << endl;
         // cout << "current planner idx: " << static_cast<int>(recoveryState.current_planner_index) << endl;
@@ -1757,8 +2680,12 @@ int Brain::goalpostCntOnFieldLine(const FieldLine line, const double margin) {
 }
 
 bool Brain::isBallOnFieldLine(const FieldLine line, const double margin) {
+    if (!tree->getEntry<bool>("ball_location_known") &&
+        !tree->getEntry<bool>("tm_ball_pos_reliable")) {
+        return false;
+    }
     auto ballPos = data->ball.posToField;
-    Point2D point = {ballPos.x, ballPos.y}; 
+    Point2D point = {ballPos.x, ballPos.y};
     return fabs(pointPerpDistToLine(point, line.posToField)) < margin;
 }
 
@@ -2002,7 +2929,7 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
         // 计算角度
         gObj.range = norm(gObj.posToRobot.x, gObj.posToRobot.y);
         gObj.yawToRobot = atan2(gObj.posToRobot.y, gObj.posToRobot.x);
-        gObj.pitchToRobot = atan2(config->robotHeight, gObj.range); // 注意这是一个近似值
+        gObj.pitchToRobot = pitchToGroundObject(config->robotHeight, gObj.range); // 注意这是一个近似值
 
         // 计算对象在 field 坐标系中的位置
         transCoord(
@@ -2019,6 +2946,7 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
 
 void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
 {
+    static rclcpp::Time lastSeenRealBallTime;
     double bestConfidence = 0;
     int indexRealBall = -1;  // 认为哪一个球是真的, -1 表示没有检测到球
 
@@ -2065,6 +2993,8 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         }
     }
 
+    auto now = this->get_clock()->now();
+
     if (indexRealBall >= 0)
     { // 检测到球了
         data->ballDetected = true;
@@ -2073,7 +3003,11 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         data->ball.confidence = bestConfidence;
 
         tree->setEntry<bool>("ball_location_known", true);
-        updateBallOut();        
+        updateBallOut();
+        updateBallPrediction();
+
+        lastSeenRealBallTime = now;
+        data->lose_ball = false;        
     }
     else
     { // 没有检测到球
@@ -2084,11 +3018,30 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         data->ball.boundingBox.xmax = 0;
         data->ball.boundingBox.ymin = 0;
         data->ball.boundingBox.ymax = 0;
+
+        if (lastSeenRealBallTime.seconds() > 0.0)
+        {
+            double msecs = (now - lastSeenRealBallTime).nanoseconds() / 1e6;
+            data->lose_ball = (msecs > get_parameter("strategy.ball_lost_msecs").as_double());
+        }
+        else
+        {
+            data->lose_ball = false;
+        }
+
         // data->ball.confidence = 0; // DO NOT set confidence to 0, confidence decay depends on this.
     }
 
-    // 计算机器人到球的向量, 在 field 坐标系中的方向
-    data->robotBallAngleToField = atan2(data->ball.posToField.y - data->robotPoseToField.y, data->ball.posToField.x - data->robotPoseToField.x);
+    // 计算机器人到球的向量, 在 field 坐标系中的方向。
+    // 尚未获得有效球位置时使用明确的中性值。
+    if (tree->getEntry<bool>("ball_location_known") ||
+        tree->getEntry<bool>("tm_ball_pos_reliable")) {
+        data->robotBallAngleToField = atan2(
+            data->ball.posToField.y - data->robotPoseToField.y,
+            data->ball.posToField.x - data->robotPoseToField.x);
+    } else {
+        data->robotBallAngleToField = 0.0;
+    }
 }
 
 void Brain::detectProcessMarkings(const vector<GameObject> &markingObjs)
@@ -2569,7 +3522,7 @@ void Brain::updateRelativePos(GameObject &obj) {
     obj.posToRobot.y = pr.y;
     obj.range = norm(obj.posToRobot.x, obj.posToRobot.y);
     obj.yawToRobot = atan2(obj.posToRobot.y, obj.posToRobot.x);
-    obj.pitchToRobot = asin(config->robotHeight / obj.range);
+    obj.pitchToRobot = pitchToGroundObject(config->robotHeight, obj.range);
 }
 
 void Brain::updateFieldPos(GameObject &obj) {
@@ -2582,7 +3535,7 @@ void Brain::updateFieldPos(GameObject &obj) {
     obj.posToField.y = pf.y;
     obj.range = norm(obj.posToRobot.x, obj.posToRobot.y);
     obj.yawToRobot = atan2(obj.posToRobot.y, obj.posToRobot.x);
-    obj.pitchToRobot = asin(config->robotHeight / obj.range);
+    obj.pitchToRobot = pitchToGroundObject(config->robotHeight, obj.range);
 }
 
 void Brain::depthImageCallback(const sensor_msgs::msg::Image &msg)
@@ -2642,6 +3595,10 @@ void Brain::depthImageCallback(const sensor_msgs::msg::Image &msg)
         // 创建网格占用数组
         vector<vector<int>> grid_occupied(grid_x_count, vector<int>(grid_y_count, 0));
         
+        const bool ballLocationKnown =
+            tree->getEntry<bool>("ball_location_known") ||
+            tree->getEntry<bool>("tm_ball_pos_reliable");
+
         // 处理深度图像点
         const int sampleStep = get_parameter("obstacle_avoidance.depth_sample_step").as_int();
         for (int y = 0; y < msg.height; y += sampleStep)
@@ -2679,6 +3636,7 @@ void Brain::depthImageCallback(const sensor_msgs::msg::Image &msg)
                             && point_robot(1) >= EXCLUDE_MIN_Y && point_robot(1) <= EXCLUDE_MAX_Y;
                     };
                     auto isBall = [&]() {
+                        if (!ballLocationKnown) return false;
                         double r = get_parameter("obstacle_avoidance.ball_exclusion_radius").as_double();
                         double h = get_parameter("obstacle_avoidance.ball_exclusion_height").as_double();
                         return fabs(point_robot(0) - data->ball.posToRobot.x) < r 
@@ -2830,6 +3788,394 @@ double Brain::calcAvoidDir(double startAngle, double safeDist) {
 void Brain::updateLogFile() {
     if (config->rerunLogEnableFile && msecsSince(data->timeLastLogSave) > config->rerunLogMaxFileMins * 60000)
         log->updateLogFilePath();
+}
+
+void Brain::setupLowFrequencyDiagnostics()
+{
+    get_parameter("debug.low_frequency_status.enable", lowFrequencyStatusEnable_);
+    get_parameter("debug.low_frequency_status.mode_enable", lowFrequencyStatusModeEnable_);
+    get_parameter("debug.low_frequency_status.field_ascii_enable", lowFrequencyStatusFieldAsciiEnable_);
+    get_parameter("debug.low_frequency_status.log_interval_ms", lowFrequencyStatusLogIntervalMs_);
+    get_parameter("debug.low_frequency_status.mode_query_interval_ms", lowFrequencyStatusModeQueryIntervalMs_);
+    get_parameter("debug.low_frequency_status.mode_query_timeout_ms", lowFrequencyStatusModeQueryTimeoutMs_);
+    get_parameter("debug.low_frequency_status.field_ascii_interval_ms", lowFrequencyStatusFieldAsciiIntervalMs_);
+    get_parameter("debug.low_frequency_status.field_ascii_char_aspect", lowFrequencyStatusFieldAsciiCharAspect_);
+    get_parameter("debug.low_frequency_status.field_ascii_width", lowFrequencyStatusFieldAsciiWidth_);
+
+    lowFrequencyStatusLogIntervalMs_ = std::max(500.0, lowFrequencyStatusLogIntervalMs_);
+    lowFrequencyStatusModeQueryIntervalMs_ = std::max(500.0, lowFrequencyStatusModeQueryIntervalMs_);
+    lowFrequencyStatusModeQueryTimeoutMs_ = std::max(100.0, lowFrequencyStatusModeQueryTimeoutMs_);
+    lowFrequencyStatusFieldAsciiIntervalMs_ = std::max(1000.0, lowFrequencyStatusFieldAsciiIntervalMs_);
+    lowFrequencyStatusFieldAsciiCharAspect_ = std::clamp(lowFrequencyStatusFieldAsciiCharAspect_, 1.0, 3.0);
+    lowFrequencyStatusFieldAsciiWidth_ = std::clamp(lowFrequencyStatusFieldAsciiWidth_, 20, 90);
+
+    if (!lowFrequencyStatusEnable_)
+        return;
+
+    if (lowFrequencyStatusModeEnable_) {
+        auto locoApiQos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+        modeQueryPublisher_ = create_publisher<booster_msgs::msg::RpcReqMsg>(
+            "LocoApiTopicReq", locoApiQos);
+        locoApiResponseSubscription_ = create_subscription<booster_msgs::msg::RpcRespMsg>(
+            "LocoApiTopicResp",
+            locoApiQos,
+            bind(&Brain::locoApiResponseCallback, this, _1));
+    } else {
+        std::lock_guard<std::mutex> lock(lowFrequencyStatusMutex_);
+        sdkRobotModeError_ = "mode_query_disabled";
+    }
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[low_frequency_status] enabled mode=%d mode_interval=%.0fms field_ascii=%d field_interval=%.0fms",
+        lowFrequencyStatusModeEnable_ ? 1 : 0,
+        lowFrequencyStatusModeQueryIntervalMs_,
+        lowFrequencyStatusFieldAsciiEnable_ ? 1 : 0,
+        lowFrequencyStatusFieldAsciiIntervalMs_);
+}
+
+void Brain::sendModeQueryIfNeeded(const rclcpp::Time &now)
+{
+    if (!lowFrequencyStatusModeEnable_ || modeQueryPublisher_ == nullptr)
+        return;
+
+    std::string uuid;
+    {
+        std::lock_guard<std::mutex> lock(lowFrequencyStatusMutex_);
+
+        if (!pendingModeQueryUuid_.empty()) {
+            const bool timeout =
+                pendingModeQueryTime_.nanoseconds() > 0 &&
+                pendingModeQueryTime_.get_clock_type() == now.get_clock_type() &&
+                (now - pendingModeQueryTime_).nanoseconds() / 1e6 > lowFrequencyStatusModeQueryTimeoutMs_;
+            if (!timeout)
+                return;
+
+            sdkRobotModeError_ = "query_timeout";
+            pendingModeQueryUuid_.clear();
+        }
+
+        if (lastModeQueryTime_.nanoseconds() > 0 &&
+            lastModeQueryTime_.get_clock_type() == now.get_clock_type() &&
+            (now - lastModeQueryTime_).nanoseconds() / 1e6 < lowFrequencyStatusModeQueryIntervalMs_) {
+            return;
+        }
+
+        uuid = gen_uuid();
+        pendingModeQueryUuid_ = uuid;
+        pendingModeQueryTime_ = now;
+        lastModeQueryTime_ = now;
+    }
+
+    booster_msgs::msg::RpcReqMsg msg;
+    msg.uuid = uuid;
+    msg.header = "{\"api_id\":2017,\"expect_response\":true}";
+    msg.body = "";
+    modeQueryPublisher_->publish(msg);
+}
+
+void Brain::locoApiResponseCallback(const booster_msgs::msg::RpcRespMsg &msg)
+{
+    if (!lowFrequencyStatusEnable_ || !lowFrequencyStatusModeEnable_)
+        return;
+
+    std::lock_guard<std::mutex> lock(lowFrequencyStatusMutex_);
+    if (pendingModeQueryUuid_.empty() || msg.uuid != pendingModeQueryUuid_)
+        return;
+
+    pendingModeQueryUuid_.clear();
+    const auto now = get_clock()->now();
+
+    int status = 0;
+    if (!msg.header.empty() && !extractJsonIntField(msg.header, "status", &status)) {
+        sdkRobotModeStatus_ = -1;
+        sdkRobotModeError_ = "bad_response_header";
+        return;
+    }
+
+    sdkRobotModeStatus_ = status;
+    if (status != 0) {
+        sdkRobotModeError_ = format("response_status_%d", status);
+        return;
+    }
+
+    int mode = -1;
+    if (!extractJsonIntField(msg.body, "mode", &mode)) {
+        sdkRobotModeError_ = "bad_response_body";
+        return;
+    }
+
+    sdkRobotMode_ = mode;
+    sdkRobotModeTime_ = now;
+    sdkRobotModeError_.clear();
+}
+
+void Brain::logLowFrequencyDiagnostics(const rclcpp::Time &now)
+{
+    const bool shouldLogStatus =
+        lastLowFrequencyStatusLogTime_.nanoseconds() == 0 ||
+        lastLowFrequencyStatusLogTime_.get_clock_type() != now.get_clock_type() ||
+        (now - lastLowFrequencyStatusLogTime_).nanoseconds() / 1e6 >= lowFrequencyStatusLogIntervalMs_;
+    const bool shouldLogField =
+        lowFrequencyStatusFieldAsciiEnable_ &&
+        (lastFieldAsciiLogTime_.nanoseconds() == 0 ||
+         lastFieldAsciiLogTime_.get_clock_type() != now.get_clock_type() ||
+         (now - lastFieldAsciiLogTime_).nanoseconds() / 1e6 >= lowFrequencyStatusFieldAsciiIntervalMs_);
+
+    if (!shouldLogStatus && !shouldLogField)
+        return;
+
+    int mode = -1;
+    int modeStatus = -1;
+    double modeAgeMs = -1.0;
+    bool modePending = false;
+    std::string modeError;
+    {
+        std::lock_guard<std::mutex> lock(lowFrequencyStatusMutex_);
+        mode = sdkRobotMode_;
+        modeStatus = sdkRobotModeStatus_;
+        modePending = !pendingModeQueryUuid_.empty();
+        modeError = sdkRobotModeError_;
+        if (sdkRobotModeTime_.nanoseconds() > 0 &&
+            sdkRobotModeTime_.get_clock_type() == now.get_clock_type()) {
+            modeAgeMs = (now - sdkRobotModeTime_).nanoseconds() / 1e6;
+        }
+    }
+
+    const Pose2D robotPose = data->robotPoseToField;
+    const Pose2D odomPose = data->robotPoseToOdom;
+    const uint64_t odomUpdateCount = data->odomUpdateCount;
+    double odomAgeMs = -1.0;
+    if (data->timeLastOdom.nanoseconds() > 0 &&
+        data->timeLastOdom.get_clock_type() == now.get_clock_type()) {
+        odomAgeMs = (now - data->timeLastOdom).nanoseconds() / 1e6;
+    }
+    Point ballField{0.0, 0.0, 0.0};
+    bool ballDetected = false;
+    bool ballKnown = false;
+    double ballAgeMs = -1.0;
+    double ballRange = -1.0;
+    double ballConfidence = 0.0;
+    if (data->ballDetected)
+        lowFrequencyStatusBallSeenOnce_ = true;
+    if (lowFrequencyStatusBallSeenOnce_) {
+        ballDetected = data->ballDetected;
+        ballField = data->ball.posToField;
+        ballRange = data->ball.range;
+        ballConfidence = data->ball.confidence;
+        ballKnown = std::isfinite(ballField.x) &&
+            std::isfinite(ballField.y) &&
+            data->ball.timePoint.nanoseconds() > 0;
+        if (ballKnown && data->ball.timePoint.get_clock_type() == now.get_clock_type())
+            ballAgeMs = (now - data->ball.timePoint).nanoseconds() / 1e6;
+    }
+
+    string gameState = "-----";
+    string gameSubState = "-----";
+    string decision = "-----";
+    int controlState = -1;
+    try {
+        gameState = tree->getEntry<string>("gc_game_state");
+        gameSubState = tree->getEntry<string>("gc_game_sub_state");
+        decision = tree->getEntry<string>("decision");
+        controlState = tree->getEntry<int>("control_state");
+        if (gameState.empty()) gameState = "-----";
+        if (gameSubState.empty()) gameSubState = "-----";
+        if (decision.empty()) decision = "-----";
+    } catch (const std::exception &e) {
+        decision = string("blackboard_error:") + e.what();
+    }
+
+    if (shouldLogStatus) {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(2);
+        ss << "MODE: " << modeNameFromIndex(mode) << "(" << mode << ")"
+           << " sdk_status=" << modeStatus
+           << " cache_age_ms=" << std::setprecision(0) << modeAgeMs
+           << " next_query_pending=" << (modePending ? 1 : 0)
+           << " error=" << (modeError.empty() ? "none" : modeError) << "\n";
+        ss << std::setprecision(2)
+           << "robot_field_pose x=" << robotPose.x
+           << " y=" << robotPose.y
+           << " theta_deg=" << robotPose.theta * 180.0 / M_PI
+           << " heading=" << headingChar(robotPose.theta) << "\n";
+        ss << "robot_odom_pose x=" << odomPose.x
+           << " y=" << odomPose.y
+           << " theta=" << odomPose.theta
+           << " age_ms=" << std::setprecision(0) << odomAgeMs
+           << " update_count=" << odomUpdateCount
+           << " recovery_hold=" << (fallLocalizationHoldActive_ ? 1 : 0) << "\n";
+        ss << "ball_field_pos x=" << ballField.x
+           << " y=" << ballField.y
+           << " detected=" << (ballDetected ? 1 : 0)
+           << " known=" << (ballKnown ? 1 : 0)
+           << " age_ms=" << std::setprecision(0) << ballAgeMs
+           << " range=" << std::setprecision(2) << ballRange
+           << " confidence=" << ballConfidence << "\n";
+        ss << "game_state=" << gameState
+           << " sub_state=" << gameSubState
+           << " control_state=" << controlState
+           << " decision=" << decision;
+        const string statusText = ss.str();
+
+        RCLCPP_INFO(get_logger(), "[low_frequency_status]\n%s", statusText.c_str());
+        log->setTimeNow();
+        log->log("debug/low_frequency_status", rerun::TextLog(statusText));
+        lastLowFrequencyStatusLogTime_ = now;
+    }
+
+    if (shouldLogField) {
+        const string fieldText = makeLowFrequencyFieldAscii(robotPose, ballField, ballKnown);
+        RCLCPP_INFO(get_logger(), "[field_ascii]\n%s", fieldText.c_str());
+        log->setTimeNow();
+        log->log("debug/field_ascii", rerun::TextLog(fieldText));
+        lastFieldAsciiLogTime_ = now;
+    }
+}
+
+std::string Brain::makeLowFrequencyFieldAscii(
+    const Pose2D &robotPose,
+    const Point &ballField,
+    bool ballKnown) const
+{
+    const auto &fd = config->fieldDimensions;
+    if (fd.length <= 0.0 || fd.width <= 0.0)
+        return "field dimensions invalid";
+
+    const int innerW = std::clamp(lowFrequencyStatusFieldAsciiWidth_, 20, 90);
+    const double charAspect = std::clamp(lowFrequencyStatusFieldAsciiCharAspect_, 1.0, 3.0);
+    const int innerH = std::clamp(
+        static_cast<int>(std::round(innerW * fd.width / fd.length / charAspect)), 8, 60);
+    const double halfL = fd.length * 0.5;
+    const double halfW = fd.width * 0.5;
+    std::vector<std::string> grid(innerH + 2, std::string(innerW + 2, ' '));
+
+    for (int c = 0; c < innerW + 2; ++c) {
+        grid.front()[c] = '-';
+        grid.back()[c] = '-';
+    }
+    for (int r = 0; r < innerH + 2; ++r) {
+        grid[r].front() = '|';
+        grid[r].back() = '|';
+    }
+    grid.front().front() = '+';
+    grid.front().back() = '+';
+    grid.back().front() = '+';
+    grid.back().back() = '+';
+
+    auto colForX = [&](double x) {
+        const double ratio = (x + halfL) / fd.length;
+        return 1 + std::clamp(
+            static_cast<int>(std::lround(ratio * (innerW - 1))), 0, innerW - 1);
+    };
+    auto rowForY = [&](double y) {
+        const double ratio = (halfW - y) / fd.width;
+        return 1 + std::clamp(
+            static_cast<int>(std::lround(ratio * (innerH - 1))), 0, innerH - 1);
+    };
+    auto put = [&](int row, int col, char ch, bool overwrite = true) {
+        if (row < 1 || row > innerH || col < 1 || col > innerW)
+            return;
+        if (overwrite || grid[row][col] == ' ')
+            grid[row][col] = ch;
+    };
+    auto putField = [&](double x, double y, char ch, bool overwrite = true) {
+        if (!std::isfinite(x) || !std::isfinite(y))
+            return;
+        put(rowForY(y), colForX(x), ch, overwrite);
+    };
+    auto drawVertical = [&](double x, double y0, double y1, char ch) {
+        const int c = colForX(x);
+        int r0 = rowForY(y0);
+        int r1 = rowForY(y1);
+        if (r0 > r1) std::swap(r0, r1);
+        for (int r = r0; r <= r1; ++r)
+            put(r, c, ch, false);
+    };
+    auto drawHorizontal = [&](double y, double x0, double x1, char ch) {
+        const int r = rowForY(y);
+        int c0 = colForX(x0);
+        int c1 = colForX(x1);
+        if (c0 > c1) std::swap(c0, c1);
+        for (int c = c0; c <= c1; ++c)
+            put(r, c, ch, false);
+    };
+    auto drawBox = [&](double x0, double x1, double y0, double y1, char ch) {
+        drawVertical(x0, y0, y1, ch);
+        drawVertical(x1, y0, y1, ch);
+        drawHorizontal(y0, x0, x1, ch);
+        drawHorizontal(y1, x0, x1, ch);
+    };
+
+    drawVertical(0.0, -halfW, halfW, ':');
+    drawBox(halfL - fd.penaltyAreaLength, halfL,
+            -fd.penaltyAreaWidth * 0.5, fd.penaltyAreaWidth * 0.5, '.');
+    drawBox(-halfL, -halfL + fd.penaltyAreaLength,
+            -fd.penaltyAreaWidth * 0.5, fd.penaltyAreaWidth * 0.5, '.');
+    drawBox(halfL - fd.goalAreaLength, halfL,
+            -fd.goalWidth * 0.5, fd.goalWidth * 0.5, ',');
+    drawBox(-halfL, -halfL + fd.goalAreaLength,
+            -fd.goalWidth * 0.5, fd.goalWidth * 0.5, ',');
+
+    putField(0.0, 0.0, 'o');
+    putField(fd.length * 0.5 - fd.penaltyDist, 0.0, '+');
+    putField(-fd.length * 0.5 + fd.penaltyDist, 0.0, '+');
+    if (ballKnown)
+        putField(ballField.x, ballField.y, 'B');
+
+    if (std::isfinite(robotPose.x) && std::isfinite(robotPose.y) &&
+        std::isfinite(robotPose.theta)) {
+        const int robotRow = rowForY(robotPose.y);
+        const int robotCol = colForX(robotPose.x);
+        const double hx = std::cos(robotPose.theta);
+        const double hy = std::sin(robotPose.theta);
+        int dr = 0;
+        int dc = 0;
+        if (std::abs(hx) >= std::abs(hy))
+            dc = hx >= 0.0 ? 1 : -1;
+        else
+            dr = hy >= 0.0 ? -1 : 1;
+
+        const int pdr = -dc;
+        const int pdc = dr;
+        put(robotRow, robotCol, 'T');
+        put(robotRow + dr, robotCol + dc, 'T');
+        put(robotRow + 2 * dr, robotCol + 2 * dc, 'T');
+        put(robotRow + pdr, robotCol + pdc, 'T');
+        put(robotRow - pdr, robotCol - pdc, 'T');
+    }
+
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    ss << "Field " << fd.length << "m x " << fd.width << "m, grid "
+       << innerW << "x" << innerH << " char_aspect=" << charAspect
+       << " (x+ right/opponent goal, y+ up/left touchline)\n";
+    ss << "Legend: T robot body, T stem points heading, B ball, : midfield, . penalty area, o center mark\n";
+    for (const auto &line : grid)
+        ss << line << "\n";
+    return ss.str();
+}
+
+std::string Brain::modeNameFromIndex(int mode) const
+{
+    switch (mode) {
+    case -1: return "kUnknown";
+    case 0: return "kDamping";
+    case 1: return "kPrepare";
+    case 2: return "kWalking";
+    case 3: return "kCustom";
+    case 4: return "kSoccer";
+    default: return "kInvalid";
+    }
+}
+
+char Brain::headingChar(double theta) const
+{
+    const double x = std::cos(theta);
+    const double y = std::sin(theta);
+    if (std::abs(x) >= std::abs(y))
+        return x >= 0.0 ? '>' : '<';
+    return y >= 0.0 ? '^' : 'v';
 }
 
 // ------------------------------------------------------ 调试 log 相关 ------------------------------------------------------
@@ -3024,7 +4370,10 @@ string Brain::getComLogString() {
     ss << "  Alive: " << aliveCnt << "  TMCMDID: " << data->tmCmdId << "  ReceivedDMD: " << data->tmReceivedCmd << "\n";
 
     // Self info
-    ss << "Self\tCost: " << format("%.1f", data->tmMyCost) << "\tLead: ";
+    ss << "Self\tCost: " << format("%.1f", data->tmMyCost)
+       << "\tCostRank: " << data->tmMyCostRank
+       << "\tStrikerCostRank: " << data->tmMyStrikerCostRank
+       << "\tLead: ";
     if (data->tmImLead)
         ss << GREEN_CODE << "YES" << CYAN_CODE;
     else
@@ -3080,5 +4429,86 @@ void Brain::playSoundForFun() {
             else if (decision == "adjust") playSound(soundPack + "-adjust", 2000);
             else if (decision == "kick") playSound(soundPack + "-kick", 2000);
         }
+    }
+}
+
+// =============================================================================
+//  请将以下代码追加到 src/brain/src/brain.cpp 的最末尾 (在最后的 } 之后或者之前均可，确保在 namespace 外或类定义外)
+// =============================================================================
+
+/**
+ * 计算当前向 dir 方向踢球的价值的大小.
+ */
+double Brain::kickValue(double dir)
+{
+    // 简单的价值评估：如果是朝向对方球门方向，价值高
+    // 这里是一个基础实现，你可以根据策略需要修改
+    auto fd = config->fieldDimensions;
+    double goalDir = atan2(0.0 - data->robotPoseToField.y, fd.length/2.0 - data->robotPoseToField.x);
+    double diff = fabs(toPInPI(dir - goalDir));
+    
+    // 角度偏差越小，价值越高。范围 [0, 1]
+    return max(0.0, 1.0 - diff / M_PI); 
+}
+
+/**
+ * 计算当前的急迫度
+ * 0: 安全, 1: 有威胁, 2: 危险
+ */
+double Brain::threatLevel()
+{
+    // 基础实现：如果有敌人在附近(2米内)，则认为有威胁
+    double minOpponentDist = 100.0;
+    auto robots = data->getRobots();
+    for(const auto& r : robots) {
+        if(r.label == "Opponent") {
+            double dist = r.range;
+            if(dist < minOpponentDist) minOpponentDist = dist;
+        }
+    }
+
+    if (minOpponentDist < 1.0) return 2.0;
+    if (minOpponentDist < 2.5) return 1.0;
+    return 0.0;
+}
+
+/**
+ * 判断是否适合定向踢球
+ */
+bool Brain::isAngleGoodForDirectionalKick(double goalPostMargin)
+{
+    // 复用通用的角度判断逻辑，或者添加特定逻辑
+    return isAngleGood(goalPostMargin, "kick");
+}
+
+/**
+ * 检查前方扇形区域是否有障碍物
+ */
+bool Brain::isFrontRangeClear(double startAngle, double endAngle, double safeDist, double step)
+{
+    // 遍历角度范围，检查每个角度上的最近障碍物距离
+    for (double ang = startAngle; ang <= endAngle; ang += step) {
+        if (distToObstacle(ang) < safeDist) {
+            return false; // 发现障碍物，不空闲
+        }
+    }
+    return true; // 区域内无障碍物
+}
+
+/**
+ * 发布视觉校准参数
+ */
+/**
+ * 发布视觉校准参数
+ */
+void Brain::pubCalParamMsg(double pitch, double yaw, double z)
+{
+    if (pubCalParam) {
+        vision_interface::msg::CalParam msg;
+        msg.pitch_compensation = pitch;
+        msg.yaw_compensation = yaw;
+        msg.z_compensation = z;
+        
+        pubCalParam->publish(msg);
     }
 }

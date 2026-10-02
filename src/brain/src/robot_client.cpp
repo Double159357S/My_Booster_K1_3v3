@@ -1,13 +1,33 @@
-/*  作用：封装机器人运动接口
-    何时修改：接入新的底层动作、修改运动指令处理
-*/
 #include <cmath>
+#include <cctype>
+#include <booster_internal/robot/b1/b1_loco_internal_api.hpp>
 #include "brain.h"
 #include "robot_client.h"
 #include "booster_interface/message_utils.hpp"
 #include "utils/math.h"
 #include "utils/print.h"
 #include "utils/misc.h"
+
+namespace {
+
+// API IDs for RL skills.
+// kVisualKick must match the public SDK: booster::robot::b1::LocoApiId::kVisualKick = 2038
+constexpr int64_t kApiIdEnableVisualKickMode = 2038;   // kVisualKick (public SDK)
+constexpr int64_t kApiIdRLKickBall           = 100011;  // kRLKickBall (internal SDK)
+constexpr int64_t kApiIdRLFancyKickBall      = 100012;  // kRLFancyKickBall (internal SDK)
+constexpr int kGetUpVersionV1 = 0;
+constexpr int kGetUpVersionV2 = 1;
+
+std::string BuildRLSkillKickParams(double kick_speed, double kick_dir, bool cancel)
+{
+    nlohmann::json body;
+    body["kick_speed"] = static_cast<float>(kick_speed);
+    body["kick_dir"] = static_cast<float>(kick_dir);
+    body["cancel"] = cancel;
+    return body.dump();
+}
+
+} // namespace
 
 void RobotClient::init()
 {
@@ -45,12 +65,106 @@ int RobotClient::standUp()
 {
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster::robot::b1::LocoApiId::kGetUp);
+    std::string versionLower;
+    versionLower.reserve(brain->config->recoveryGetUpVersion.size());
+    for (unsigned char c : brain->config->recoveryGetUpVersion) {
+        versionLower.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    // SDK GetUpVersion uses kV1=0 and kV2=1 on the wire.
+    const int getUpVersion =
+        (versionLower == "kv2" || versionLower == "v2")
+            ? kGetUpVersionV2
+            : kGetUpVersionV1;
+    nlohmann::json body;
+    body["version"] = getUpVersion;
+    msg.body = body.dump();
+
+    brain->log->log(
+        "RobotClient/standUp",
+        rerun::TextLog(
+            "Sending get-up request: version=" + brain->config->recoveryGetUpVersion +
+            ", body=" + msg.body));
+    return call(msg);
+}
+
+int RobotClient::kickBall(double kick_speed, double kick_dir, bool cancel)
+{
+    setVelocity(0.0, 0.0, 0.0, false, false, false); // 停止运动，准备踢球
+    std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 10ms后再发踢球命令,否则踢球命令可能下发不下去,原因待查
+
+    std::string param = BuildRLSkillKickParams(kick_speed, kick_dir, cancel);
+
+    booster_interface::msg::BoosterApiReqMsg msg;
+    msg.api_id = kApiIdRLKickBall;
+    msg.body = param;
+
+    return call(msg);
+}
+
+int RobotClient::walkMode()
+{
+    booster_interface::msg::BoosterApiReqMsg msg;
+    msg.api_id = static_cast<int64_t>(booster_internal::robot::b1::LocoInternalApiId::kEnableRobocupWalkMode);
     nlohmann::json body;
     msg.body = body.dump();
 
     return call(msg);
 }
 
+int RobotClient::fancyKickBall(double kick_speed, double kick_dir, bool cancel)
+{
+    std::string param = BuildRLSkillKickParams(kick_speed, kick_dir, cancel);
+
+    booster_interface::msg::BoosterApiReqMsg msg;
+    msg.api_id = kApiIdRLFancyKickBall;
+    msg.body = param;
+
+    return call(msg);
+}
+
+int RobotClient::RLVisionKick(bool start)
+{
+    booster_interface::msg::BoosterApiReqMsg msg;
+    // 目标机器人的运控协议已支持 2038，但本工程随带的较旧 SDK
+    // 头文件还没有 kVisualKick / VisualKickVersion 枚举，因此使用协议值。
+    msg.api_id = kApiIdEnableVisualKickMode;
+    nlohmann::json body;
+    body["start"] = start;
+    std::string verLower;
+    verLower.reserve(brain->config->RLVisionKickVisualKickVersion.size());
+    for (unsigned char c : brain->config->RLVisionKickVisualKickVersion) {
+        verLower.push_back(static_cast<char>(std::tolower(c)));
+    }
+    int visualKickVersion = 1; // SDK 协议: kV1=0, kV2=1
+    if (verLower == "kv1" || verLower == "v1") {
+        visualKickVersion = 0;
+    } else if (verLower == "kv2" || verLower == "v2") {
+        visualKickVersion = 1;
+    }
+    body["version"] = visualKickVersion;
+    msg.body = body.dump();
+    std::cout << "RobotClient::RLVisionKick called with start=" << (start ? "true" : "false") << std::endl;
+    return call(msg);
+}
+
+int RobotClient::robocupWalk()
+{
+    std::cout << "RobotClient::robocupWalk exit VisualKick(false)" << std::endl;
+
+    // Only exit VisualKick mode; gait/mode switch is handled elsewhere.
+    return RLVisionKick(false);
+}
+
+int RobotClient::changeRobocupMode()
+{
+    std::cout << "RobotClient::changeRobocupMode switch to kSoccer and exit VisualKick(false)" << std::endl;
+
+    int ret = call(booster_interface::CreateChangeModeMsg(booster::robot::RobotMode::kSoccer));
+    if (ret != 0) return ret;
+
+    return RLVisionKick(false);
+}
 
 int RobotClient::enterDamping()
 {
@@ -68,8 +182,18 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
     brain->log->log("RobotClient/setVelocity_in",
                     rerun::TextLog(format("vx: %.2f  vy: %.2f  vtheta: %.2f", x, y, theta)));
 
+    // rerun::Collection<rerun::Vec2D> vxLine = {{0, 0}, {x, 0}};
+    // rerun::Collection<rerun::Vec2D> vyLine = {{0, 0}, {0, -y}};
+    // rerun::Collection<rerun::Vec2D> vthetaLine = {{0, 0}, {2.0 * cos(-theta), 2.0 * sin(-theta)}};
+
+    // brain->log->log("robotframe/velocity",
+    //                 rerun::LineStrips2D({vxLine, vyLine, vthetaLine})
+    //                     .with_colors({0xFF0000FF, 0x00FF00FF, 0x0000FFFF})
+    //                     .with_radii({0.05, 0.05, 0.02})
+    //                     .with_draw_order(1.0));
+
     // 速度指令太小时, 给一个最小速度, 以防止不响应 TODO 转为参数化
-    double minx = 0.05, miny = 0.08, mintheta = 0.05;
+    double minx = 0.3, miny = 0.3, mintheta = 0.3;
     if (applyMinX && fabs(x) < minx && fabs(x) > 1e-5)
         x = x > 0 ? minx : -minx;
     if (applyMinY && fabs(y) < miny && fabs(y) > 1e-5)
@@ -79,6 +203,11 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
     x = cap(x, brain->config->vxLimit, -brain->config->vxLimit);
     y = cap(y, brain->config->vyLimit, -brain->config->vyLimit);
     theta = cap(theta, brain->config->vthetaLimit, -brain->config->vthetaLimit);
+
+
+    // brain->log->log("RobotClient/velocity_out/x", rerun::Scalar(x));
+    // brain->log->log("RobotClient/velocity_out/y", rerun::Scalar(y));
+    // brain->log->log("RobotClient/velocity_out/theta", rerun::Scalar(theta));
     
     // log simulated path based on velocity
     vector<Pose2D> path = {{0, 0, 0}}; // 坐标系是以机器人的位置为 0,0, linear 速度方向为 theta = 0 的坐标系
@@ -112,6 +241,14 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
         colors.push_back({0, 0, 255 * (1 - i / path_f.size() / 2.0)});
     }
 
+    // brain->log->log(
+    //     "field/projected_path",
+    //     rerun::Arrows2D::from_vectors(vectors)
+    //         .with_origins(origins)
+    //         .with_colors(colors)
+    //         .with_radii(0.005)
+    //         .with_draw_order(40)
+    // );
     if (path_f.size() > 0) {
         auto p = path_f[0];
         brain->log->log(
@@ -123,6 +260,7 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
                 .with_draw_order(40)
         );
     }
+    // prtWarn(format("path_f size: %d", path_f.size()));
     _vx = x; _vy = y; _vtheta = theta; // remember last command. 可以近似作为当前机器人的速度使用. 
     _lastCmdTime = brain->get_clock()->now();
     if (fabs(_vx) > 1e-3 || fabs(_vy) > 1e-3 || fabs(_vtheta) > 1e-3) _lastNonZeroCmdTime = brain->get_clock()->now();
@@ -273,7 +411,7 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
     
 
     double range = norm(tx - brain->data->robotPoseToField.x, ty - brain->data->robotPoseToField.y);
-    if (range > longRangeThreshold * (mode == "longRange" ? 0.9 : 1.0)) {
+    if (range > longRangeThreshold * (mode == "longRange" ? 0.9 : 1.0)) { // 距离较远时, 优先转向目标点走过去, 而不是直接调整位置
         mode = "longRange";
     } else {
         mode = "shortRange";
@@ -282,34 +420,37 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
     double vx, vy, vtheta;
     double tarDir = atan2(ty - brain->data->robotPoseToField.y, tx - brain->data->robotPoseToField.x);
     double faceDir = brain->data->robotPoseToField.theta;
-    double tarDir_r = toPInPI(tarDir - faceDir); 
+    double tarDir_r = toPInPI(tarDir - faceDir); // 目标点相对于当前朝向的角度
     auto now = brain->get_clock()->now();
-    if (mode == "longRange") { 
-
-        if (fabs(tarDir_r) > turnThreshold) { 
+    if (mode == "longRange") { // 距离较远时, 优先转向目标点走过去, 而不是直接调整位置
+        // 不避障时
+        if (fabs(tarDir_r) > turnThreshold) { // 转向目标方向
             vx = 0.0;
             vy = 0.0;
             vtheta = tarDir_r;
-        } else { 
+        } else { // 向前走, 同时微微转向
             vx = cap(range, vxLimit, -vxLimit);
             vy = 0.0;
             vtheta = tarDir_r;
         }
-       
+        // 若避障, 则 override 上面的指令
         if (avoidObstacle) {
-            if (now < timeEndAvoid) { 
+            if (now < timeEndAvoid) { // 在避障中, 执行避障逻辑
                 double distToObstacle = brain->distToObstacle(0);
-                if (distToObstacle < SAFE_DIST / 2.0) { 
+                if (distToObstacle < SAFE_DIST / 2.0) { // 距离障碍物太近, 后退
                     isBacking = true;
                     timeEndAvoid = now + rclcpp::Duration(AVOID_SECS, 0.0);
                     avoidDir = brain->calcAvoidDir(tarDir_r, SAFE_DIST) > 0 ? 1.0 : -1.0;
                     vx = -0.2;
                     vy = avoidDir * 0.2;
                     vtheta = 0.0; 
-                }else if (brain->distToObstacle(0) < SAFE_DIST + (isBacking ? 0.5 : 0.0)) { 
+                }else if (brain->distToObstacle(0) < SAFE_DIST + (isBacking ? 0.5 : 0.0)) { // 距离障碍物较近, 转向
                     isBacking = false;
                     timeEndAvoid = now + rclcpp::Duration(AVOID_SECS, 0.0);
-                    avoidDir = brain->calcAvoidDir(tarDir_r, SAFE_DIST) > 0 ? 1.0 : -1.0;
+                    bool alwaysLeft = false;
+                    brain->get_parameter("obstacle_avoidance.always_turn_left", alwaysLeft);
+                    if (alwaysLeft) avoidDir = 1.0;
+                    else avoidDir = brain->calcAvoidDir(tarDir_r, SAFE_DIST) > 0 ? 1.0 : -1.0;
                     vx = 0.0;
                     vy = 0.0;
                     vtheta = avoidDir * brain->config->vthetaLimit;
@@ -367,12 +508,12 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
 
             // }
         }
-    } else if (mode == "shortRange") { 
+    } else if (mode == "shortRange") { // 距离较近时, 直接调整位置
         
-
+        // 不避障时
         vx = range * cos(tarDir_r);
         vy = range * sin(tarDir_r);
-        vtheta = toPInPI(ttheta - faceDir); 
+        vtheta = toPInPI(ttheta - faceDir); // 转向期望的方向
         if (fabs(vx) < xTolerance && fabs(vy) < yTolerance && fabs(vtheta) < thetaTolerance) {
             vx = 0.0;
             vy = 0.0;
@@ -380,13 +521,13 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
         }
 
 
-        if (avoidObstacle) { 
+        if (avoidObstacle) { // 避障时, 有障碍物则覆盖上面的指令
             double distToObstacle = brain->distToObstacle(tarDir_r);
-
+            // TODO: 距离太小时 Backout
             if (distToObstacle < SAFE_DIST) {
                 vx = 0.0;
                 vy = 0.0;
-                vtheta = tarDir_r;
+                vtheta = tarDir_r; // 转向目标方向, 关注障碍物
             }
         }
     }
@@ -406,7 +547,7 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
     const double AVOID_SECS = isFreekickStartPlacing ? brain->get_parameter("obstacle_avoidance.freekick_start_placing_avoid_secs").get_value<double>() : brain->config->avoidSecs;
 
     double range = norm(tx - brain->data->robotPoseToField.x, ty - brain->data->robotPoseToField.y);
-    if (range > longRangeThreshold * (mode == "longRange" ? 0.9 : 1.0)) { 
+    if (range > longRangeThreshold * (mode == "longRange" ? 0.9 : 1.0)) { // 距离较远时, 优先转向目标点走过去, 而不是直接调整位置
         mode = "longRange";
     } else {
         mode = "shortRange";
@@ -415,24 +556,25 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
     double vx, vy, vtheta;
     double tarDir = atan2(ty - brain->data->robotPoseToField.y, tx - brain->data->robotPoseToField.x);
     double faceDir = brain->data->robotPoseToField.theta;
-    double tarDir_r = toPInPI(tarDir - faceDir); 
-    if (mode == "longRange") { 
+    double tarDir_r = toPInPI(tarDir - faceDir); // 目标点相对于当前朝向的角度
+    if (mode == "longRange") { // 距离较远时, 优先转向目标点走过去, 而不是直接调整位置
         // brain->log->log("debug/freekick_position", rerun::TextLog(format(
         //         "long range"
         // )));
-        if (fabs(tarDir_r) > turnThreshold) { 
+        // 不避障时
+        if (fabs(tarDir_r) > turnThreshold) { // 转向目标方向
             vx = 0.0;
             vy = 0.0;
             vtheta = tarDir_r;
-        } else { 
+        } else { // 向前走, 同时微微转向
             vx = cap(range, vxLimit, -vxLimit);
             vy = 0.0;
             vtheta = tarDir_r;
         }
-       
+        // 若避障, 则 override 上面的指令
         if (avoidObstacle) {
-            double mostViableDir = 0; 
-            double distToObstacleMostViable = brain->distToObstacle(0); 
+            double mostViableDir = 0; // 最可行的方向, 用于避障时的转向
+            double distToObstacleMostViable = brain->distToObstacle(0); // 最可行方向的距离障碍物
             for (size_t i = 1; i <= 10; i++)
             {
                 double tarDir_r_temp = toPInPI(0 + M_PI / 10 * i);
@@ -449,29 +591,29 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
                     break;
                 }
             }
-            if (should_avoid_in_move) {
+            if (should_avoid_in_move) { // 在避障中, 执行避障逻辑
                 double distToObstacle = brain->distToObstacle(0);
                 // brain->log->log("debug/freekick_position", rerun::TextLog(format(
                 //         "side move distToObstacle: %.2f, SAFE_DIST: %.2f",
                 //         distToObstacle, SAFE_DIST
                 // )));
                 vx = 0;
-                vy = (mostViableDir - tarDir_r > 0 ? 0.3 : -0.3); 
+                vy = (mostViableDir - tarDir_r > 0 ? 0.3 : -0.3); // 向最可行的方向侧移
                 vtheta = 0.0;
-                if (distToObstacle < SAFE_DIST) {
+                if (distToObstacle < SAFE_DIST) { // 距离障碍物较近, 侧移动
                     should_avoid_in_move = true;
                 } else {
                     vx = vxLimit;
                     if (brain->distToObstacle(tarDir_r) < SAFE_DIST * 2) vxLimit *= 0.5;
                     vy = 0.0;
                     vtheta = 0.0;
-                    should_avoid_in_move = false; 
+                    should_avoid_in_move = false; // 结束避障
                 }
             } else {
                 double distToObstacle = brain->distToObstacle(tarDir_r);
                 if (distToObstacle < SAFE_DIST * 3) vxLimit = 0.5;
                 if (distToObstacle < SAFE_DIST) {
-                    should_avoid_in_move = true;
+                    should_avoid_in_move = true; // 开始避障
 
                     // brain->log->log("debug/freekick_position", rerun::TextLog(format(
                     //         "long range zero case"
@@ -484,14 +626,14 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
             }
 
         }
-    } else if (mode == "shortRange") { 
+    } else if (mode == "shortRange") { // 距离较近时, 直接调整位置
         // brain->log->log("debug/freekick_position", rerun::TextLog(format(
         //     "shortRange"
         // )));
-
+       // 不避障时
         vx = range * cos(tarDir_r);
         vy = range * sin(tarDir_r);
-        vtheta = toPInPI(ttheta - faceDir); 
+        vtheta = toPInPI(ttheta - faceDir); // 转向期望的方向
         if (fabs(vx) < xTolerance && fabs(vy) < yTolerance && fabs(vtheta) < thetaTolerance) {
             vx = 0.0;
             vy = 0.0;
@@ -503,11 +645,11 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
         }
 
 
-        if (avoidObstacle) { 
+        if (avoidObstacle) { // 避障时, 有障碍物则覆盖上面的指令
             double distToObstacle = brain->distToObstacle(tarDir_r);
 
-            double mostViableDir = tarDir_r; 
-            double distToObstacleMostViable = distToObstacle;
+            double mostViableDir = tarDir_r; // 最可行的方向, 用于避障时的转向
+            double distToObstacleMostViable = distToObstacle; // 最可行方向的距离障碍物
             for (size_t i = 1; i <= 10; i++)
             {
                 double tarDir_r_temp = toPInPI(tarDir_r + M_PI / 10 * i);
@@ -531,8 +673,8 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
                 //     distToObstacle, SAFE_DIST
                 // )));
                 vx = 0.0;
-                vy = mostViableDir == tarDir_r ? 0.0 : (mostViableDir - tarDir_r > 0 ? 0.2 : -0.2); 
-                vtheta = tarDir_r; 
+                vy = mostViableDir == tarDir_r ? 0.0 : (mostViableDir - tarDir_r > 0 ? 0.2 : -0.2); // 向最可行的方向侧移
+                vtheta = tarDir_r; // 转向目标方向, 关注障碍物
             }
         }
     }
@@ -546,8 +688,8 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
 double RobotClient::msecsToCollide(double vx, double vy, double vtheta, double maxTime) {
     auto robots = brain->data->getRobots();
 
-    if (robots.size() == 0) return maxTime; 
-    if (vx < 1e-3 && vy < 1e-3) return maxTime; 
+    if (robots.size() == 0) return maxTime; // 无障碍时, 直接返回最大时间.
+    if (vx < 1e-3 && vy < 1e-3) return maxTime; // 速度非常小时, 认为不会碰撞, 同时避免后面除零的问题.
 
     brain->log->setTimeNow();
 

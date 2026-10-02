@@ -12,6 +12,8 @@ BrainLog::BrainLog(Brain *argBrain) : brain(argBrain), log_tcp("robocup"), log_f
     {
         rerun::Error err = log_tcp.connect(brain->config->rerunLogServerIP);
         if (err.is_err()) prtErr("Connect rerunLog server failed: " + err.description);
+        // 注意这里，如果指定的地址里没有启动服务，err其实也不会报错，只会阻塞一定的时间（默认2s)，进不到这个分支
+        // TODO：后续可以看看 relog 文档，把这里修一下，预期的是连不上服务要正常报错
     }
     
 
