@@ -7,4 +7,4 @@ source ./install/setup.bash
 #export FASTRTPS_DEFAULT_PROFILES_FILE=./configs/fastdds.xml
 
 # ros2 launch vision launch.py show_det:=true > vision_d.log 2>&1
-ros2 launch vision launch.py show_det:=false save_data:=false
+ros2 launch vision launch.py vision_config_path:="$VISION_CONFIG_PATH" show_det:=false save_data:=false
