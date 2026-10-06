@@ -1,13 +1,13 @@
 brain_node:
   ros__parameters:
     game:
-      team_id: 70 # consistant with GameControl
+      team_id: 71 # consistant with GameControl
       player_id: 1 # 1 | 2 | 3 | 4 | 5
-      field_type: "robo_league" # adult_size | kid_size | robo_league
-      player_role: "goal_keeper" # striker | goal_keeper
+      field_type: "kid_size" # adult_size | kid_size | robo_league
+      player_role: "striker" # striker | goal_keeper
       player_start_pos: "right" # right | left
       treat_person_as_robot: false # 是否将人类视为机器人, 用于调试. !!!! 正式比赛时, 必须设置为 false !!!!
-      number_of_players: 5
+      number_of_players: 3
     
     ball_predictor: 
       step_interval: 100. 

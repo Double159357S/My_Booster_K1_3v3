@@ -1,0 +1,175 @@
+# Kid Size 3v3：沿用 middle/params.yaml 的比赛规则。
+# 场地尺寸来源：机器人 types.h 中的 FD_KIDSIZE；以下单位均为米。
+# /home/booster/Workspace/K1_5v5_demo_1.7/src/brain/include/types.h
+# 场地白线范围：长 9，宽 6。
+# 罚球点距底线：1.5。
+# 球门宽度：2.6。
+# 中圈半径：0.75；直径：1.5。
+# 大禁区：纵深 2，横向宽度 5。
+# 小禁区：纵深 1，横向宽度 3。
+# 本版 GameController 不读取场地尺寸；这些注释仅供核对。
+# 机器人 brain 配置使用 game.field_type: "kid_size"。
+# division 是裁判机的分组枚举，与机器人 field_type 分开设置。
+# 保留有效值 small；不能在此写 division: kid_size。
+name: "kid_size"
+division: small
+playersPerTeam: 3
+penalties:
+  noPenalty:
+    duration:
+      secs: 0
+      nanos: 0
+    incremental: false
+  illegalPositioning:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  motionInSet:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  motionInStop:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: true
+  localGameStuck:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  incapableRobot:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  pickedUp:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  ballHolding:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  leavingTheField:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  playingWithArmsHands:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  pushing:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  cautioned:
+    duration:
+      secs: 1
+      nanos: 0
+    incremental: false
+  sentOff:
+    duration:
+      secs: 0
+      nanos: 0
+    incremental: false
+  substitute:
+    duration:
+      secs: 0
+      nanos: 0
+    incremental: false
+penaltyDurationIncrement:
+  secs: 10
+  nanos: 0
+setPlays:
+  noSetPlay:
+    duration:
+      secs: 0
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+  kickOff:
+    duration:
+      secs: 10
+      nanos: 0
+    readyDuration:
+      secs: 45
+      nanos: 0
+  directFreeKick:
+    duration:
+      secs: 45
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+  indirectFreeKick:
+    duration:
+      secs: 45
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+  penaltyKick:
+    duration:
+      secs: 60
+      nanos: 0
+    readyDuration:
+      secs: 45
+      nanos: 0
+  throwIn:
+    duration:
+      secs: 45
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+  goalKick:
+    duration:
+      secs: 45
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+  cornerKick:
+    duration:
+      secs: 45
+      nanos: 0
+    readyDuration:
+      secs: 0
+      nanos: 0
+halfDuration:
+  secs: 900
+  nanos: 0
+halfTimeBreakDuration:
+  secs: 300
+  nanos: 0
+extraHalfDuration:
+  secs: 300
+  nanos: 0
+timeoutDuration:
+  secs: 300
+  nanos: 0
+timeoutsPerTeam: 1
+refereeTimeoutDuration:
+  secs: 600
+  nanos: 0
+messagesPerTeam: 12000
+messagesPerTeamPerAdditionalMinute: 600
+messagesPerTeamPerExtraTime: 6000
+mercyRuleScoreDifference: 10
+penaltyShots: 3
+suddenDeathPenaltyShots: 3
+penaltyShotDuration:
+  secs: 60
+  nanos: 0
+delayAfterPlaying:
+  secs: 10
+  nanos: 0

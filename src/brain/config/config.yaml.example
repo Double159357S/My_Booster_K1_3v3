@@ -1,0 +1,207 @@
+# Booster K1 3v3 配置模板，供 set_up.py 初始化 config.yaml 使用。
+# 以 My_Booster_K1_3v3 的现有配置为基础，参考 5v5 示例的注释格式。
+# 每队 3 台，使用 kid_size 场地预设；队号、球员编号、角色、裁判机 IP 需填写。
+# 0 和 TODO 是初始化占位值，先用 set_up.py 完成设置，再启动 brain。
+# 场地预设：9×6 米，中圈直径 1.5 米，大禁区 2×5 米，小禁区 1×3 米。
+# 角色示例：1 号 goal_keeper，2/3 号 striker；也可在裁判机比赛界面调整守门员编号。
+# 自动角色切换沿用现有设置；要固定角色，修改 strategy.cooperation.enable_role_switch。
+# set_up.py 只在 config.yaml 不存在时复制此模板；已有配置需要同步场地类型和比赛人数。
+
+brain_node:
+  ros__parameters:
+    game:
+      team_id: 0 # 待设置：队伍 ID，必须与裁判机一致；有效值 1-255
+      player_id: 0 # 待设置：3v3 使用 1、2、3；同队机器人编号不能重复
+      field_type: "kid_size" # 本次使用 kid_size：9×6 米，中圈半径 0.75 米；预设见 types.h
+      player_role: "TODO" # 待设置：striker | goal_keeper；这是启动角色
+      player_start_pos: "right" # 入场边线：right | left；与实际摆放位置一致
+      treat_person_as_robot: false # 调试开关；正式比赛保持 false
+      number_of_players: 3 # 3v3：每队 3 台机器人，与裁判机 playersPerTeam 保持一致
+
+    ball_predictor: # 球运动预测参数，沿用当前项目配置
+      step_interval: 100. # 球预测的时间间隔，单位：毫秒
+      step_cnt: 50 # 球预测的步数
+      acceleration: -0.35 # 球自由滚动时的加速度
+      speed_friction_factor: 0.45 # 球速度衰减因子，沿用当前值
+
+    robot:
+      robot_height: 0.90 # 用于大概估算检测到的物体相对于机器人头的 pitch 角
+      odom_factor: 1.0 # 大约估算 odom 中给出的距离与实际行走的距离的比例
+      vx_factor: 0.90 # 步态前向速度补偿比例
+      yaw_offset: 0.0 # 步态航向补偿，沿用当前标定值
+      vx_limit: 1.6 # 前后方向速度上限，米/秒
+      vy_limit: 0.8 # 左右方向速度上限，米/秒
+      vtheta_limit: 1.5 # 转向角速度上限，弧度/秒
+
+    strategy:
+      ball_confidence_threshold: 60.0 # confidence 低于这个阈值，认为不是球
+      ball_confidence_decay_rate: 3.0 # 看到 confidence 为 100 的球后，多少秒没有再看到，则认为球丢了
+      enable_stable_kick: false
+      ball_memory_timeout: 3.0 # 球记忆失效时间，超过这个时间，认为球丢了
+      ball_lost_msecs: 1000.0 # 球丢失判定时间，毫秒
+      tm_ball_dist_threshold: 1.5 # 队友发送的球的位置与我当前位置的距离，如果大于此值，则认为队友的信息准确.
+      limit_near_ball_speed: false # 是否限制在 chase 时靠近球时的速度
+      near_ball_speed_limit: 0.6 # 靠近球时的速度限制
+      near_ball_range: 2.0 # 靠近球时的范围，在这个范围内，限制速度
+      soft_kickoff: true # 比赛开球及角球、门球等重启使用软速度
+      soft_kickoff_speed: 0.3 # 软开球速度参数，沿用当前值
+      kick_range: 1.0 # 仅在这个 range 之内才会执行 kick 或 disrupt
+      kick_theta_range: 0.2 # ball yaw 只有在这个角度之内，才会踢。否则就继续调整
+      abort_kick_when_ball_moved: true # kick 过程中，如果能明确感知到球已经不在 kick 路线上或已经踢中了，则直接退出 kick
+      abort_kick_ball_move_threshold: 0.3 # 球的距离相对于最小值变化了这么多，则认为已经踢到球了
+      abort_shoot_when_ball_moved: true # shoot 过程中，如果能明确感知到球已经不在路线上或已经踢中了，则直接退出
+      limit_speed_near_border: false # 是否限制在 chase 时靠近场地边界时的速度
+      near_border_speed_limit: 0.5 # 靠近场地边界时的速度限制
+      near_border_dist_threshold: -1.0 # 靠近场地边界时的范围，在这个范围内，限制速度。注意，这里负值代表在场内.
+      enable_bypass: false
+      enable_shoot: false
+      enable_directional_kick: false
+      goalie_visual_kick_cooldown_ms: 600.0 # 守门员视觉踢球冷却时间，毫秒
+      goalie_visual_kick_max_ball_range: 5.0 # 守门员视觉踢球允许的最大球距，米
+      goalie_visual_kick_max_direction_error: 1.2 # 守门员解围方向最大误差，弧度
+      goalie_simple_x_kp: 0.9
+      goalie_simple_y_kp: 2.2
+      goalie_simple_threat_vxf: -0.03
+      goalie_simple_predict_min_vxf: 0.06
+      goalie_simple_t_goal_max: 8.0
+      goalie_simple_t_plane_min: 0.02
+      goalie_simple_t_plane_max: 6.0
+      goalie_simple_vy_max: 0.8
+      goalie_simple_vx_max: 1.2
+      goalie_simple_vtheta_kp: 1.4
+      goalie_simple_vtheta_limit: 1.5
+      shoot:
+        threat_threshold: -2.0 # threat 小于此值时，才使用 kick
+        xmin: 0.3 # 触发区域 x 下限，米
+        xmax: 0.6 # 触发区域 x 上限，米
+        ymin: -0.3 # 触发区域 y 下限，米
+        ymax: 0.3 # 触发区域 y 上限，米
+
+      power_shoot:
+        enable: true # 在直接任意球和门球时，是否使用大力踢
+        use_for_kickoff: false # 在正常开球时是否使用大力踢
+        xmin: 0.2 # 触发区域 x 下限，米
+        xmax: 1.0 # 触发区域 x 上限，米
+        ymin: -0.3 # 触发区域 y 下限，米
+        ymax: 0.3 # 触发区域 y 上限，米
+      enable_auto_visual_kick: true
+      auto_visual_kick_enable_dist_min: 0.05 # 自动视觉踢球的最小球距，米；过滤紧贴本体的误检
+      auto_visual_kick_enable_dist_max: 5.0 # 自动视觉踢球的最大球距，米
+      auto_visual_kick_enable_angle: 1.5 # 允许的球方向偏角，弧度
+      auto_visual_kick_max_direction_error: 1.8 # 相对期望踢球方向的最大误差，弧度
+      auto_visual_kick:
+        real_ball_hold_ms: 1000.0 # 近期真实球检测保持时间，毫秒
+        current_real_ball_max_age_ms: 650.0 # 当前真实球检测的最大年龄，毫秒
+        near_ball_memory_reject_range: 0.45 # 近距离时拒绝仅凭记忆启动踢球的距离，米
+        allow_predicted_kick_msg: true
+        allow_memory_kick_msg: true
+        kick_msg_real_ball_max_age_ms: 650.0 # 发布踢球信息时允许的真实检测年龄，毫秒
+        no_detection_kick_msg_reject_range: 0.45 # 近距离且无检测时拒绝踢球信息的范围，米
+        startup_decelerate_ms: 80.0 # 启动视觉踢球前的减速时间，毫秒
+        exit_decelerate_ms: 140.0 # 退出视觉踢球时的减速时间，毫秒
+        max_parallel_count: 1 # 同队同时执行视觉踢球的机器人数量上限
+        yield_my_cost_min: 4.0
+        no_progress_timeout_ms: 3500.0 # 无进展超时时间，毫秒
+        progress_range_delta: 0.12 # 判定有进展的球距变化，米
+        progress_ball_forward_delta: 0.15 # 判定球向前推进的变化，米
+        max_total_ms: 14000.0 # 单次视觉踢球会话最大时长，毫秒
+        max_extra_rounds: 1 # 允许的额外调整轮数
+      cooperation:
+        enable_role_switch: true # true：自动分配角色；固定角色测试可设 false
+        ball_control_cost_threshold: 5.0 # 队友踢球的 cost 小于此值时，我不再上前抢球，而是转为助攻
+        goalie_comm_fresh_msecs: 2200.0 # 队友通信有效期，毫秒
+        goalie_comm_stable_msecs: 1000.0 # 通信持续稳定多久后启用动态守门员选择，毫秒
+        goalie_distance_tie_margin: 0.15 # 距己方球门距离的近似相等范围，米
+        goalie_fallback_use_gc_goalie: true # 队友通信不完整时，优先采用裁判机指定的守门员编号
+        goalie_attack_handoff: true # 守门员进攻时，允许将守门任务交给队友
+      far_set_play_search:
+        enable: true # 任一方门球/角球很远且看不到球时，先去球应出现的半场搜索
+        trigger_x: 0.5 # 越过中线至少 0.5 m 才算进入目标半场，避免在中线附近反复切换
+        field_target_x_ratio: 0.25 # 场上机器人搜索目标 |x| = 场长 * 此比例
+        lane_y_ratio: 0.28 # 按 player_id 分配横向搜索通道
+        max_move_secs: 30.0
+        vx_limit: 0.7
+        vy_limit: 0.4
+      set_play_stand:
+        corridor_half_width: 0.6 # 我方角球/门球时，判断是否挡住开球通道的半宽 (m)
+        corridor_forward_range: 3.0 # 开球通道沿 kickDir 方向的有效长度 (m)
+        side_margin: 0.2 # 让位时在通道边缘外再留出的余量 (m)
+
+    obstacle_avoidance:
+      depth_sample_step: 16 # 障碍物检测时，深度图采样点的步长，越大越快但越不准确，单位：像素
+      obstacle_min_height: 0.3 # 障碍物高度阈值，高于此值的点视为障碍物，单位：米
+      grid_size: 0.2 # 障碍物检测时，网格边长，单位：米
+      max_x: 3.0 # 在前方 x: [0, max_x] 范围内检测障碍物，单位：米
+      max_y: 5.0 # 在左右 y: [-max_y, max_y] 范围内检测障碍物
+      exclusion_x: 0.4 # 排除 x 轴（前后方向）范围，即排除机器人自己，此范围外的点视为障碍物
+      exclusion_y: 0.5 # 排除 y 轴（左右方向）范围，即排除机器人自己，此范围外的点视为障碍物
+      ball_exclusion_radius: 0.0 # 球周围这个半径内的障碍物认为不是障碍
+      ball_exclusion_height: 0.3 # 球周围这个高度内的障碍物认为不是障碍
+      occupancy_threshold: 20 # 障碍物阈值，在世界坐标系的一个网格内，高于指定高度的深度采样点数大于些值，则认为存在障碍物
+      collision_threshold: 0.3 # 碰撞阈值，当障碍物与机器人的距离小于此值，则认为发生碰撞，相当于机器人的碰撞半径
+      safe_distance: 1.0 # 安全距离，当障碍物距离小于此值时，认为需要避障
+      avoid_secs: 2.0 # 避障时，每次绕行障碍物的时长
+      enable_freekick_avoid: true # 是否在自由球起始放置时避障
+      freekick_start_placing_safe_distance: 0.5 # 自由球起始放置时，避障安全距离，如果球在此范围内，则认为需要避障
+      freekick_start_placing_avoid_secs: 1.5 # 自由球起始放置时，避障绕行时间（秒）
+      obstacle_memory_msecs: 500. # 视野外的障碍物，在记忆中保持的时间 (毫秒)
+      avoid_during_kick: false # 是否在 kick 时避障，如果为 true, 则有障碍物时就不会踢球，只会挡住对方
+      kick_ao_safe_dist: 1.5 # kick 时的避障安全距离
+      kick_ao_use_shoot: false # 当 avoid_during_kick 为 true 时，此值为 true 时，使用 shoot 进行踢球; 此值为 false 时，则直接不踢，只原地踏步.
+      avoid_during_chase: false # 是否在 chase 时避障
+      chase_ao_safe_dist: 1.5 # chase 时的避障安全距离
+      always_turn_left: false # 在 gotoreadyposition 时，如果有障碍，永远向左转
+
+    RLVisionKick:
+      visual_kick_version: kV2 # 视觉踢球接口版本：kV1 | kV2；沿用 kV2
+      goalie_clearance_power: 2.5 # 守门员视觉解围 power 参数，沿用当前值
+
+    locator:
+      min_marker_count: 4 # 最少看到多少到 marker, 才可以进行粒子滤波定位
+      max_residual: 0.4 # 粒子滤波定位时，最终每个粒子的加权偏差大于此值时，认为定位不成功
+
+    enable_com: true # 开启队友通信；三台机器人的队号一致、球员编号唯一
+
+    rerunLog:
+      enable_tcp: false # 是否通过网络传输 log
+      server_ip: "192.168.10.110:9876" # 开启了 rerun Viewer 的机器地址
+      enable_file: true # 是否将 log 写入本地,加入默认扫场
+      log_dir: "/home/booster/Workspace/rrlog" # 本地 log 存储路径, 会在此路径下生成以时间为开头的文件
+      max_log_file_mins: 5.0 # 本地 log 最长多少分钟就分片存储. 太大的文件会导致读的时候死机.
+      img_interval: 1 # 每多少帧图像 log 一次, 如果希望更好的实时性或减少日志大小, 可以调高这个值. 但会造成 log 的时间精度降低.
+
+    recovery:
+      retry_max_count: 2 # 尝试起身的最大次数，超过这个次数后，认为起身失败，进入 recovery 模式，需要人工干预
+      get_up_version: kV2 # 起身接口版本：kV1 | kV2；沿用 kV2
+
+    vision:
+      image_topic: "/boostercamera/head/rgb" # 当前 Booster 头部相机 RGB 话题
+      depth_image_topic: "/boostercamera/head/depth" # 当前 Booster 头部相机深度话题
+      cam_pixel_width: 1280. # 图像宽度，像素；沿用当前相机配置
+      cam_pixel_height: 720. # 图像高度，像素；沿用当前相机配置
+      cam_fov_x: 90.0 # 水平视场角，度；沿用当前相机配置
+      cam_fov_y: 60.0 # 垂直视场角，度；沿用当前相机配置
+      # cam_pixel_width: 544. # 相机像素宽度, d-robotics
+      # cam_pixel_height: 448. # 相机像素高度, d-robotics
+      # cam_fov_x: 105.0 # 相机视场角, 单位: 度, d-robotics,debug
+      # cam_fov_y: 94.0 # 相机视场角, 单位: 度, d-robotics,debug  
+      
+    debug:
+      log_ball_pos: false # 是否记录球位置到 ballpos.log 中, 用于调试
+      low_frequency_status:
+        enable: true # 低频输出机器人位姿、球状态、比赛状态和 ASCII 场地图
+        mode_enable: true # 通过 LocoApi GetMode(2017) 异步查询当前机器人模式
+        field_ascii_enable: true # 输出按场地坐标绘制的 ASCII 场地图
+        log_interval_ms: 2000.0 # 位姿/球/比赛状态摘要间隔
+        mode_query_interval_ms: 2000.0 # SDK mode 查询间隔
+        mode_query_timeout_ms: 1000.0 # 单次 SDK mode 查询超时
+        field_ascii_interval_ms: 5000.0 # ASCII 场地图输出间隔
+        field_ascii_char_aspect: 2.0 # 终端字符高宽比修正
+        field_ascii_width: 45 # ASCII 场地图内部宽度
+
+    game_control_ip: "TODO" # 待设置：运行裁判机的电脑 IPv4 地址，由 set_up.py 填写
+
+    # for fun
+    sound:
+      enable: true # 是否播放声音
+      sound_pack: "espeak" # espeak 或 语音名名称，假设语音包名称为 <name>, 相应的语音文件需放到：sound_play/sounds/ 目录下，以<name>-xx.mp3 命名
