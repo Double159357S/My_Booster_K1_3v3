@@ -21,7 +21,7 @@ brain_node:
       vx_factor: 0.90 
       yaw_offset: 0.0 
       vx_limit: 1.6
-      vy_limit: 0.8
+      vy_limit: 1.0 # 全局横移上限, 原来 0.8 导致守门员横移扑救太慢
       vtheta_limit: 1.5 
 
     strategy:
@@ -51,13 +51,13 @@ brain_node:
       goalie_visual_kick_max_ball_range: 5.0
       goalie_visual_kick_max_direction_error: 1.2 # 守门员启动视觉踢球前，球方向与解围方向的最大误差(rad)
       goalie_simple_x_kp: 0.9
-      goalie_simple_y_kp: 2.2
+      goalie_simple_y_kp: 4.0 # 横向增益, 误差>0.25m 即满速输出(原 2.2 太小, 横移显慢)
       goalie_simple_threat_vxf: -0.03
       goalie_simple_predict_min_vxf: 0.06
       goalie_simple_t_goal_max: 8.0
       goalie_simple_t_plane_min: 0.02
       goalie_simple_t_plane_max: 6.0
-      goalie_simple_vy_max: 0.8
+      goalie_simple_vy_max: 1.0 # 与全局 robot.vy_limit 一致, 否则被钳位
       goalie_simple_vx_max: 1.2
       goalie_simple_vtheta_kp: 1.4
       goalie_simple_vtheta_limit: 1.5

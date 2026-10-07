@@ -345,6 +345,9 @@ private:
         bool ballKnown) const;
     std::string modeNameFromIndex(int mode) const;
     char headingChar(double theta) const;
+    // 行走模式看门狗: 机器人若停在 kPrepare 等非行走模式, 速度指令不生效(表现为"不动"),
+    // 需要在比赛状态下重新切回 kSoccer.
+    void updateWalkModeWatchdog();
 
     rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joySubscription;
     rclcpp::Subscription<game_controller_interface::msg::GameControlData>::SharedPtr gameControlSubscription;
@@ -402,4 +405,8 @@ private:
 
     // LT + RT + A 组合键(切换 RoboCup 步态)的边沿检测, 避免长按被重复触发
     bool ltRtAPressed_ = false;
+
+    // 行走模式看门狗状态
+    rclcpp::Time walkModeBadSince_;        // 首次发现模式异常的时刻
+    rclcpp::Time lastWalkModeSwitchCmd_;   // 上次重新切换模式的时刻(冷却用)
 };

@@ -272,9 +272,9 @@ void BrainTree::initEntry()
     setEntry<double>("penalty_kick_goalie_dist_tolerance", 0.12);
     setEntry<double>("penalty_kick_goalie_theta_tolerance", 0.25);
     setEntry<double>("penalty_kick_goalie_vx_limit", 0.35);
-    // 横移限速提到机器人本体上限(robot.vy_limit=0.8): 点球需横向扑救, 原 0.45 太慢.
+    // 横移限速提到与全局 robot.vy_limit 一致: 点球需横向扑救, 原 0.45 太慢.
     // 站位/前向速度保持不变, 守门员仍贴门线、不前移.
-    setEntry<double>("penalty_kick_goalie_vy_limit", 0.8);
+    setEntry<double>("penalty_kick_goalie_vy_limit", 1.0);
 
     setEntry<int>("test_choice", 0);
     setEntry<int>("control_state", 0);
@@ -1128,6 +1128,14 @@ NodeStatus GoToGoalBlockingPosition::tick() {
             : (cap(targetPose.y, fd.penaltyAreaWidth/ 2.0, -fd.penaltyAreaWidth / 2.0));
     }
 
+    // 约束: 守门员站位不越出禁区.
+    if (curRole != "striker") {
+        targetPose.x = std::clamp(targetPose.x, -fd.length / 2.0 + 0.05,
+                                  -fd.length / 2.0 + fd.penaltyAreaLength - 0.3);
+        targetPose.y = std::clamp(targetPose.y, -fd.penaltyAreaWidth / 2.0 + 0.3,
+                                  fd.penaltyAreaWidth / 2.0 - 0.3);
+    }
+
     double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
     if ( // 认为到达了目标位置
         dist < distTolerance
@@ -1915,8 +1923,9 @@ NodeStatus Analyze2::tick()
         source.range <= maxRange && cooldownOk &&
         clearanceDirectionReady &&
         source.field.x < -brain->config->fieldDimensions.circleRadius - 2.0;
+    // 出击解围的会话范围收紧到禁区前沿以内, 避免守门员追出禁区.
     const double sessionMaxX = -brain->config->fieldDimensions.length / 2.0 +
-        brain->config->fieldDimensions.penaltyAreaLength + 0.4;
+        brain->config->fieldDimensions.penaltyAreaLength - 0.2;
     const bool sessionActive = active && visualKickMode && !forceIdle &&
         source.usable && source.field.x <= sessionMaxX;
     const bool visualKickReady = baseReady || sessionActive;
@@ -2561,8 +2570,18 @@ NodeStatus Intercept2::tick()
         }
     }
 
+    // 站位基准: 站在"球门中心 — 球"的连线上, 覆盖射门角度.
+    // (原来直接跟随球的 y, 球偏离球门时会站到门柱位置, 封不住角度.)
+    auto lineYAt = [&](double x, const Point &b) -> double {
+        const double goalDist = x - goalLineX;   // 目标点离门线的距离
+        const double ballDist = b.x - goalLineX; // 球离门线的距离
+        if (goalDist <= 0.0) return 0.0;
+        if (ballDist <= goalDist) return b.y;    // 球比站位更靠门, 直接用球的 y
+        return b.y * goalDist / ballDist;
+    };
+
     double targetX = anchorX;
-    double targetY = std::clamp(ball.y, -halfGoalWidth, halfGoalWidth);
+    double targetY = std::clamp(lineYAt(targetX, ball), -halfGoalWidth, halfGoalWidth);
     if (threateningGoal && std::abs(ballVx) > minPredictVx) {
         // 移动挡球: 优先在预测球路上求解"最近可达拦截点".
         // 沿轨迹由远及近扫描, 取第一个"机器人能赶在球到达之前到位"且落在防守区内的点,
@@ -2608,6 +2627,16 @@ NodeStatus Intercept2::tick()
             }
         }
     }
+
+    // 约束: 目标点始终留在禁区内, 横移不出禁区、也不越过禁区前沿.
+    const double penaltyMargin = 0.3;
+    const double minTargetX = goalLineX + 0.05;
+    const double maxTargetX = std::min(anchorX + std::max(0.0, interceptAdvance),
+                                       goalLineX + fd.penaltyAreaLength - penaltyMargin);
+    const double maxTargetAbsY = std::min(halfGoalWidth,
+                                          fd.penaltyAreaWidth / 2.0 - penaltyMargin);
+    targetX = std::clamp(targetX, minTargetX, maxTargetX);
+    targetY = std::clamp(targetY, -maxTargetAbsY, maxTargetAbsY);
 
     double xKp = 0.9, yKp = 2.2, vxMax = 1.2, vyMax = 0.8;
     double thetaKp = 1.4, thetaMax = 1.5;

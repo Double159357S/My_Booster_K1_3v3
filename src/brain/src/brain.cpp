@@ -472,6 +472,8 @@ void Brain::tick()
         sendModeQueryIfNeeded(now);
         logLowFrequencyDiagnostics(now);
     }
+    // 兜底: 若运控停在 kPrepare 等非行走模式, 重新切回 kSoccer, 否则速度指令不生效.
+    updateWalkModeWatchdog();
 }
 
 void Brain::pubKickMsg() {
@@ -3939,6 +3941,75 @@ void Brain::locoApiResponseCallback(const booster_msgs::msg::RpcRespMsg &msg)
     sdkRobotMode_ = mode;
     sdkRobotModeTime_ = now;
     sdkRobotModeError_.clear();
+}
+
+// 行走模式看门狗: 运控若停在 kPrepare(1) 等非行走模式, 速度指令会被忽略, 机器人表现为"不动".
+// 背景: 切到 kSoccer 的唯一入口 <RunOnce><RobocupWalk/> 只在 control_state==2 分支,
+//       而 RLVisionKick 结束时的 robocupWalk() 只退出视觉踢球、不切模式,
+//       因此一旦掉回 kPrepare 就再也没有代码把它切回来.
+void Brain::updateWalkModeWatchdog()
+{
+    constexpr int kModePrepare = 1;          // 0:kDamping 1:kPrepare 2:kWalking 3:kCustom 4:kSoccer
+    constexpr double kBadModeToleranceMs = 4000.0; // 模式查询缓存最长滞后约 2~3s, 留余量
+    constexpr double kSwitchCooldownMs = 6000.0;
+
+    const auto now = get_clock()->now();
+    auto resetBadSince = [&]() {
+        walkModeBadSince_ = rclcpp::Time(0, 0, now.get_clock_type());
+    };
+
+    bool inMatch = false;
+    bool manual = false;
+    bool inVisualKick = false;
+    try {
+        inMatch = tree->getEntry<int>("control_state") == 3;
+        manual = tree->getEntry<bool>("go_manual");
+        inVisualKick = data->tmImInVisualKick ||
+                       tree->getEntry<bool>("goalie_block_kick_active");
+    } catch (const std::exception &) {
+        resetBadSince();
+        return;
+    }
+
+    // 只在"应由大脑驱动行走"的场合干预: 比赛中、非手动接管、且不在视觉踢球会话里
+    // (视觉踢球期间运控使用自己的技能模式, 强行切换会打断踢球).
+    if (!inMatch || manual || inVisualKick ||
+        !lowFrequencyStatusEnable_ || !lowFrequencyStatusModeEnable_) {
+        resetBadSince();
+        return;
+    }
+
+    int mode = -1;
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> lock(lowFrequencyStatusMutex_);
+        mode = sdkRobotMode_;
+        fresh = sdkRobotModeTime_.nanoseconds() > 0 &&
+                sdkRobotModeTime_.get_clock_type() == now.get_clock_type();
+    }
+    // 模式未知/读取失败时不动手, 避免误切; 只处理"确实停在 kPrepare"这一种情况
+    if (!fresh || mode != kModePrepare) {
+        resetBadSince();
+        return;
+    }
+
+    if (walkModeBadSince_.nanoseconds() == 0 ||
+        walkModeBadSince_.get_clock_type() != now.get_clock_type()) {
+        walkModeBadSince_ = now;
+        return;
+    }
+    if (msecsSince(walkModeBadSince_) < kBadModeToleranceMs) return;
+
+    if (lastWalkModeSwitchCmd_.nanoseconds() > 0 &&
+        lastWalkModeSwitchCmd_.get_clock_type() == now.get_clock_type() &&
+        msecsSince(lastWalkModeSwitchCmd_) < kSwitchCooldownMs) {
+        return;
+    }
+
+    client->changeRobocupMode();
+    walkModeBadSince_ = now;
+    lastWalkModeSwitchCmd_ = now;
+    prtDebug(format("walk mode watchdog: stuck in kPrepare, re-issue kSoccer"));
 }
 
 void Brain::logLowFrequencyDiagnostics(const rclcpp::Time &now)
