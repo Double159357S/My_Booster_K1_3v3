@@ -61,6 +61,8 @@ brain_node:
       goalie_simple_vx_max: 1.2
       goalie_simple_vtheta_kp: 1.4
       goalie_simple_vtheta_limit: 1.5
+      goalie_simple_intercept_advance: 0.6 # 移动挡球: 拦截点相对门线前站位最多前出的距离(m)
+      goalie_simple_intercept_speed: 1.0 # 移动挡球: 估算机器人赶往拦截点的速度(m/s), 用于判断能否抢在球前到达
       shoot:
         threat_threshold: -2.0 
         xmin: 0.3
@@ -139,7 +141,7 @@ brain_node:
       avoid_during_kick: false 
       kick_ao_safe_dist: 1.5 
       kick_ao_use_shoot: false 
-      avoid_during_chase: false 
+      avoid_during_chase: true # 追球/接应时启用避障(队友障碍来自团队通信), 避免撞队友; 若追球变迟钝可改回 false
       chase_ao_safe_dist: 1.5 
       always_turn_left: false 
 

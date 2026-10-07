@@ -142,6 +142,8 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.goalie_simple_vx_max", 1.2);
     declare_parameter<double>("strategy.goalie_simple_vtheta_kp", 1.4);
     declare_parameter<double>("strategy.goalie_simple_vtheta_limit", 1.5);
+    declare_parameter<double>("strategy.goalie_simple_intercept_advance", 0.6);
+    declare_parameter<double>("strategy.goalie_simple_intercept_speed", 1.0);
     declare_parameter<bool>("strategy.enable_auto_visual_kick", false);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.2);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 4.0);
@@ -1064,6 +1066,7 @@ void Brain::updateObstacleMemory() {
     for (int i = 0; i < obstacles.size(); i++) {
         auto obs = obstacles[i];
         if (obs.label == "Ball") continue; 
+        if (obs.label == "Teammate") continue; // 队友障碍每 tick 由通信数据重建, 避免累积重复
         if (msecsSince(obs.timePoint) > OBS_EXPIRE_TIME)  continue; 
 
 
@@ -1079,6 +1082,24 @@ void Brain::updateObstacleMemory() {
         ((get_parameter("obstacle_avoidance.enable_freekick_avoid").as_bool() && isFreekickStartPlacing())
          || tree->getEntry<string>("gc_game_state") == "READY")) {
         obs_new.push_back(data->ball);
+    }
+
+    // 队友位置来自团队通信, 是全向的(不像深度图障碍只覆盖相机视野).
+    // 注入为障碍物后, 现有避障(基于 distToObstacle 的转向/减速)会自动避开队友, 避免撞在一起.
+    for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+        if (i == config->playerId - 1) continue; // 跳过自己
+        const auto &tm = data->tmStatus[i];
+        if (!tm.isAlive) continue; // isAlive 已包含"通讯未丢失"判定
+        const auto &tmPose = tm.robotPoseToField;
+        if (!std::isfinite(tmPose.x) || !std::isfinite(tmPose.y)) continue;
+
+        GameObject obj;
+        obj.label = "Teammate";
+        obj.timePoint = get_clock()->now();
+        obj.posToField = {tmPose.x, tmPose.y, 0.0};
+        obj.confidence = 100.0; // 高于 occupancy_threshold, 确保 distToObstacle 采用
+        updateRelativePos(obj);
+        obs_new.push_back(obj);
     }
 
     data->setObstacles(obs_new);

@@ -272,7 +272,9 @@ void BrainTree::initEntry()
     setEntry<double>("penalty_kick_goalie_dist_tolerance", 0.12);
     setEntry<double>("penalty_kick_goalie_theta_tolerance", 0.25);
     setEntry<double>("penalty_kick_goalie_vx_limit", 0.35);
-    setEntry<double>("penalty_kick_goalie_vy_limit", 0.45);
+    // 横移限速提到机器人本体上限(robot.vy_limit=0.8): 点球需横向扑救, 原 0.45 太慢.
+    // 站位/前向速度保持不变, 守门员仍贴门线、不前移.
+    setEntry<double>("penalty_kick_goalie_vy_limit", 0.8);
 
     setEntry<int>("test_choice", 0);
     setEntry<int>("control_state", 0);
@@ -1074,15 +1076,45 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     double distToGoalline = getInput<double>("dist_to_goalline").value();
 
     auto fd = brain->config->fieldDimensions;
-    auto ballPos = brain->data->ball.posToField;
+    // 相机短暂丢球但轨迹预测仍可靠时, 用预测位置, 避免沿用陈旧检测位置(点球快射时常见).
+    Point ballPos = brain->data->ball.posToField;
+    if (!brain->data->ballDetected && brain->data->reliableBallPredict) {
+        ballPos = brain->data->ball.reliablePredictPosToField;
+    }
     auto robotPose = brain->data->robotPoseToField;
 
     string curRole = brain->tree->getEntry<string>("player_role");
 
+    // 球速预测: 球高速朝我方球门飞来时, 直接预测它到达守门员所站平面时的横向位置,
+    // 避免只追踪球的当前位置而在点球/任意球防守中滞后. 阈值复用 goalie_simple_* 参数.
+    double threatVx = -0.03, predictMinVx = 0.06;
+    double tPlaneMin = 0.02, tPlaneMax = 6.0;
+    brain->get_parameter("strategy.goalie_simple_threat_vxf", threatVx);
+    brain->get_parameter("strategy.goalie_simple_predict_min_vxf", predictMinVx);
+    brain->get_parameter("strategy.goalie_simple_t_plane_min", tPlaneMin);
+    brain->get_parameter("strategy.goalie_simple_t_plane_max", tPlaneMax);
+
+    const double anchorX = -fd.length / 2.0 + distToGoalline;
+    const double ballVx = brain->data->ballEstVelX;
+    const double ballVy = brain->data->ballEstVelY;
+    const double ballSpeed = std::hypot(ballVx, ballVy);
+
+    bool predicted = false;
+    double predictedY = 0.0;
+    if (ballVx < threatVx && ballSpeed > predictMinVx) {
+        const double t = (anchorX - ballPos.x) / ballVx;
+        if (t > tPlaneMin && t < tPlaneMax) {
+            predictedY = std::clamp(ballPos.y + ballVy * t,
+                                    -fd.goalWidth / 2.0, fd.goalWidth / 2.0);
+            predicted = true;
+        }
+    }
+
     Pose2D targetPose;
-    targetPose.x = curRole == "striker" ? (std::max(- fd.length / 2.0 + distToGoalline, ballPos.x - 1.5))
-            : (- fd.length / 2.0 + distToGoalline);
-    if (ballPos.x + fd.length / 2.0 < distToGoalline) {
+    targetPose.x = curRole == "striker" ? (std::max(anchorX, ballPos.x - 1.5)) : anchorX;
+    if (predicted) {
+        targetPose.y = predictedY;
+    } else if (ballPos.x + fd.length / 2.0 < distToGoalline) {
         targetPose.y = curRole == "striker" ? (ballPos.y > 0 ? fd.goalWidth / 2.0 : -fd.goalWidth / 2.0)
             : (std::abs(ballPos.x + fd.length / 2.0) < 1e-4
                 ? (ballPos.y >= 0.0 ? fd.goalWidth / 2.0 : -fd.goalWidth / 2.0)
@@ -1909,12 +1941,22 @@ NodeStatus Analyze2::tick()
         _interceptKickCloseStartValid = false;
     }
 
+    // "被过"告警: 预测球会从守门员身后穿过(即射向球门且守门员当前不在球路上)时,
+    // 禁止离开球门出击, 否则会被过顶/挑射; 该情形下降级为门线防守.
+    const bool willBeBeaten =
+        brain->data->ballWillBreach &&
+        brain->data->ballEstVelX < -0.3 &&  // 球须明显朝我方球门运动, 排除慢速滚球
+        std::abs(brain->data->ballBreachPoint.y) <=
+            brain->config->fieldDimensions.goalWidth / 2.0 + 0.5;
+
     string nextMode;
     if (forceIdle) {
         nextMode = "guard_idle";
         _interceptKickDisabled = false;
-    } else if (!visualKickReady) {
-        nextMode = brain->data->ballDetected ? "guard_defend" : "guard_idle";
+    } else if (!visualKickReady || willBeBeaten) {
+        // 相机短暂丢球(如快射时的运动模糊)但仍有可靠轨迹预测时, 应继续防守而非回位.
+        // source.usable 已统一了"实时检测 / 可靠预测"两种球源.
+        nextMode = source.usable ? "guard_defend" : "guard_idle";
         _interceptKickDisabled = false;
     } else if (currentMode == "intercept_kick" && sessionActive && !_interceptKickDisabled) {
         nextMode = "intercept_kick";
@@ -2364,6 +2406,7 @@ NodeStatus RLVisionKick::onRunning()
     }
 
     bool teammateWinsVisualKick = false;
+    bool teammateWinnerNearBall = false;
     double minTeammateVisualKickCost = std::numeric_limits<double>::infinity();
     int minTeammateVisualKickId = 0;
     const int selfIdx = brain->config->playerId - 1;
@@ -2374,6 +2417,7 @@ NodeStatus RLVisionKick::onRunning()
         if (tm.cost < minTeammateVisualKickCost) {
             minTeammateVisualKickCost = tm.cost;
             minTeammateVisualKickId = i + 1;
+            teammateWinnerNearBall = std::isfinite(tm.ballRange) && tm.ballRange <= 1.0;
         }
     }
     if (minTeammateVisualKickId > 0) {
@@ -2386,7 +2430,10 @@ NodeStatus RLVisionKick::onRunning()
     double yieldMyCostMin = 4.0;
     brain->get_parameter("strategy.auto_visual_kick.max_parallel_count", maxParallel);
     brain->get_parameter("strategy.auto_visual_kick.yield_my_cost_min", yieldMyCostMin);
-    const bool shouldYield = !nearRealBall && teammateWinsVisualKick &&
+    // 原逻辑仅在"我不在近球"时让位; 但若两台机器人同时贴近球(争球), 谁都不让会直接撞在一起.
+    // 因此双方都在近球时也按 cost/ID 让位, 保证同一时刻只有一台出脚.
+    const bool bothAtBall = nearRealBall && teammateWinnerNearBall;
+    const bool shouldYield = teammateWinsVisualKick && (!nearRealBall || bothAtBall) &&
         (maxParallel <= 1 || brain->data->tmMyCost > yieldMyCostMin);
 
     const bool elapsedEnough = elapsed > minMsecKick;
@@ -2487,17 +2534,24 @@ NodeStatus Intercept2::tick()
     const double goalLineX = -fd.length / 2.0;
     const double anchorX = goalLineX + distToGoalLine;
     const auto &pose = brain->data->robotPoseToField;
-    const auto &ball = brain->data->ball.posToField;
+    // 相机短暂丢球但轨迹预测仍可靠时, 用预测位置继续防守, 避免沿用陈旧的上次检测位置.
+    Point ball = brain->data->ball.posToField;
+    if (!brain->data->ballDetected && brain->data->reliableBallPredict) {
+        ball = brain->data->ball.reliablePredictPosToField;
+    }
     const double ballVx = brain->data->ballEstVelX;
     const double ballVy = brain->data->ballEstVelY;
 
     double threatVx = -0.03, minPredictVx = 0.06;
     double maxGoalTime = 8.0, minPlaneTime = 0.02, maxPlaneTime = 6.0;
+    double interceptAdvance = 0.6, interceptSpeed = 1.0;
     brain->get_parameter("strategy.goalie_simple_threat_vxf", threatVx);
     brain->get_parameter("strategy.goalie_simple_predict_min_vxf", minPredictVx);
     brain->get_parameter("strategy.goalie_simple_t_goal_max", maxGoalTime);
     brain->get_parameter("strategy.goalie_simple_t_plane_min", minPlaneTime);
     brain->get_parameter("strategy.goalie_simple_t_plane_max", maxPlaneTime);
+    brain->get_parameter("strategy.goalie_simple_intercept_advance", interceptAdvance);
+    brain->get_parameter("strategy.goalie_simple_intercept_speed", interceptSpeed);
 
     bool threateningGoal = false;
     if (ballVx < threatVx) {
@@ -2507,12 +2561,51 @@ NodeStatus Intercept2::tick()
         }
     }
 
+    double targetX = anchorX;
     double targetY = std::clamp(ball.y, -halfGoalWidth, halfGoalWidth);
     if (threateningGoal && std::abs(ballVx) > minPredictVx) {
-        const double timeToAnchor = (anchorX - ball.x) / ballVx;
-        if (timeToAnchor > minPlaneTime && timeToAnchor < maxPlaneTime) {
-            targetY = std::clamp(ball.y + timeToAnchor * ballVy,
-                                 -halfGoalWidth, halfGoalWidth);
+        // 移动挡球: 优先在预测球路上求解"最近可达拦截点".
+        // 沿轨迹由远及近扫描, 取第一个"机器人能赶在球到达之前到位"且落在防守区内的点,
+        // 从而尽量前出封堵, 而不是死守门线前固定平面上的预测落点.
+        bool foundIntercept = false;
+        const auto &traj = brain->data->predictedBallPos;
+        if (!traj.empty() && brain->data->ballPosPredictTime.nanoseconds() > 0) {
+            const double stepMs = std::max(
+                1.0, brain->get_parameter("ball_predictor.step_interval").as_double());
+            const double ageMs = brain->msecsSince(brain->data->ballPosPredictTime);
+            const double horizonMs = stepMs * static_cast<double>(traj.size() - 1);
+            if (std::isfinite(ageMs) && ageMs >= 0.0 &&
+                ageMs <= std::min(2000.0, horizonMs)) {
+                const int startIdx = std::clamp(
+                    static_cast<int>(ageMs / stepMs), 0,
+                    static_cast<int>(traj.size()) - 1);
+                const double maxAdvanceX = anchorX + std::max(0.0, interceptAdvance);
+                for (int i = startIdx; i < static_cast<int>(traj.size()); ++i) {
+                    const auto &p = traj[i];
+                    if (!std::isfinite(p[0]) || !std::isfinite(p[1])) continue;
+                    // 约束: 拦截点须位于门线到最大前出位置之间, 且不超出球门宽度.
+                    if (p[0] < goalLineX || p[0] > maxAdvanceX) continue;
+                    if (std::abs(p[1]) > halfGoalWidth) continue;
+                    const double ballTimeSec = (i - startIdx) * stepMs / 1000.0;
+                    if (ballTimeSec > maxPlaneTime) break;
+                    const double robotTimeSec =
+                        std::hypot(p[0] - pose.x, p[1] - pose.y) / std::max(0.1, interceptSpeed);
+                    if (robotTimeSec <= ballTimeSec) {
+                        targetX = p[0];
+                        targetY = p[1];
+                        foundIntercept = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!foundIntercept) {
+            // 回退: 轨迹不可用或无点可达时, 仍用固定拦截平面上的预测落点.
+            const double timeToAnchor = (anchorX - ball.x) / ballVx;
+            if (timeToAnchor > minPlaneTime && timeToAnchor < maxPlaneTime) {
+                targetY = std::clamp(ball.y + timeToAnchor * ballVy,
+                                     -halfGoalWidth, halfGoalWidth);
+            }
         }
     }
 
@@ -2525,7 +2618,7 @@ NodeStatus Intercept2::tick()
     brain->get_parameter("strategy.goalie_simple_vtheta_kp", thetaKp);
     brain->get_parameter("strategy.goalie_simple_vtheta_limit", thetaMax);
 
-    const double vxField = std::clamp(xKp * (anchorX - pose.x), -vxMax, vxMax);
+    const double vxField = std::clamp(xKp * (targetX - pose.x), -vxMax, vxMax);
     const double vyField = std::clamp(yKp * (targetY - pose.y), -vyMax, vyMax);
     double vxRobot = vxField * std::cos(pose.theta) + vyField * std::sin(pose.theta);
     double vyRobot = -vxField * std::sin(pose.theta) + vyField * std::cos(pose.theta);
