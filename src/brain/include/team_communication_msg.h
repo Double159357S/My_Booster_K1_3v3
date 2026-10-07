@@ -1,10 +1,14 @@
 #pragma once
 
 #include <cstddef>
-#include "types.h"
+#include <cstring>
+#include <cmath>
+#include "utils/geometry_types.h"
+#include "utils/team_cooperation.h"
 
 #define VALIDATION_COMMUNICATION_LEGACY 31202
 #define VALIDATION_COMMUNICATION 31203
+#define VALIDATION_COMMUNICATION_OWNERSHIP 31204
 struct TeamCommunicationMsg
 {
     int validation = VALIDATION_COMMUNICATION; // validate msg, to determine if it's sent by us.
@@ -86,3 +90,78 @@ struct TeamCommunicationMsgInsertedV1
 };
 static_assert(sizeof(TeamCommunicationMsgInsertedV1) == 128,
               "transitional team packet layout changed");
+
+// Preserve the complete 128-byte v2 prefix, including its tail padding.
+// All on-field robots must upgrade together: old senders cannot confirm grants.
+struct TeamOwnershipPacket {
+    TeamCommunicationMsg state{};
+    team_cooperation::Announcement ownership;
+    std::uint64_t session = 0;
+    std::uint32_t canControl = 0; // Calibrated and in autonomous football mode.
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(TeamCommunicationMsg) == 128, "v2 team packet layout changed");
+static_assert(offsetof(TeamOwnershipPacket, ownership) == 128, "v2 prefix changed");
+static_assert(sizeof(TeamOwnershipPacket) == 160, "ownership packet layout changed");
+
+template<class OldPacket>
+inline void copyLegacyTeamState(const OldPacket &old, TeamCommunicationMsg &msg) {
+    msg.validation = VALIDATION_COMMUNICATION;
+    msg.communicationId = old.communicationId;
+    msg.teamId = old.teamId;
+    msg.playerId = old.playerId;
+    msg.playerRole = old.playerRole;
+    msg.isAlive = old.isAlive;
+    msg.isLead = old.isLead;
+    msg.ballDetected = old.ballDetected;
+    msg.ballLocationKnown = old.ballLocationKnown;
+    msg.ballConfidence = old.ballConfidence;
+    msg.ballRange = old.ballRange;
+    msg.cost = old.cost;
+    msg.ballPosToField = old.ballPosToField;
+    msg.robotPoseToField = old.robotPoseToField;
+    msg.kickDir = old.kickDir;
+    msg.thetaRb = old.thetaRb;
+    msg.cmdId = old.cmdId;
+    msg.cmd = old.cmd;
+}
+
+inline bool decodeTeamPacket(const void *data, std::size_t size, TeamOwnershipPacket &out) {
+    out = TeamOwnershipPacket{};
+    if (!data || size < sizeof(int)) return false;
+    int validation = 0;
+    std::memcpy(&validation, data, sizeof(validation));
+    const auto *bytes = static_cast<const unsigned char *>(data);
+    // Check native bool representations before copying any untrusted bool.
+    const std::size_t boolEnd = validation == VALIDATION_COMMUNICATION_LEGACY &&
+        size == sizeof(TeamCommunicationMsgInsertedV1) ? 25 : 24;
+    if (size < boolEnd) return false;
+    for (std::size_t i = 20; i < boolEnd; ++i) if (bytes[i] > 1) return false;
+    if (validation == VALIDATION_COMMUNICATION_OWNERSHIP && size == sizeof(out)) {
+        if (bytes[120] > 1) return false;
+        std::memcpy(&out, data, sizeof(out));
+        if (out.session == 0 || out.canControl > 1 || out.reserved != 0 ||
+            out.ownership.coordinator < 0 || out.ownership.owner < 0 ||
+            out.ownership.leaseMs > 10000) return false;
+    } else if (validation == VALIDATION_COMMUNICATION && size == sizeof(out.state)) {
+        if (bytes[120] > 1) return false;
+        std::memcpy(&out.state, data, sizeof(out.state));
+    } else if (validation == VALIDATION_COMMUNICATION_LEGACY &&
+               size == sizeof(TeamCommunicationMsgLegacy)) {
+        TeamCommunicationMsgLegacy old{};
+        std::memcpy(&old, data, sizeof(old));
+        copyLegacyTeamState(old, out.state);
+    } else if (validation == VALIDATION_COMMUNICATION_LEGACY &&
+               size == sizeof(TeamCommunicationMsgInsertedV1)) {
+        TeamCommunicationMsgInsertedV1 old{};
+        std::memcpy(&old, data, sizeof(old));
+        copyLegacyTeamState(old, out.state);
+        out.state.isInVisualKick = old.isInVisualKick;
+    } else return false;
+    const auto &m = out.state;
+    return m.playerId > 0 && m.playerRole >= 1 && m.playerRole <= 3 &&
+        std::isfinite(m.cost) && m.cost >= 0.0 && std::isfinite(m.ballRange) &&
+        std::isfinite(m.ballPosToField.x) && std::isfinite(m.ballPosToField.y) &&
+        std::isfinite(m.robotPoseToField.x) && std::isfinite(m.robotPoseToField.y) &&
+        std::isfinite(m.robotPoseToField.theta);
+}

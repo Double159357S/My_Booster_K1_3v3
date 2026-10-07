@@ -10,6 +10,8 @@
 #include <iterator>
 #include <limits>
 #include <rclcpp/rclcpp.hpp>
+#include "utils/geometry_types.h"
+#include "utils/team_cooperation.h"
 
 using namespace std;
 
@@ -37,20 +39,7 @@ const FieldDimensions FD_ADULTSIZE{14.16, 9.22, 2.242, 2.6, 1.54, 3.24, 6.192, 1
 const FieldDimensions FD_ROBOLEAGUE{22.003, 14.126, 3.635, 2.6, 1.99, 5.221, 8.121, 2.307, 5.083};
 
 // Pose2D, 记录平面上的一个点以及朝向
-struct Pose2D
-{
-    double x = 0;
-    double y = 0;
-    double theta = 0; // rad, 从 x 轴正方向开始, 逆时针为正
-};
-
-// Point, 记录一个三维点
-struct Point
-{
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
+// Pose2D and Point are defined in utils/geometry_types.h.
 
 // Point2D, 记录一个二维点
 struct Point2D
@@ -212,6 +201,12 @@ struct TMStatus {
     int cmd = 0; // 最后一次发出的指令 
     int cmdId = 0; // 最后一次发出的指令 ID
     rclcpp::Time timeLastCom; // 最后一次通讯时间
+    double teamReceivedMs = -std::numeric_limits<double>::infinity();
+    team_cooperation::Announcement ownership;
+    std::uint64_t teamSession = 0;
+    std::uint64_t retiredTeamSession = 0;
+    int teamSequence = -1;
+    bool canControl = false;
 };
 
 

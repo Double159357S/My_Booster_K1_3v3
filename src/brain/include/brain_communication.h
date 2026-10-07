@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <stdexcept>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <thread>
 
 
@@ -56,6 +58,8 @@ private:
     void broadcastTeamCommunication();
     void spinTeamCommunicationReceiver();
     int _team_communication_msg_id = 0;
+    const std::uint64_t _team_session = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
     std::atomic<bool> _team_communication_flag{false};
     std::thread _team_broadcast_thread;
     std::thread _team_receive_thread;

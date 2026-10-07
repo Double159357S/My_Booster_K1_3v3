@@ -4,11 +4,11 @@
 
 ### 1. 视觉节点收不到图像和 CameraInfo
 
-记录日期：2026-10-05。
+记录日期：2026-10-05；更新日期：2026-10-07，机器人 `192.168.133.21`。
 
 #### 问题现象
 
-检测和分割模型初始化成功，但 `vision.log` 停在以下警告，视觉节点收不到图像和内参：
+模型初始化成功，但没有图像和检测输出，日志提示：
 
 ```text
 no valid CameraInfo received within 3.000 s; using YAML fallback
@@ -16,49 +16,41 @@ no valid CameraInfo received within 3.000 s; using YAML fallback
 
 #### 问题原因
 
-头部相机处理服务启动时，设备时间错误地处于 **2053 年**，随后系统时间回拨到 **2026 年**，硬件时钟 RTC 仍是 2053 年。处理节点持续打印：
-
-```text
-drop one message to avoid timestamp disorder
-```
-
-结合日志和重启后的恢复情况，判断时间回拨导致 `StereoNetNode` 持续丢帧，无法正常发布 RGB 和 CameraInfo，主机视觉节点因此超时。
+头部相机服务在错误的 **2053 年**启动，时间回拨到 **2026 年**后持续丢帧，日志出现 `drop one message to avoid timestamp disorder`。本次只重启处理服务未恢复，还需要重启原始采集服务。
 
 #### 解决方法
 
-从机器人主机登录头部相机板：
+先登录机器人主机，再登录头部板：
 
 ```bash
+ssh booster@192.168.133.21
 ssh root@192.168.127.10
 ```
 
-在头部检查时间和处理日志：
+头部密码取自主机 `/opt/booster/BoosterRos2/install/booster-x5-camera/booster_x5_manager.sh` 中的 `REMOTE_PASS`。
+
+在头部检查时间，**确认系统时间正确后**重启两项服务：
 
 ```bash
 date -Is
-timedatectl status
-journalctl -u start_stereo.service -n 20 --no-pager
-```
-
-**确认系统时间正确后**，重启处理服务并将当前时间写入 RTC：
-
-```bash
+hwclock --show --utc
+# 确认系统时间正确后执行
+systemctl restart start_camera.service
 systemctl restart start_stereo.service
-hwclock --systohc --utc
 ```
 
-以上两条修复命令在头部执行。本次没有修改视觉源码、YAML、启动脚本或 service 文件。
+仅当 RTC 错误时，再执行 `hwclock --systohc --utc`。本次 RTC 已正确，无需写入。
 
 #### 验证结果
 
-回到机器人主机，在工程目录检查日志：
+回到机器人主机检查：
 
 ```bash
 cd /home/booster/Workspace/K1_5v5_demo_1.7
 grep '\[vision\]\[intrinsics\]' vision.log | tail -5
 ```
 
-出现 `using CameraInfo topic intrinsics`，说明视觉节点已自动使用相机实际内参。RGB 图像和检测输出恢复，本次实测检测发布频率约 **15～17 Hz**。
+出现 `using CameraInfo topic intrinsics`，图像和检测输出恢复。本次实测 RGB、CameraInfo 约 **20 Hz**，检测约 **16.7 Hz**；尚未验证重新开机后的恢复情况。
 
 ### 2. 入场定位失败，头部持续扫描找球
 

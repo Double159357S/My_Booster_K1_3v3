@@ -75,40 +75,43 @@ void BrainCommunication::unicastToGameController()
             continue;
         }
 
-        if (protocolVersion >= 20)
         {
-            const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
-            gc_return_data_v20.teamNum = brain->config->teamId;
-            gc_return_data_v20.playerNum = brain->config->playerId;
-            gc_return_data_v20.fallen =
-                brain->data->recoveryState == RobotRecoveryState::HAS_FALLEN ? 1 : 0;
-            gc_return_data_v20.pose[0] = static_cast<float>(brain->data->robotPoseToField.x * 1000.0);
-            gc_return_data_v20.pose[1] = static_cast<float>(brain->data->robotPoseToField.y * 1000.0);
-            gc_return_data_v20.pose[2] = static_cast<float>(brain->data->robotPoseToField.theta);
-            gc_return_data_v20.ballAge = ballLocationKnown
-                ? static_cast<float>(brain->msecsSince(brain->data->ball.timePoint) / 1000.0)
-                : -1.0F;
-            gc_return_data_v20.ball[0] = ballLocationKnown
-                ? static_cast<float>(brain->data->ball.posToRobot.x * 1000.0)
-                : 0.0F;
-            gc_return_data_v20.ball[1] = ballLocationKnown
-                ? static_cast<float>(brain->data->ball.posToRobot.y * 1000.0)
-                : 0.0F;
-            const int ret = sendto(_gc_send_socket, &gc_return_data_v20,
-                                   sizeof(gc_return_data_v20), 0,
-                                   reinterpret_cast<sockaddr *>(&_gcsaddr), sizeof(_gcsaddr));
-            if (ret < 0)
-                cout << RED_CODE << format("gc sendto failed: %s", strerror(errno)) << RESET_CODE << endl;
-        }
-        else
-        {
-            gc_return_data.team = brain->config->teamId;
-            gc_return_data.player = brain->config->playerId;
-            gc_return_data.message = GAMECONTROLLER_RETURN_MSG_ALIVE;
-            const int ret = sendto(_gc_send_socket, &gc_return_data, sizeof(gc_return_data), 0,
-                                   reinterpret_cast<sockaddr *>(&_gcsaddr), sizeof(_gcsaddr));
-            if (ret < 0)
-                cout << RED_CODE << format("gc sendto failed: %s", strerror(errno)) << RESET_CODE << endl;
+            std::lock_guard<std::recursive_mutex> stateLock(brain->brainStateMutex_);
+            if (protocolVersion >= 20)
+            {
+                const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
+                gc_return_data_v20.teamNum = brain->config->teamId;
+                gc_return_data_v20.playerNum = brain->config->playerId;
+                gc_return_data_v20.fallen =
+                    brain->data->recoveryState == RobotRecoveryState::HAS_FALLEN ? 1 : 0;
+                gc_return_data_v20.pose[0] = static_cast<float>(brain->data->robotPoseToField.x * 1000.0);
+                gc_return_data_v20.pose[1] = static_cast<float>(brain->data->robotPoseToField.y * 1000.0);
+                gc_return_data_v20.pose[2] = static_cast<float>(brain->data->robotPoseToField.theta);
+                gc_return_data_v20.ballAge = ballLocationKnown
+                    ? static_cast<float>(brain->msecsSince(brain->data->ball.timePoint) / 1000.0)
+                    : -1.0F;
+                gc_return_data_v20.ball[0] = ballLocationKnown
+                    ? static_cast<float>(brain->data->ball.posToRobot.x * 1000.0)
+                    : 0.0F;
+                gc_return_data_v20.ball[1] = ballLocationKnown
+                    ? static_cast<float>(brain->data->ball.posToRobot.y * 1000.0)
+                    : 0.0F;
+                const int ret = sendto(_gc_send_socket, &gc_return_data_v20,
+                                       sizeof(gc_return_data_v20), 0,
+                                       reinterpret_cast<sockaddr *>(&_gcsaddr), sizeof(_gcsaddr));
+                if (ret < 0)
+                    cout << RED_CODE << format("gc sendto failed: %s", strerror(errno)) << RESET_CODE << endl;
+            }
+            else
+            {
+                gc_return_data.team = brain->config->teamId;
+                gc_return_data.player = brain->config->playerId;
+                gc_return_data.message = GAMECONTROLLER_RETURN_MSG_ALIVE;
+                const int ret = sendto(_gc_send_socket, &gc_return_data, sizeof(gc_return_data), 0,
+                                       reinterpret_cast<sockaddr *>(&_gcsaddr), sizeof(_gcsaddr));
+                if (ret < 0)
+                    cout << RED_CODE << format("gc sendto failed: %s", strerror(errno)) << RESET_CODE << endl;
+            }
         }
         this_thread::sleep_for(chrono::milliseconds(BROADCAST_GAME_CONTROL_INTERVAL_MS));
     }
@@ -177,37 +180,46 @@ void BrainCommunication::broadcastTeamCommunication()
     };
     while (_team_communication_flag.load())
     {
-        TeamCommunicationMsg msg{};
-        const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
-        msg.validation = VALIDATION_COMMUNICATION;
-        msg.communicationId = _team_communication_msg_id++;
-        msg.teamId = brain->config->teamId;
-        msg.playerId = brain->config->playerId;
-        msg.playerRole = brain->tree->getEntry<string>("player_role") == "striker" ? 1 : 2;
-        msg.isAlive = brain->data->tmImAlive;
-        msg.isLead = brain->data->tmImLead;
-        msg.isInVisualKick = brain->data->tmImInVisualKick;
-        msg.ballDetected = ballLocationKnown && brain->data->ballDetected;
-        msg.ballLocationKnown = ballLocationKnown;
-        msg.ballConfidence = ballLocationKnown ? brain->data->ball.confidence : 0.0;
-        msg.ballRange = ballLocationKnown ? brain->data->ball.range : 0.0;
-        msg.cost = brain->data->tmMyCost;
-        msg.ballPosToField = ballLocationKnown ? brain->data->ball.posToField : Point{};
-        msg.robotPoseToField = brain->data->robotPoseToField;
-        msg.kickDir = brain->data->kickDir;
-        msg.thetaRb = ballLocationKnown ? brain->data->robotBallAngleToField : 0.0;
-        msg.cmdId = brain->data->tmMyCmdId;
-        msg.cmd = brain->data->tmMyCmd;
+        TeamOwnershipPacket wire{};
+        auto &msg = wire.state;
+        {
+            std::lock_guard<std::recursive_mutex> stateLock(brain->brainStateMutex_);
+            wire.ownership = brain->data->ballArbitration.announcement(team_cooperation::steadyNowMs());
+            wire.session = _team_session;
+            wire.canControl = brain->data->tmImAlive &&
+                brain->tree->getEntry<int>("control_state") == 3 ? 1 : 0;
+            const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
+            msg.validation = VALIDATION_COMMUNICATION_OWNERSHIP;
+            msg.communicationId = _team_communication_msg_id++;
+            msg.teamId = brain->config->teamId;
+            msg.playerId = brain->config->playerId;
+            msg.playerRole = brain->tree->getEntry<string>("player_role") == "striker" ? 1 : 2;
+            msg.isAlive = brain->data->tmImAlive;
+            msg.isLead = brain->data->tmImLead;
+            msg.isInVisualKick = brain->data->tmImInVisualKick;
+            msg.ballDetected = ballLocationKnown && brain->data->ballDetected;
+            msg.ballLocationKnown = ballLocationKnown;
+            msg.ballConfidence = ballLocationKnown ? brain->data->ball.confidence : 0.0;
+            msg.ballRange = ballLocationKnown ? brain->data->ball.range : 0.0;
+            msg.cost = brain->data->tmMyCost;
+            msg.ballPosToField = ballLocationKnown ? brain->data->ball.posToField : Point{};
+            msg.robotPoseToField = brain->data->robotPoseToField;
+            msg.kickDir = brain->data->kickDir;
+            msg.thetaRb = ballLocationKnown ? brain->data->robotBallAngleToField : 0.0;
+            msg.cmdId = brain->data->tmMyCmdId;
+            msg.cmd = brain->data->tmMyCmd;
+        }
         log(format("ImAlive: %d, ImLead: %d, myCost: %.1f, myCmdId: %d, myCmd: %d",
                     msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
 
-        const int ret = sendto(_team_socket, &msg, sizeof(msg), 0,
+        const int ret = sendto(_team_socket, &wire, sizeof(wire), 0,
                                reinterpret_cast<sockaddr *>(&_team_broadcast_addr),
                                sizeof(_team_broadcast_addr));
         if (ret < 0)
             cout << RED_CODE << format("team broadcast failed: %s", strerror(errno)) << RESET_CODE << endl;
         else
         {
+            std::lock_guard<std::recursive_mutex> stateLock(brain->brainStateMutex_);
             brain->data->sendId = msg.communicationId;
             brain->data->sendTime = brain->get_clock()->now();
         }
@@ -243,68 +255,10 @@ void BrainCommunication::spinTeamCommunicationReceiver()
                  << RESET_CODE << endl;
             continue;
         }
-        if (len != static_cast<ssize_t>(TEAM_COMMUNICATION_LEGACY_SIZE) &&
-            len != static_cast<ssize_t>(sizeof(TeamCommunicationMsg)) &&
-            len != static_cast<ssize_t>(sizeof(TeamCommunicationMsgInsertedV1)))
-            continue;
-
-        int validation = 0;
-        std::memcpy(&validation, packet.data(), sizeof(validation));
-        if (len == static_cast<ssize_t>(TEAM_COMMUNICATION_LEGACY_SIZE) &&
-            validation == VALIDATION_COMMUNICATION_LEGACY)
-        {
-            TeamCommunicationMsgLegacy legacy{};
-            std::memcpy(&legacy, packet.data(), sizeof(legacy));
-            msg.validation = VALIDATION_COMMUNICATION;
-            msg.communicationId = legacy.communicationId;
-            msg.teamId = legacy.teamId;
-            msg.playerId = legacy.playerId;
-            msg.playerRole = legacy.playerRole;
-            msg.isAlive = legacy.isAlive;
-            msg.isLead = legacy.isLead;
-            msg.ballDetected = legacy.ballDetected;
-            msg.ballLocationKnown = legacy.ballLocationKnown;
-            msg.ballConfidence = legacy.ballConfidence;
-            msg.ballRange = legacy.ballRange;
-            msg.cost = legacy.cost;
-            msg.ballPosToField = legacy.ballPosToField;
-            msg.robotPoseToField = legacy.robotPoseToField;
-            msg.kickDir = legacy.kickDir;
-            msg.thetaRb = legacy.thetaRb;
-            msg.cmdId = legacy.cmdId;
-            msg.cmd = legacy.cmd;
-            msg.isInVisualKick = false;
-        }
-        else if (len == static_cast<ssize_t>(sizeof(TeamCommunicationMsg)) &&
-                 validation == VALIDATION_COMMUNICATION)
-            std::memcpy(&msg, packet.data(), sizeof(msg));
-        else if (len == static_cast<ssize_t>(sizeof(TeamCommunicationMsgInsertedV1)) &&
-                 validation == VALIDATION_COMMUNICATION_LEGACY)
-        {
-            TeamCommunicationMsgInsertedV1 inserted{};
-            std::memcpy(&inserted, packet.data(), sizeof(inserted));
-            msg.validation = VALIDATION_COMMUNICATION;
-            msg.communicationId = inserted.communicationId;
-            msg.teamId = inserted.teamId;
-            msg.playerId = inserted.playerId;
-            msg.playerRole = inserted.playerRole;
-            msg.isAlive = inserted.isAlive;
-            msg.isLead = inserted.isLead;
-            msg.ballDetected = inserted.ballDetected;
-            msg.ballLocationKnown = inserted.ballLocationKnown;
-            msg.ballConfidence = inserted.ballConfidence;
-            msg.ballRange = inserted.ballRange;
-            msg.cost = inserted.cost;
-            msg.ballPosToField = inserted.ballPosToField;
-            msg.robotPoseToField = inserted.robotPoseToField;
-            msg.kickDir = inserted.kickDir;
-            msg.thetaRb = inserted.thetaRb;
-            msg.cmdId = inserted.cmdId;
-            msg.cmd = inserted.cmd;
-            msg.isInVisualKick = inserted.isInVisualKick;
-        }
-        else
-            continue;
+        TeamOwnershipPacket wire{};
+        if (!decodeTeamPacket(packet.data(), static_cast<std::size_t>(len), wire)) continue;
+        msg = wire.state;
+        std::lock_guard<std::recursive_mutex> stateLock(brain->brainStateMutex_);
 
         if (msg.teamId != brain->config->teamId)
             continue;
@@ -317,12 +271,31 @@ void BrainCommunication::spinTeamCommunicationReceiver()
         }
 
         const int tmIdx = msg.playerId - 1;
-        if (tmIdx < 0 || tmIdx >= HL_MAX_NUM_PLAYERS || brain->data->penalty[tmIdx] == SUBSTITUTE)
+        if (tmIdx < 0 || tmIdx >= HL_MAX_NUM_PLAYERS ||
+            msg.playerId > brain->config->numOfPlayers ||
+            wire.ownership.coordinator > brain->config->numOfPlayers ||
+            wire.ownership.owner > brain->config->numOfPlayers ||
+            brain->data->penalty[tmIdx] == SUBSTITUTE)
             continue;
         log(format("TMID: %d, alive: %d, lead: %d, cost: %.1f, CmdId: %d, Cmd: %d",
                     msg.playerId, msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
         TMStatus &tmStatus = brain->data->tmStatus[tmIdx];
-        tmStatus.role = msg.playerRole == 1 ? "striker" : "goal_keeper";
+        // Do not let delayed legacy packets erase an adopted ownership grant.
+        if (wire.session == 0 && tmStatus.teamSession != 0) continue;
+        if (wire.session != 0) {
+            if (wire.session == tmStatus.retiredTeamSession) continue;
+            if (wire.session == tmStatus.teamSession && msg.communicationId <= tmStatus.teamSequence) continue;
+            if (wire.session != tmStatus.teamSession) {
+                tmStatus.retiredTeamSession = tmStatus.teamSession;
+                tmStatus.teamSession = wire.session;
+            }
+            tmStatus.teamSequence = msg.communicationId;
+        }
+        tmStatus.ownership = wire.ownership;
+        tmStatus.canControl = wire.canControl == 1;
+        tmStatus.teamReceivedMs = team_cooperation::steadyNowMs();
+        tmStatus.role = msg.playerRole == 1 ? "striker" :
+            (msg.playerRole == 2 ? "goal_keeper" : "unknown");
         tmStatus.isAlive = msg.isAlive;
         tmStatus.ballDetected = msg.ballDetected;
         tmStatus.ballLocationKnown = msg.ballLocationKnown;

@@ -145,8 +145,12 @@ public:
     int tmMyCmd = 0; // 我最后发出的指令;
     int tmMyCmdId = 0; // 我最后发出的指令的 ID; 
     int tmReceivedCmd = 0; // 收到队友的指令. 当 tmCmdId 与收到的 cmdId 不同时, 这个值会被更新为收到的 Cmd, 执行后会回到 0;
-    bool tmImLead = true; // 当前我是否在控球.
-    bool tmImAlive = true; // 当前我是否在上场中. 以裁判机为准.
+    bool tmImLead = false; // 等待协调器确认控球权后才允许攻击。
+    bool tmImAlive = false;
+    team_cooperation::Arbitration ballArbitration;
+    team_cooperation::Announcement teamOwnership;
+    int supportOwnerId = 0;
+    int supportSide = 0;
     double tmMyCost = 0.; // 我接近球的成本, 用于多机配合. 基本上 cost 相当于我踢到球需要花的秒数.
     int tmMyCostRank = 0; // 我接近球的成本排名, 用于多机配合. 基本上 cost 相当于我踢到球需要花的秒数.
     int tmMyStrikerCostRank = 0; // 仅在前锋中按 cost 排名，用于我方普通开球阶段的攻守分组.

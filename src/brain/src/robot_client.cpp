@@ -200,8 +200,29 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
         y = y > 0 ? miny : -miny;
     if (applyMinTheta && fabs(theta) < mintheta && fabs(theta) > 1e-5)
         theta = theta > 0 ? mintheta : -mintheta;
-    x = cap(x, brain->config->vxLimit, -brain->config->vxLimit);
-    y = cap(y, brain->config->vyLimit, -brain->config->vyLimit);
+    // Apply teammate clearance after minimum-speed boosts. A stationary or
+    // retreating robot can still move away instead of being trapped by a stop.
+    const double teamNowMs = team_cooperation::steadyNowMs();
+    const double freshMs = std::clamp(brain->get_parameter(
+        "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const double stopDist = std::clamp(brain->get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+    const double slowDist = std::max(stopDist + 0.1, brain->get_parameter(
+        "strategy.cooperation.teammate_slow_distance").as_double());
+    const double approachSpeed = std::clamp(brain->get_parameter(
+        "strategy.cooperation.teammate_approach_speed").as_double(), 0.0, 0.6);
+    std::vector<team_cooperation::Position> teammates;
+    if (brain->tree->getEntry<bool>("odom_calibrated")) {
+        for (int i = 0; i < brain->config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+            const auto &tm = brain->data->tmStatus[i];
+            const double age = teamNowMs - tm.teamReceivedMs;
+            if (i + 1 == brain->config->playerId || !tm.isAlive || age < 0.0 || age > freshMs) continue;
+            auto relative = brain->data->field2robot(tm.robotPoseToField);
+            teammates.push_back({relative.x, relative.y});
+        }
+    }
+    team_cooperation::limitTeamVelocity(x, y, theta, teammates,
+        stopDist, slowDist, approachSpeed, brain->config->vxLimit, brain->config->vyLimit);
     theta = cap(theta, brain->config->vthetaLimit, -brain->config->vthetaLimit);
 
 

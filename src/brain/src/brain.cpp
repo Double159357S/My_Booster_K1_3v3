@@ -175,7 +175,17 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.shoot.ymin", -0.5);
     declare_parameter<double>("strategy.shoot.ymax", 0.5);
     declare_parameter<bool>("strategy.cooperation.enable_role_switch", true);
-    declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 10.0);
+    declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 10.0); // legacy parameter
+    declare_parameter<double>("strategy.cooperation.comm_fresh_ms", 800.0);
+    declare_parameter<double>("strategy.cooperation.owner_lease_ms", 1200.0);
+    declare_parameter<double>("strategy.cooperation.owner_hold_ms", 1500.0);
+    declare_parameter<double>("strategy.cooperation.owner_switch_margin", 0.75);
+    declare_parameter<double>("strategy.cooperation.owner_confirm_ms", 500.0);
+    declare_parameter<double>("strategy.cooperation.support_back_distance", 1.4);
+    declare_parameter<double>("strategy.cooperation.support_side_distance", 1.2);
+    declare_parameter<double>("strategy.cooperation.teammate_stop_distance", 0.8);
+    declare_parameter<double>("strategy.cooperation.teammate_slow_distance", 1.3);
+    declare_parameter<double>("strategy.cooperation.teammate_approach_speed", 0.4);
     declare_parameter<double>("strategy.cooperation.goalie_comm_fresh_msecs", 2200.0);
     declare_parameter<double>("strategy.cooperation.goalie_comm_stable_msecs", 1000.0);
     declare_parameter<double>("strategy.cooperation.goalie_distance_tie_margin", 0.15);
@@ -473,7 +483,7 @@ void Brain::tick()
 }
 
 void Brain::pubKickMsg() {
-    if (!pubKickBall) return;
+    if (!pubKickBall || (config->enableCom && !data->tmImLead)) return;
     const bool goalieVisualKick =
         tree->getEntry<string>("player_role") == "goal_keeper" &&
         (data->goalieVisualKickSubState == "block_kick" ||
@@ -728,7 +738,9 @@ void Brain::handleCooperation() {
     log_("handle cooperation");
 
     const int CMD_COOLDOWN = 2000; 
-    const int COM_TIMEOUT = 5000; 
+    const double COM_TIMEOUT = std::clamp(
+        get_parameter("strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const double teamNowMs = team_cooperation::steadyNowMs();
 
     int selfId = config->playerId;
     int selfIdx = selfId - 1;
@@ -739,7 +751,8 @@ void Brain::handleCooperation() {
 
     data->tmImAlive = 
         (data->penalty[selfIdx] == PENALTY_NONE) 
-        && tree->getEntry<bool>("odom_calibrated"); 
+        && tree->getEntry<bool>("odom_calibrated")
+        && data->recoveryState == RobotRecoveryState::IS_READY;
     updateCostToKick(); 
     log_(format("ImAlive: %d, myCost: %.1f", data->tmImAlive, data->tmMyCost));
 
@@ -776,7 +789,7 @@ void Brain::handleCooperation() {
 
         if (
             data->penalty[i] != PENALTY_NONE 
-            || msecsSince(data->tmStatus[i].timeLastCom) > COM_TIMEOUT 
+            || teamNowMs - data->tmStatus[i].teamReceivedMs > COM_TIMEOUT
         ) {
             data->tmStatus[i].isAlive = false;
             data->tmStatus[i].isLead = false;
@@ -966,10 +979,43 @@ void Brain::handleCooperation() {
     const int ownerId = activeVisualKickOwner.id > 0
         ? activeVisualKickOwner.id
         : bestOwner.id;
-    data->tmImLead = data->tmImAlive && ownerId == selfId;
+    if (config->enableCom) {
+        team_cooperation::Settings settings;
+        settings.freshMs = COM_TIMEOUT;
+        settings.leaseMs = std::clamp(get_parameter("strategy.cooperation.owner_lease_ms").as_double(), 800.0, 3000.0);
+        settings.holdMs = std::clamp(get_parameter("strategy.cooperation.owner_hold_ms").as_double(), 0.0, 10000.0);
+        settings.switchMargin = std::max(0.05, get_parameter("strategy.cooperation.owner_switch_margin").as_double());
+        settings.confirmMs = std::clamp(get_parameter("strategy.cooperation.owner_confirm_ms").as_double(), 100.0, 3000.0);
+        std::vector<team_cooperation::Peer> peers;
+        peers.push_back({selfId, data->tmImAlive,
+            tree->getEntry<int>("control_state") == 3 &&
+                (selfRole == "striker" || selfGoalieClaimsBall) &&
+                tree->getEntry<bool>("ball_location_known"),
+            data->tmImInVisualKick, data->tmMyCost, 0.0,
+            data->ballArbitration.announcement(teamNowMs)});
+        for (int tmIdx : aliveTmIdxs) {
+            const auto &tm = data->tmStatus[tmIdx];
+            const bool goalieClaim = tm.role == "goal_keeper" &&
+                (tm.isInVisualKick || (tm.ballDetected && tm.ballRange < 1.5 &&
+                 tm.ballPosToField.x < goalieClaimBallX));
+            peers.push_back({tmIdx + 1, tm.isAlive,
+                tm.canControl && (tm.role == "striker" || goalieClaim) && tm.ballLocationKnown,
+                tm.isInVisualKick, tm.cost, teamNowMs - tm.teamReceivedMs, tm.ownership});
+        }
+        // Use the referee's on-field roster, not each receiver's visible peers.
+        const int quorum = std::max(1, gcAliveCount / 2 + 1);
+        data->tmImLead = data->ballArbitration.update(teamNowMs, selfId, quorum, peers, settings);
+        data->teamOwnership = data->ballArbitration.announcement(teamNowMs);
+    } else {
+        data->tmImLead = data->tmImAlive && ownerId == selfId;
+        data->teamOwnership = {selfId, data->tmImLead ? selfId : 0, 0, 0};
+    }
     tree->setEntry<bool>("is_lead", data->tmImLead);
+    log_(format("shared owner: coordinator=%d owner=%d revision=%u lead=%d",
+        data->teamOwnership.coordinator, data->teamOwnership.owner,
+        data->teamOwnership.revision, data->tmImLead));
     log_(format("ball owner: %d, myCost: %.1f, myCostRank: %d, myStrikerCostRank: %d, kickoffGroupRank: %d, myStrikerIDRank: %d",
-        ownerId, data->tmMyCost, myCostRank, myStrikerCostRank,
+        data->teamOwnership.owner, data->tmMyCost, myCostRank, myStrikerCostRank,
         data->kickoffStrikerGroupRank, myStrikerIDRank));
 
 
@@ -3716,6 +3762,23 @@ void Brain::depthImageCallback(const sensor_msgs::msg::Image &msg)
     }
 }
 
+double Brain::teammateDistance() {
+    double result = std::numeric_limits<double>::infinity();
+    if (!tree->getEntry<bool>("odom_calibrated")) return result;
+    const double nowMs = team_cooperation::steadyNowMs();
+    const double freshMs = std::clamp(
+        get_parameter("strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+        const auto &tm = data->tmStatus[i];
+        const double age = nowMs - tm.teamReceivedMs;
+        if (i + 1 == config->playerId || !tm.isAlive || age < 0.0 || age > freshMs) continue;
+        const double range = std::hypot(tm.robotPoseToField.x - data->robotPoseToField.x,
+                                        tm.robotPoseToField.y - data->robotPoseToField.y);
+        if (std::isfinite(range)) result = std::min(result, range);
+    }
+    return result;
+}
+
 double Brain::distToObstacle(double angle) {
     auto obs = data->getObstacles();
     double minDist = 1e9;
@@ -3738,6 +3801,24 @@ double Brain::distToObstacle(double angle) {
             if (dist > 0 && dist < minDist) {
                 minDist = dist;
             }
+        }
+    }
+    const double nowMs = team_cooperation::steadyNowMs();
+    const double freshMs = std::clamp(get_parameter(
+        "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const double radius = std::clamp(get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+    if (!tree->getEntry<bool>("odom_calibrated")) return minDist;
+    for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+        const auto &tm = data->tmStatus[i];
+        const double age = nowMs - tm.teamReceivedMs;
+        if (i + 1 == config->playerId || !tm.isAlive || age < 0.0 || age > freshMs) continue;
+        const auto p = data->field2robot(tm.robotPoseToField);
+        const double along = p.x * std::cos(angle) + p.y * std::sin(angle);
+        const double perpendicular = std::fabs(p.x * std::sin(angle) - p.y * std::cos(angle));
+        if (along > 0.0 && perpendicular < radius) {
+            const double contact = std::max(0.0, along - std::sqrt(radius * radius - perpendicular * perpendicular));
+            minDist = std::min(minDist, contact);
         }
     }
     return minDist;
