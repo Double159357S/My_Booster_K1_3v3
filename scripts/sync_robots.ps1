@@ -1,11 +1,11 @@
 ﻿#requires -Version 5.1
 <#
-Ask for the IP prefix and robot suffixes, then compare and sync sources.
+Ask for the local project, IP prefix and robot suffixes, then sync sources.
 Use -DryRun to preview or -Build to compile after syncing.
 #>
 [CmdletBinding()]
 param(
-    [string]$LocalRoot = 'E:\GIthubCode\My_Booster_K1_3v3',
+    [string]$LocalRoot,
     [string]$RemoteRoot = '/home/booster/Workspace/K1_5v5_demo_1.7',
     [string]$IpPrefix,
     [string]$RobotIds,
@@ -42,9 +42,18 @@ try {
     if (-not (Test-Path -LiteralPath $backend -PathType Leaf)) {
         throw "缺少脚本配套文件：$backend"
     }
+    if ([string]::IsNullOrWhiteSpace($LocalRoot)) {
+        $defaultLocalRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+        $LocalRoot = Read-Host ("请输入本地工程路径（直接回车使用 $defaultLocalRoot）")
+        if ([string]::IsNullOrWhiteSpace($LocalRoot)) { $LocalRoot = $defaultLocalRoot }
+    }
+    # Accept paths pasted with surrounding quotes, including paths with spaces.
+    $LocalRoot = $LocalRoot.Trim().Trim('"').Trim("'")
+    $LocalRoot = (Resolve-Path -LiteralPath $LocalRoot -ErrorAction Stop).ProviderPath
     if (-not (Test-Path -LiteralPath (Join-Path $LocalRoot 'src\brain') -PathType Container)) {
         throw "本地工程目录无效：$LocalRoot"
     }
+    Write-Host ("本地工程：$LocalRoot") -ForegroundColor Cyan
     $python = Get-Command python.exe -ErrorAction Stop
     $plink = Find-PuttyTool 'plink.exe'
     $pscp = Find-PuttyTool 'pscp.exe'

@@ -1,20 +1,21 @@
 # 同步本地代码到机器人
 
-在 Windows PowerShell 运行：
+在本地工程根目录打开 Windows PowerShell，运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "E:\GIthubCode\My_Booster_K1_3v3\scripts\sync_robots.ps1"
+powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 ```
 
 脚本依次询问：
 
-1. IP 段，例如 `192.168.133`。
-2. 机器人尾号，例如 `.43`；多台可输入 `.43,.21`，也支持 `43 21`。
-3. SSH 密码，本次运行只输入一次，适用于所选机器使用相同密码的情况。
+1. 本地工程路径；直接回车使用脚本所在的工程目录，也可以输入其他目录，支持带空格或外围引号的路径。
+2. IP 段，例如 `192.168.133`。
+3. 机器人尾号，例如 `.43`；多台可输入 `.43,.21`，也支持 `43 21`。
+4. SSH 密码，本次运行只输入一次，适用于所选机器使用相同密码的情况。
 
 **没有默认机器人，也不会扫描或自动选择其他 IP。** 空尾号会退出。
 
-默认本地工程为 `E:\GIthubCode\My_Booster_K1_3v3`，机器人目录为 `/home/booster/Workspace/K1_5v5_demo_1.7`，SSH 用户为 `booster`。
+本地路径不固定；机器人目录默认为 `/home/booster/Workspace/K1_5v5_demo_1.7`，SSH 用户为 `booster`。
 
 ## 同步内容
 
@@ -30,14 +31,16 @@ powershell -ExecutionPolicy Bypass -File "E:\GIthubCode\My_Booster_K1_3v3\script
 
 ## 可选参数
 
-只预览差异，在运行命令末尾加 `-DryRun`；预览仍会询问 IP 段和尾号。
+只预览差异，在运行命令末尾加 `-DryRun`；预览仍会询问本地工程路径、IP 段和尾号。
+
+已明确本地路径时，可用 `-LocalRoot "D:\Projects\My_Booster_K1_3v3"` 跳过路径询问。
 
 同步后自动编译加 `-Build`，使用单并发构建 `brain`、`vision`、`game_controller` 及其依赖。使用此选项前先停止 Demo。脚本不启动或停止机器人程序；更新完成后自行重启 Demo。
 
 已明确目标时可以省略地址询问：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "E:\GIthubCode\My_Booster_K1_3v3\scripts\sync_robots.ps1" -IpPrefix 192.168.133 -RobotIds .43
+powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1" -IpPrefix 192.168.133 -RobotIds .43
 ```
 
 回滚时加 `-RollbackBackup <备份编号>`，再输入需要回滚的目标；如果文件在同步后又被修改，脚本会拒绝覆盖这些修改。
