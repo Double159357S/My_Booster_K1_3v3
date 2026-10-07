@@ -17,5 +17,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Source-sync comparison reports and on-robot backups
+.robot-sync/
+.robot-sync-backups/
+
 # Keep the bundled .so and .a dependencies in src/vision/thirdparty/lib.
 # Ignore build output by directory, not all library files by extension.
