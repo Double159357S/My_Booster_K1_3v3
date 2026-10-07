@@ -1,18 +1,18 @@
-# Booster K1 3v3 配置模板，供 set_up.py 初始化 config.yaml 使用。
+# Booster K1 3v3 配置模板，供 setup/set_up.py 初始化 config.yaml 使用。
 # 以 My_Booster_K1_3v3 的现有配置为基础，参考 5v5 示例的注释格式。
-# 每队 3 台，使用 kid_size 场地预设；队号、球员编号、角色、裁判机 IP 需填写。
-# 0 和 TODO 是初始化占位值，先用 set_up.py 完成设置，再启动 brain。
+# 每队 3 台，默认 kid_size 场地；队号、球员编号、场地类型、角色、入场边线、调试开关、裁判机 IP 由脚本设置。
+# 0 和 TODO 是初始化占位值，先用 setup/set_up.py 完成设置，再启动 brain。
 # 场地预设：9×6 米，中圈直径 1.5 米，大禁区 2×5 米，小禁区 1×3 米。
 # 角色示例：1 号 goal_keeper，2/3 号 striker；也可在裁判机比赛界面调整守门员编号。
 # 自动角色切换沿用现有设置；要固定角色，修改 strategy.cooperation.enable_role_switch。
-# set_up.py 只在 config.yaml 不存在时复制此模板；已有配置需要同步场地类型和比赛人数。
+# setup/set_up.py 只在 config.yaml 不存在时复制此模板；逐项按回车保留有效值，比赛人数需人工校对。
 
 brain_node:
   ros__parameters:
     game:
       team_id: 0 # 待设置：队伍 ID，必须与裁判机一致；有效值 1-255
       player_id: 0 # 待设置：3v3 使用 1、2、3；同队机器人编号不能重复
-      field_type: "kid_size" # 本次使用 kid_size：9×6 米，中圈半径 0.75 米；预设见 types.h
+      field_type: "kid_size" # 场地类型：adult_size | kid_size | robo_league；默认 kid_size，预设见 types.h
       player_role: "TODO" # 待设置：striker | goal_keeper；这是启动角色
       player_start_pos: "right" # 入场边线：right | left；与实际摆放位置一致
       treat_person_as_robot: false # 调试开关；正式比赛保持 false
