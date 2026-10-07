@@ -138,3 +138,126 @@ Teammates: Alive: 0
 - 全局 `teams.yaml` 中的 `number` 对应机器人的 `team_id`；颜色列表只提供球衣颜色选项。**颜色不对应 `player_id`，守门员也不限定为 1 号。**
 - 裁判机只指定守门员编号，其余球员的前锋职责由 brain 决定。
 - 固定前锋测试时，Ready 日志应显示 `Role: striker`、`StartRole: striker`。只看到 `StartRole: striker` 不能证明当前角色仍是前锋。
+
+### 2. WSL 裁判机网络与 VS Code 1006 错误
+
+记录日期：2026-10-07。
+
+#### 问题现象
+
+WSL 的 IP 为 `172.22.237.178`，机器人为 `192.168.133.43`。虽然能 ping 通，但裁判机的 UDP 广播不一定能到达机器人。
+
+切换镜像网络并重启 WSL 后，VS Code 提示“无法获取远程环境”和 `WebSocket close with status code 1006`。
+
+#### 问题原因
+
+WSL 默认 NAT 网络不能直接向机器人所在局域网广播。重启 WSL 后，VS Code 的 WSL 辅助进程仍缓存旧连接，导致重连失败。
+
+#### 解决方法
+
+1. 在 Windows 11 22H2 或更新版本中，编辑 `C:\Users\wjc\.wslconfig`，在文件中设置：
+
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+
+   这是文件内容，不能直接粘贴到 Ubuntu 终端执行。
+
+2. 保存工作，在 **Windows PowerShell** 执行，然后重新进入 Ubuntu：
+
+   ```powershell
+   wsl --shutdown
+   ```
+
+3. 如果 VS Code 仍报 1006，在 **Windows PowerShell** 重启 WSL 辅助进程：
+
+   ```powershell
+   Get-CimInstance Win32_Process -Filter "Name='Code.exe'" |
+       Where-Object { $_.CommandLine -match 'ms-vscode-remote\.remote-wsl.*[\\/]wslDaemon\.js' } |
+       ForEach-Object { Stop-Process -Id $_.ProcessId }
+   ```
+
+   回到 VS Code，按 **Ctrl + Shift + P**，执行 **Developer: Reload Window（重新加载窗口）**。
+
+4. 在 Ubuntu 用 `ip -4 addr` 检查网卡。GameController 的 **Interface** 选择机器人所在网段的接口，本次为 **`eth2`（`192.168.133.210`）**。确认防火墙允许 UDP **3838**（比赛状态）和 **3939**（机器人回报）。
+
+#### 验证结果
+
+镜像网络已生效，WSL 能 ping 通机器人，VS Code 连接已恢复。**后续已验证 UDP 双向通信，回包防火墙问题见第 4 项。**
+
+### 3. WSL 中 GameController 窗口不可见，并出现 EGL/DRI3 警告
+
+记录日期：2026-10-07。
+
+#### 问题现象与原因
+
+执行 `./game_controller` 后窗口不可见，终端出现 EGL/Mesa/DRI3 警告，窗口标题带有 `[WARN:COPY MODE]`。
+
+原因是硬件渲染异常，同时 WSLg 共享内存显示通道初始化失败，日志显示 `use_gfxredir = 0`。
+
+#### 解决方法
+
+1. 在 Ubuntu 的 `game_controller` 启动脚本中，原有 `exec` 命令前加入：
+
+   ```bash
+   if [[ "$(uname -r)" == *[Mm]icrosoft* ]]; then
+     export GDK_BACKEND="${GDK_BACKEND:-x11}"
+     export WEBKIT_DISABLE_COMPOSITING_MODE="${WEBKIT_DISABLE_COMPOSITING_MODE:-1}"
+     export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+   fi
+   ```
+
+   本次文件路径：`/home/wjc/game_controller-7.0.0-rc.3-4-x86_64-unknown-linux-gnu/game_controller`。
+
+2. 保存 Linux 图形程序中的工作，在 **Windows PowerShell** 重启 WSLg 图形服务：
+
+   ```powershell
+   wsl --system --exec pkill -TERM -x weston
+   ```
+
+3. 回到 Ubuntu 的裁判机目录，重新启动：
+
+   ```bash
+   ./game_controller
+   ```
+
+本次排查还尝试过临时挂载 `/mnt/shared_memory`，恢复后已清理；该步骤的必要性未单独验证。
+
+#### 验证结果
+
+Windows 上的 `Kid Size` 窗口恢复，菜单可操作，EGL/DRI3 警告消失，日志变为 `use_gfxredir = 1`。
+
+参考：[微软 WSL 同类问题 #40618](https://github.com/microsoft/WSL/issues/40618)。
+
+### 4. 机器人收到比赛数据，但裁判机仍显示红叉
+
+记录日期：2026-10-07。
+
+**原因：**Windows 的 WSL/Hyper-V 防火墙拦截了 UDP 3939 状态回包。
+
+**设置位置：**用**管理员 Windows PowerShell** 管理 WSL/Hyper-V 防火墙。规则永久保存，重启后仍有效。
+
+**解决：**一次放行机器人所在网段的 UDP 3939，之后同网段机器人换 IP 无需逐台设置。本次已创建以下规则，不必重复执行：
+
+```powershell
+New-NetFirewallHyperVRule -Name 'GameController-WSL-UDP3939-RobotLAN' `
+  -DisplayName 'GameController robot status - local network UDP 3939' `
+  -PolicyStore PersistentStore -Direction Inbound `
+  -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
+  -Protocol UDP -LocalAddresses Any -LocalPorts 3939 `
+  -RemoteAddresses '192.168.133.0/24' -Action Allow -Enabled True
+```
+
+查看当前设置：
+
+```powershell
+Get-NetFirewallHyperVRule -Name 'GameController-WSL-UDP3939-RobotLAN' |
+  Format-List DisplayName, Enabled, Protocol, LocalPorts, RemoteAddresses
+```
+
+**结果：**已停用原来的逐台 IP 规则，Team70 的 1、2、3 号机器人全部显示绿色勾。
+
+更换网络导致网段变化时，需要修改规则的 `RemoteAddresses`。电脑 IP 变化时，机器人配置中的 `game_control_ip` 仍需同步更新。
+
+参考：[微软 Hyper-V 防火墙说明](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/hyper-v-firewall)。
