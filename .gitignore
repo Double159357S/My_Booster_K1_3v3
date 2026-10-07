@@ -1,0 +1,21 @@
+# colcon 构建产物
+build/
+install/
+log/
+
+# 运行时日志
+*.log
+vision_log/
+
+# 深度学习模型（体积大，单独分发）
+src/vision/model/*.engine
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / 系统文件
+.vscode/
+.idea/
+.DS_Store

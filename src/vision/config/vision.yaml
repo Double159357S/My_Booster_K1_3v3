@@ -1,0 +1,88 @@
+camera:
+  type: d-robotics
+  camera_info_topic: /boostercamera/head/rgb/camera_info
+  intrin_wait_timeout_sec: 3.0
+  intrin:
+    fx: 207.864532
+    fy: 207.864532
+    cx: 277.225952
+    cy: 214.041077
+    distortion_model: 0
+    distortion_coeffs:
+      []
+  extrin:
+    -
+      - 0.000615934085
+      - 0.0184067674
+      - 0.999830425
+      - -1.79783035e-06
+    -
+      - -0.999918878
+      - -0.0127084833
+      - 0.00084995036
+      - 0.0518174134
+    -
+      - 0.0127219716
+      - -0.99974972
+      - 0.0183974449
+      - -0.0125848455
+    -
+      - 0
+      - 0
+      - 0
+      - 1
+  pitch_compensation: 0
+  yaw_compensation: 0
+  z_compensation: 0
+detection_model:
+  model_path: ./src/vision/model/best_digua_second_10.3.engine
+  confidence_threshold: 0.2
+  nms_threshold: 0.4
+  classnames: [Ball, Goalpost, Person, LCross, TCross, XCross, PenaltyPoint, Opponent, BRMarker]
+  post_process:
+    single_ball_assumption: false
+    confidence_thresholds:
+      Ball: 0.2
+      Goalpost: 0.2
+      Person: 0.2
+      LCross: 0.1
+      TCross: 0.1
+      XCross: 0.1
+      PenaltyPoint: 0.1
+      Opponent: 0.5
+      BRMarker: 0.2
+segmentation_model:
+  model_path: ./src/vision/model/best_seg_orin_10.3.engine
+  confidence_threshold: 0.3
+  nms_threshold: 0.9
+use_depth: false
+ball_pose_estimator:
+  use_depth: false
+  ball_size: 3
+  x_compensation: 0.06
+  y_compensation: -0.06
+  down_sample_leaf_size: 0.01
+  cluster_distance_threshold: 0.01
+  fitting_distance_threshold: 0.01
+  minimum_cluster_size: 150
+  filter_distance: 1.2
+  check_ball_height: true
+human_like_pose_estimator:
+  use_depth: false
+  down_sample_leaf_size: 0.01
+  fitting_distance_threshold: 0.01
+  statistic_outlier_multiplier: 0.01
+field_marker_pose_estimator:
+  refine: false
+  line_segment_area_threshold: 75
+calibration:
+  sync_max_time_diff_ms: 1400
+  offset:
+    exclude_distance: 2.0
+    zero_translation: true
+    field_marker_path: ./src/vision/config/field.yaml
+  handeye:
+    calibration_time: 2026-10-05-13-19-50
+    reprojection_error: 6.6090615449628203
+misc:
+  save_data_nonstationary: true
