@@ -229,6 +229,7 @@ public:
      * @return double, 碰撞距离
      */
     double distToObstacle(double angle);
+    double teammateDistance();
 
     /**
      * @brief 计算前方角度范围x米内是否有障碍物

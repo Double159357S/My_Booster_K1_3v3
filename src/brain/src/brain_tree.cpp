@@ -1218,6 +1218,48 @@ NodeStatus Assist::tick() {
     if (isCornerOrGoalKickAttack) {
         targetPose = calcSetPlayStandPose(brain, robotPose, ballPos);
         log(format("corner/goal kick stand, rank=%d", rank));
+    } else if (brain->config->numOfPlayers <= 3) {
+        const double back = std::clamp(brain->get_parameter(
+            "strategy.cooperation.support_back_distance").as_double(), 0.8, 2.5);
+        const double side = std::clamp(brain->get_parameter(
+            "strategy.cooperation.support_side_distance").as_double(), 0.8, 2.0);
+        auto makeTarget = [&](int direction) {
+            return team_cooperation::Position{
+                std::clamp(ballPos.x - back, ownGoalX + distToGoalline,
+                    oppGoalX - fd.penaltyAreaLength - 0.2),
+                std::clamp(ballPos.y + direction * side,
+                    -fd.width / 2.0 + 0.7, fd.width / 2.0 - 0.7)};
+        };
+        const int ownerId = brain->data->teamOwnership.owner;
+        team_cooperation::Position owner{ballPos.x, ballPos.y};
+        if (ownerId > 0 && ownerId <= brain->config->numOfPlayers && ownerId != brain->config->playerId) {
+            const auto &tm = brain->data->tmStatus[ownerId - 1];
+            if (tm.isAlive) owner = {tm.robotPoseToField.x, tm.robotPoseToField.y};
+        }
+        if (brain->data->supportSide == 0 || brain->data->supportOwnerId != ownerId) {
+            const int preferred = robotPose.y > ballPos.y ? 1 :
+                (robotPose.y < ballPos.y ? -1 : (brain->config->playerId % 2 == 0 ? 1 : -1));
+            brain->data->supportSide = team_cooperation::supportSide(
+                {robotPose.x, robotPose.y}, makeTarget(1), makeTarget(-1),
+                owner, {ballPos.x, ballPos.y}, 0.8, preferred);
+            brain->data->supportOwnerId = ownerId;
+        }
+        const auto target = makeTarget(brain->data->supportSide);
+        targetPose.x = target.x;
+        targetPose.y = target.y;
+        // Leave a crossing approach route laterally before following the target.
+        if (team_cooperation::segmentDistance({robotPose.x, robotPose.y}, target,
+                owner, {ballPos.x, ballPos.y}) < 0.8 && ownerId > 0) {
+            targetPose.x = robotPose.x;
+            targetPose.y = std::clamp(robotPose.y + brain->data->supportSide * 0.8,
+                -fd.width / 2.0 + 0.7, fd.width / 2.0 - 0.7);
+            // At the touchline there is no lateral room; retreat behind the
+            // owner first, then approach the support point from the outside.
+            if (std::fabs(targetPose.y - robotPose.y) < 0.2) {
+                targetPose.x = std::clamp(std::min(robotPose.x - 0.8, owner.x - 1.0),
+                    ownGoalX + distToGoalline, oppGoalX - fd.penaltyAreaLength - 0.2);
+            }
+        }
     } else if (aggressiveAssist) {
         if (strikerCostRank <= 2) {
             // 主攻手以外的前两名进入对方半场，形成前后错开的两条接应线。
@@ -2245,7 +2287,10 @@ NodeStatus RLVisionKick::onStart()
         _progressKickDir = brain->data->kickDir;
     }
 
-    if (!visualKickBallUsable(brain, goalieKick)) {
+    const double clearance = brain->get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double();
+    if (!brain->data->tmImLead || brain->teammateDistance() < clearance ||
+        !visualKickBallUsable(brain, goalieKick)) {
         brain->data->tmImInVisualKick = false;
         brain->tree->setEntry<bool>("goalie_block_kick_active", false);
         brain->data->goalieVisualKickSubState = "none";
@@ -2301,6 +2346,13 @@ NodeStatus RLVisionKick::onRunning()
         _isDecelerating = false;
         _pendingRobocupWalk = false;
         return NodeStatus::SUCCESS;
+    }
+
+    const double clearance = brain->get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double();
+    if (!_pendingRobocupWalk &&
+        (!brain->data->tmImLead || brain->teammateDistance() < clearance)) {
+        return beginExit("ownership revoked or teammate too close");
     }
 
     if (_isDecelerating) {

@@ -10,6 +10,7 @@
 #include <iterator>
 #include <limits>
 #include <rclcpp/rclcpp.hpp>
+#include "utils/team_cooperation.h"
 
 using namespace std;
 
@@ -212,6 +213,12 @@ struct TMStatus {
     int cmd = 0; // 最后一次发出的指令 
     int cmdId = 0; // 最后一次发出的指令 ID
     rclcpp::Time timeLastCom; // 最后一次通讯时间
+    double teamReceivedMs = -std::numeric_limits<double>::infinity();
+    team_cooperation::Announcement ownership;
+    std::uint64_t teamSession = 0;
+    std::uint64_t retiredTeamSession = 0;
+    int teamSequence = -1;
+    bool canControl = false;
 };
 
 

@@ -96,6 +96,12 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(test_kick_geometry PRIVATE cxx_std_17)
   add_test(NAME test_kick_geometry COMMAND test_kick_geometry)
+
+  add_executable(test_team_cooperation test/test_team_cooperation.cpp)
+  target_include_directories(test_team_cooperation PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(test_team_cooperation PRIVATE cxx_std_17)
+  add_test(NAME test_team_cooperation COMMAND test_team_cooperation)
 endif()
 
 ament_package()

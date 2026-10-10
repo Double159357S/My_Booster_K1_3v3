@@ -101,7 +101,17 @@ brain_node:
         max_extra_rounds: 1
       cooperation:
         enable_role_switch: true 
-        ball_control_cost_threshold: 5.0 
+        ball_control_cost_threshold: 5.0 # 旧参数；控球交接使用以下独立门槛
+        comm_fresh_ms: 800.0
+        owner_lease_ms: 1200.0
+        owner_hold_ms: 1500.0
+        owner_switch_margin: 0.75
+        owner_confirm_ms: 500.0
+        support_back_distance: 1.4
+        support_side_distance: 1.2
+        teammate_stop_distance: 0.8
+        teammate_slow_distance: 1.3
+        teammate_approach_speed: 0.4
         goalie_comm_fresh_msecs: 2200.0
         goalie_comm_stable_msecs: 1000.0
         goalie_distance_tie_margin: 0.15

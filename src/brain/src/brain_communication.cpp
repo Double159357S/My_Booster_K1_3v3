@@ -177,9 +177,14 @@ void BrainCommunication::broadcastTeamCommunication()
     };
     while (_team_communication_flag.load())
     {
-        TeamCommunicationMsg msg{};
+        TeamOwnershipPacket wire{};
+        auto &msg = wire.state;
+        wire.ownership = brain->data->ballArbitration.announcement(team_cooperation::steadyNowMs());
+        wire.session = _team_session;
+        wire.canControl = brain->data->tmImAlive &&
+            brain->tree->getEntry<int>("control_state") == 3 ? 1 : 0;
         const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
-        msg.validation = VALIDATION_COMMUNICATION;
+        msg.validation = VALIDATION_COMMUNICATION_OWNERSHIP;
         msg.communicationId = _team_communication_msg_id++;
         msg.teamId = brain->config->teamId;
         msg.playerId = brain->config->playerId;
@@ -201,7 +206,7 @@ void BrainCommunication::broadcastTeamCommunication()
         log(format("ImAlive: %d, ImLead: %d, myCost: %.1f, myCmdId: %d, myCmd: %d",
                     msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
 
-        const int ret = sendto(_team_socket, &msg, sizeof(msg), 0,
+        const int ret = sendto(_team_socket, &wire, sizeof(wire), 0,
                                reinterpret_cast<sockaddr *>(&_team_broadcast_addr),
                                sizeof(_team_broadcast_addr));
         if (ret < 0)
@@ -243,68 +248,9 @@ void BrainCommunication::spinTeamCommunicationReceiver()
                  << RESET_CODE << endl;
             continue;
         }
-        if (len != static_cast<ssize_t>(TEAM_COMMUNICATION_LEGACY_SIZE) &&
-            len != static_cast<ssize_t>(sizeof(TeamCommunicationMsg)) &&
-            len != static_cast<ssize_t>(sizeof(TeamCommunicationMsgInsertedV1)))
-            continue;
-
-        int validation = 0;
-        std::memcpy(&validation, packet.data(), sizeof(validation));
-        if (len == static_cast<ssize_t>(TEAM_COMMUNICATION_LEGACY_SIZE) &&
-            validation == VALIDATION_COMMUNICATION_LEGACY)
-        {
-            TeamCommunicationMsgLegacy legacy{};
-            std::memcpy(&legacy, packet.data(), sizeof(legacy));
-            msg.validation = VALIDATION_COMMUNICATION;
-            msg.communicationId = legacy.communicationId;
-            msg.teamId = legacy.teamId;
-            msg.playerId = legacy.playerId;
-            msg.playerRole = legacy.playerRole;
-            msg.isAlive = legacy.isAlive;
-            msg.isLead = legacy.isLead;
-            msg.ballDetected = legacy.ballDetected;
-            msg.ballLocationKnown = legacy.ballLocationKnown;
-            msg.ballConfidence = legacy.ballConfidence;
-            msg.ballRange = legacy.ballRange;
-            msg.cost = legacy.cost;
-            msg.ballPosToField = legacy.ballPosToField;
-            msg.robotPoseToField = legacy.robotPoseToField;
-            msg.kickDir = legacy.kickDir;
-            msg.thetaRb = legacy.thetaRb;
-            msg.cmdId = legacy.cmdId;
-            msg.cmd = legacy.cmd;
-            msg.isInVisualKick = false;
-        }
-        else if (len == static_cast<ssize_t>(sizeof(TeamCommunicationMsg)) &&
-                 validation == VALIDATION_COMMUNICATION)
-            std::memcpy(&msg, packet.data(), sizeof(msg));
-        else if (len == static_cast<ssize_t>(sizeof(TeamCommunicationMsgInsertedV1)) &&
-                 validation == VALIDATION_COMMUNICATION_LEGACY)
-        {
-            TeamCommunicationMsgInsertedV1 inserted{};
-            std::memcpy(&inserted, packet.data(), sizeof(inserted));
-            msg.validation = VALIDATION_COMMUNICATION;
-            msg.communicationId = inserted.communicationId;
-            msg.teamId = inserted.teamId;
-            msg.playerId = inserted.playerId;
-            msg.playerRole = inserted.playerRole;
-            msg.isAlive = inserted.isAlive;
-            msg.isLead = inserted.isLead;
-            msg.ballDetected = inserted.ballDetected;
-            msg.ballLocationKnown = inserted.ballLocationKnown;
-            msg.ballConfidence = inserted.ballConfidence;
-            msg.ballRange = inserted.ballRange;
-            msg.cost = inserted.cost;
-            msg.ballPosToField = inserted.ballPosToField;
-            msg.robotPoseToField = inserted.robotPoseToField;
-            msg.kickDir = inserted.kickDir;
-            msg.thetaRb = inserted.thetaRb;
-            msg.cmdId = inserted.cmdId;
-            msg.cmd = inserted.cmd;
-            msg.isInVisualKick = inserted.isInVisualKick;
-        }
-        else
-            continue;
+        TeamOwnershipPacket wire{};
+        if (!decodeTeamPacket(packet.data(), static_cast<std::size_t>(len), wire)) continue;
+        msg = wire.state;
 
         if (msg.teamId != brain->config->teamId)
             continue;
@@ -317,12 +263,31 @@ void BrainCommunication::spinTeamCommunicationReceiver()
         }
 
         const int tmIdx = msg.playerId - 1;
-        if (tmIdx < 0 || tmIdx >= HL_MAX_NUM_PLAYERS || brain->data->penalty[tmIdx] == SUBSTITUTE)
+        if (tmIdx < 0 || tmIdx >= HL_MAX_NUM_PLAYERS ||
+            msg.playerId > brain->config->numOfPlayers ||
+            wire.ownership.coordinator > brain->config->numOfPlayers ||
+            wire.ownership.owner > brain->config->numOfPlayers ||
+            brain->data->penalty[tmIdx] == SUBSTITUTE)
             continue;
         log(format("TMID: %d, alive: %d, lead: %d, cost: %.1f, CmdId: %d, Cmd: %d",
                     msg.playerId, msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
         TMStatus &tmStatus = brain->data->tmStatus[tmIdx];
-        tmStatus.role = msg.playerRole == 1 ? "striker" : "goal_keeper";
+        // Do not let delayed legacy packets erase an adopted ownership grant.
+        if (wire.session == 0 && tmStatus.teamSession != 0) continue;
+        if (wire.session != 0) {
+            if (wire.session == tmStatus.retiredTeamSession) continue;
+            if (wire.session == tmStatus.teamSession && msg.communicationId <= tmStatus.teamSequence) continue;
+            if (wire.session != tmStatus.teamSession) {
+                tmStatus.retiredTeamSession = tmStatus.teamSession;
+                tmStatus.teamSession = wire.session;
+            }
+            tmStatus.teamSequence = msg.communicationId;
+        }
+        tmStatus.ownership = wire.ownership;
+        tmStatus.canControl = wire.canControl == 1;
+        tmStatus.teamReceivedMs = team_cooperation::steadyNowMs();
+        tmStatus.role = msg.playerRole == 1 ? "striker" :
+            (msg.playerRole == 2 ? "goal_keeper" : "unknown");
         tmStatus.isAlive = msg.isAlive;
         tmStatus.ballDetected = msg.ballDetected;
         tmStatus.ballLocationKnown = msg.ballLocationKnown;
