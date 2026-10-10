@@ -949,10 +949,11 @@ void Brain::handleCooperation() {
             goalieClearanceMargin, goalieClearanceRange);
     };
     const string selfRole = tree->getEntry<string>("player_role");
+    const bool selfBallLocationKnown = tree->getEntry<bool>("ball_location_known");
     const bool selfGoalieClaimsBall =
         selfRole == "goal_keeper" &&
         (data->tmImInVisualKick ||
-         (data->ballDetected && !data->lose_ball &&
+         (selfBallLocationKnown && !data->lose_ball &&
           goalieCanClaim(data->ball.posToField.x, data->ball.posToField.y, data->ball.range)));
     if (selfRole == "striker" || selfGoalieClaimsBall) {
         ownerCandidates.push_back({selfId, data->tmMyCost, data->tmImInVisualKick});
@@ -962,7 +963,7 @@ void Brain::handleCooperation() {
         const bool teammateGoalieClaimsBall =
             tm.role == "goal_keeper" &&
             (tm.isInVisualKick ||
-             (tm.ballDetected &&
+             (tm.ballLocationKnown &&
               goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
         if (tm.role == "striker" || teammateGoalieClaimsBall) {
             ownerCandidates.push_back({tmIdx + 1,
@@ -1007,7 +1008,7 @@ void Brain::handleCooperation() {
         for (int tmIdx : aliveTmIdxs) {
             const auto &tm = data->tmStatus[tmIdx];
             const bool goalieClaim = tm.role == "goal_keeper" &&
-                (tm.isInVisualKick || (tm.ballDetected &&
+                (tm.isInVisualKick || (tm.ballLocationKnown &&
                  goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
             peers.push_back({tmIdx + 1, tm.isAlive,
                 tm.canControl && (tm.role == "striker" || goalieClaim) && tm.ballLocationKnown,
