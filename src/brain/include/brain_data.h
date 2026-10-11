@@ -13,6 +13,7 @@
 #include "types.h"
 #include "RoboCupGameControlData.h"
 #include "buffer.h"
+#include "utils/team_ball.h"
 
 using namespace std;
 
@@ -59,6 +60,10 @@ public:
     bool ballDetected = false;    // 当前摄像头是否识别到了足球
     GameObject ball{};              // 球的各项信息记录, 包含位置, boundingbox 等
     GameObject tmBall{};            // 队友传来的球的信息
+    bool ballFromTeammate = false;  // 当前策略球来自队友，不能用它启动踢球
+    int tmBallPlayerId = 0;         // 共享球的直接视觉来源，0 表示没有有效来源
+    team_ball::Recovery sharedBallRecovery;
+    bool tmCanControlBall = false; // 本机本帧的控球候选资格，随队内消息广播
     double robotBallAngleToField = 0.0; // 机器人到球的向量, 在球场坐标系中与 X 轴的夹角, (-PI,PI]
     bool lose_ball = false;       // 视觉丢球状态, 用于 visual kick 的退出判定
     vector<array<double, 2>> predictedBallPos; // 预测的球的位置, 单位 m, 相对于球场坐标系. 第一维为 x, 第二维为 y

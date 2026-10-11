@@ -186,9 +186,10 @@ void BrainCommunication::broadcastTeamCommunication()
             std::lock_guard<std::recursive_mutex> stateLock(brain->brainStateMutex_);
             wire.ownership = brain->data->ballArbitration.announcement(team_cooperation::steadyNowMs());
             wire.session = _team_session;
-            wire.canControl = brain->data->tmImAlive &&
-                brain->tree->getEntry<int>("control_state") == 3 ? 1 : 0;
-            const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
+            wire.canControl = brain->data->tmImAlive && brain->data->tmCanControlBall ? 1 : 0;
+            const bool localBallFresh = brain->hasFreshLocalBall();
+            const bool ballLocationKnown = localBallFresh ||
+                brain->tree->getEntry<bool>("tm_ball_pos_reliable");
             msg.validation = VALIDATION_COMMUNICATION_OWNERSHIP;
             msg.communicationId = _team_communication_msg_id++;
             msg.teamId = brain->config->teamId;
@@ -197,7 +198,7 @@ void BrainCommunication::broadcastTeamCommunication()
             msg.isAlive = brain->data->tmImAlive;
             msg.isLead = brain->data->tmImLead;
             msg.isInVisualKick = brain->data->tmImInVisualKick;
-            msg.ballDetected = ballLocationKnown && brain->data->ballDetected;
+            msg.ballDetected = localBallFresh && brain->data->ballDetected;
             msg.ballLocationKnown = ballLocationKnown;
             msg.ballConfidence = ballLocationKnown ? brain->data->ball.confidence : 0.0;
             msg.ballRange = ballLocationKnown ? brain->data->ball.range : 0.0;

@@ -505,7 +505,8 @@ NodeStatus DecideCheckBehind::tick()
 NodeStatus Chase::tick()
 {
     if (
-        !brain->tree->getEntry<bool>("ball_location_known")
+        (!brain->tree->getEntry<bool>("ball_location_known") &&
+         !brain->tree->getEntry<bool>("tm_ball_pos_reliable"))
         || brain->isBallOut(3.0, 1.5)
     )
     {
@@ -529,6 +530,15 @@ NodeStatus Chase::tick()
         && brain->data->ball.range < brain->config->nearBallRange
     ) {
         vxLimit = min(brain->config->nearBallSpeedLimit, vxLimit);
+    }
+
+    if (brain->data->ballFromTeammate) {
+        // 共享球用于接近和转向重识别；场地坐标不能替代本机脚边视觉。
+        const double yaw = brain->data->ball.yawToRobot;
+        const double speed = team_ball::approachSpeed(brain->data->ball.range, vxLimit);
+        brain->client->setVelocity(speed * sigmoid(fabs(yaw), 1, 3), 0.0,
+            cap(yaw, vthetaLimit, -vthetaLimit));
+        return NodeStatus::SUCCESS;
     }
 
     double ballRange = brain->data->ball.range;
@@ -1669,6 +1679,11 @@ NodeStatus StrikerDecide::tick() {
         newDecision = kickoffHold ? "kickoff_hold" : "assist";
         color = 0x00FFFFFF;
     }
+    else if (brain->data->ballFromTeammate)
+    {
+        newDecision = "chase"; // 先用共享位置找回真实球，再允许调整和踢球
+        color = 0x0000FFFF;
+    }
     else if (nearBallVisualKick)
     {
         // Near-ball urgency never bypasses the shared ownership grant.
@@ -1783,6 +1798,7 @@ struct GoalieBallSource
     bool usable = false;
     bool real = false;
     bool predicted = false;
+    bool shared = false;
     Point field{0.0, 0.0, 0.0};
     Pose2D robot{};
     double range = std::numeric_limits<double>::infinity();
@@ -1815,9 +1831,15 @@ GoalieBallSource getGoalieBallSource(Brain *brain)
         source.robot = {brain->data->ball.reliablePredictPosToRobot.x,
                         brain->data->ball.reliablePredictPosToRobot.y, 0.0};
         source.range = std::hypot(source.robot.x, source.robot.y);
+    } else if (brain->data->ballFromTeammate &&
+               brain->tree->getEntry<bool>("tm_ball_pos_reliable")) {
+        source.shared = true;
+        source.field = brain->data->tmBall.posToField;
+        source.robot = brain->data->field2robot({source.field.x, source.field.y, 0.0});
+        source.range = std::hypot(source.robot.x, source.robot.y);
     }
     const auto &fd = brain->config->fieldDimensions;
-    source.usable = (source.real || source.predicted) &&
+    source.usable = (source.real || source.predicted || source.shared) &&
         std::isfinite(source.field.x) && std::isfinite(source.field.y) &&
         std::isfinite(source.range) && source.range > 0.05 &&
         source.field.x >= -fd.length / 2.0 - 0.7 &&
@@ -1829,6 +1851,7 @@ GoalieBallSource getGoalieBallSource(Brain *brain)
 GoaliePredictTarget getGoaliePredictTarget(Brain *brain, const GoalieBallSource &source)
 {
     GoaliePredictTarget result;
+    if (source.shared) return result; // 本机旧轨迹不能用来拦截队友共享的新球
     const auto &trajectory = brain->data->predictedBallPos;
     if (trajectory.empty() || brain->data->ballPosPredictTime.nanoseconds() <= 0) return result;
 
@@ -1921,7 +1944,7 @@ NodeStatus Analyze2::tick()
     const bool baseReady = source.usable && brain->data->tmImLead &&
         !teammateInVisualKick &&
         source.range <= claimRange && inClearanceArea;
-    const bool sessionActive = active && visualKickMode && !forceIdle &&
+    const bool sessionActive = active && visualKickMode && !forceIdle && !source.shared &&
         brain->data->tmImLead && source.usable && inClearanceArea &&
         source.range <= claimRange + 0.5;
     const bool clearanceReady = baseReady || sessionActive;
@@ -1961,7 +1984,7 @@ NodeStatus Analyze2::tick()
         nextMode = "block_kick";
     } else {
         const auto action = kick_strategy::clearanceAction(baseReady, source.range,
-            maxRange, clearanceDirectionReady, cooldownOk);
+            maxRange, clearanceDirectionReady, cooldownOk, !source.shared);
         if (action == kick_strategy::ClearanceAction::approach) nextMode = "clear_approach";
         else if (action == kick_strategy::ClearanceAction::align) nextMode = "clear_align";
         else if (action == kick_strategy::ClearanceAction::kick) nextMode = "block_kick";

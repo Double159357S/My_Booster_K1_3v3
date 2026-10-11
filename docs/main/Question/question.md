@@ -253,3 +253,13 @@ Get-NetFirewallHyperVRule -Name 'GameController-WSL-UDP3939-RobotLAN' |
 更换网络导致网段变化时，需要修改规则的 `RemoteAddresses`。电脑 IP 变化时，机器人配置中的 `game_control_ip` 仍需同步更新。
 
 参考：[微软 Hyper-V 防火墙说明](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/hyper-v-firewall)。
+
+### 5. 己方禁区无人处理球、队友不能共享球位置
+
+记录日期：2026-10-11。
+
+**发现：**`.43` 上一次日志显示两名队友消息过期、在线数为 0；另外，原策略会丢弃近距离共享球，守门员看不见球时也不能凭队友位置申请清球。
+
+**修改：**允许共享新鲜的近球位置，守门员可申请控球并接近，踢球前由本机视觉确认；近球 2 秒仍看不见时释放资格给队友。新增 `[Team]` 日志用于检查通信和控球分配。
+
+**复测：**`.43`、`.21`、`.97` 全部同步、编译、重启 Demo，保留各自球员号。运行 `grep '\[Team\]' brain.log | tail -n 10` 查看；正常上场且定位完成时应为 `online=2/2`。如果持续为 0，检查三台版本、队号、通信开关，以及机器人之间 UDP 10070（队号 70）的网络连通性。裁判机绿色勾不代表队友通信正常。

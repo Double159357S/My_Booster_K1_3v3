@@ -486,7 +486,17 @@ void Brain::tick()
     }
 }
 
+bool Brain::hasFreshLocalBall() {
+    const double freshMs = std::clamp(get_parameter(
+        "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const double ageMs = data->ball.timePoint.nanoseconds() > 0
+        ? msecsSince(data->ball.timePoint) : std::numeric_limits<double>::infinity();
+    return team_ball::freshLocal(tree->getEntry<bool>("ball_location_known"),
+        data->ballFromTeammate, ageMs, freshMs);
+}
+
 kick_strategy::BallSource Brain::getKickBallSource() {
+    if (data->ballFromTeammate) return kick_strategy::BallSource::none;
     kick_strategy::BallObservation ball;
     ball.detected = data->ballDetected;
     ball.known = tree->getEntry<bool>("ball_location_known");
@@ -755,8 +765,6 @@ void Brain::handleCooperation() {
         (data->penalty[selfIdx] == PENALTY_NONE) 
         && tree->getEntry<bool>("odom_calibrated")
         && data->recoveryState == RobotRecoveryState::IS_READY;
-    updateCostToKick(); 
-    log_(format("ImAlive: %d, myCost: %.1f", data->tmImAlive, data->tmMyCost));
 
     
     int gcAliveCount = 0; 
@@ -811,49 +819,42 @@ void Brain::handleCooperation() {
     log_(format("Self: cost: %.1f, isLead: %d", data->tmMyCost, data->tmImLead));
 
 
-    static rclcpp::Time lastTmBallPosTime = get_clock()->now();
-    const double TM_BALL_TIMEOUT = 1000.; 
-    const double RANGE_THRESHOLD = config->tmBallDistThreshold; 
-    int trustedTMIdx = -1;
-    double minRange = 1e6;
-    log_(format("Find ball info among %d alive TMs", aliveTmIdxs.size()));
-    for (int i = 0; i < aliveTmIdxs.size(); i++) {
-        auto status = data->tmStatus[aliveTmIdxs[i]];
-        log_(format("TM %d, ballDetected: %d, ballRange: %.1f", i + 1, status.ballDetected, status.ballRange));
-        if (status.ballDetected && status.ballRange < minRange) {
-            log_(format("tm ball range(%.1f) < minRange(%.1f)", status.ballRange, minRange));
-            double dist = norm(status.ballPosToField.x - data->robotPoseToField.x, status.ballPosToField.y - data->robotPoseToField.y);
-            if (dist > RANGE_THRESHOLD) {
-                log_(format("tm ball dist to me(%.1f) > threshold(%.1f), TM %d can be trusted", dist, RANGE_THRESHOLD, i+ 1));
-                minRange = status.ballRange;
-                trustedTMIdx = aliveTmIdxs[i];
-            }  else {
-                log_(format("tm ball dist to me(%.1f) < threshold(%.1f), TM %d can NOT be trusted", dist, RANGE_THRESHOLD, i+ 1));
-            }
-        }
+    std::vector<team_ball::Report> ballReports;
+    for (int tmIdx : aliveTmIdxs) {
+        const auto &tm = data->tmStatus[tmIdx];
+        ballReports.push_back({tmIdx + 1, tm.isAlive, tm.ballDetected,
+            tm.ballLocationKnown, teamNowMs - tm.teamReceivedMs,
+            tm.ballConfidence, tm.ballRange, tm.ballPosToField.x, tm.ballPosToField.y});
     }
-    if (trustedTMIdx >= 0) {   
-        log_(format("Reliable tm ball found. PlayerID = %d", trustedTMIdx + 1));
-        data->tmBall.posToField = data->tmStatus[trustedTMIdx].ballPosToField;
+    const auto &fd = config->fieldDimensions;
+    const int selectedReport = team_ball::selectReport(ballReports, COM_TIMEOUT,
+        config->ballConfidenceThreshold, fd.length, fd.width);
+    const bool sharedBallKnown = selectedReport >= 0;
+    tree->setEntry<bool>("tm_ball_pos_reliable", sharedBallKnown);
+    data->tmBallPlayerId = sharedBallKnown ? ballReports[selectedReport].playerId : 0;
+    if (sharedBallKnown) {
+        const auto &tm = data->tmStatus[data->tmBallPlayerId - 1];
+        data->tmBall.posToField = tm.ballPosToField;
+        data->tmBall.confidence = tm.ballConfidence;
+        data->tmBall.timePoint = tm.timeLastCom; // 本机接收时间，不是远端时钟
         updateRelativePos(data->tmBall);
-
-        tree->setEntry<bool>("tm_ball_pos_reliable", true);
-        lastTmBallPosTime = get_clock()->now();
-        if (!tree->getEntry<bool>("ball_location_known")) {
-            log_("update ball.posToField");
+        if (!hasFreshLocalBall()) {
             data->ball.posToField = data->tmBall.posToField;
+            data->ball.confidence = data->tmBall.confidence;
+            data->ballFromTeammate = true;
+            data->ballDetected = false;
+            // 保留最后一次本机检测时间；共享消息不能延长真实视觉的有效期。
+            tree->setEntry<bool>("ball_location_known", false);
             updateRelativePos(data->ball);
             data->robotBallAngleToField = atan2(
                 data->ball.posToField.y - data->robotPoseToField.y,
                 data->ball.posToField.x - data->robotPoseToField.x);
         }
-    } else {
-        log_("TM reported NO BALL or can not be trusted");
-        if (msecsSince(lastTmBallPosTime) > TM_BALL_TIMEOUT) {
-            log_("TM ball timeout reached");
-            tree->setEntry<bool>("tm_ball_pos_reliable", false);
-        }
     }
+    // 先更新共享球，再计算成本，避免沿用上一帧的球和不断增长的失球成本。
+    updateCostToKick();
+    log_(format("ImAlive: %d, myCost: %.1f, sharedBallFrom: %d",
+        data->tmImAlive, data->tmMyCost, data->tmBallPlayerId));
 
     bool switchRole;
     get_parameter("strategy.cooperation.enable_role_switch", switchRole);
@@ -949,10 +950,11 @@ void Brain::handleCooperation() {
             goalieClearanceMargin, goalieClearanceRange);
     };
     const string selfRole = tree->getEntry<string>("player_role");
+    const bool strategyBallKnown = hasFreshLocalBall() || sharedBallKnown;
     const bool selfGoalieClaimsBall =
         selfRole == "goal_keeper" &&
         (data->tmImInVisualKick ||
-         (data->ballDetected && !data->lose_ball &&
+         (strategyBallKnown &&
           goalieCanClaim(data->ball.posToField.x, data->ball.posToField.y, data->ball.range)));
     if (selfRole == "striker" || selfGoalieClaimsBall) {
         ownerCandidates.push_back({selfId, data->tmMyCost, data->tmImInVisualKick});
@@ -962,7 +964,7 @@ void Brain::handleCooperation() {
         const bool teammateGoalieClaimsBall =
             tm.role == "goal_keeper" &&
             (tm.isInVisualKick ||
-             (tm.ballDetected &&
+             (tm.ballLocationKnown &&
               goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
         if (tm.role == "striker" || teammateGoalieClaimsBall) {
             ownerCandidates.push_back({tmIdx + 1,
@@ -990,6 +992,11 @@ void Brain::handleCooperation() {
     const int ownerId = activeVisualKickOwner.id > 0
         ? activeVisualKickOwner.id
         : bestOwner.id;
+    const bool canPursueBall = data->sharedBallRecovery.canPursue(teamNowMs,
+        data->ballFromTeammate, data->tmImLead, data->ball.range,
+        data->ball.posToField.x, data->ball.posToField.y);
+    data->tmCanControlBall = tree->getEntry<int>("control_state") == 3 &&
+        (selfRole == "striker" || selfGoalieClaimsBall) && strategyBallKnown && canPursueBall;
     if (config->enableCom) {
         team_cooperation::Settings settings;
         settings.freshMs = COM_TIMEOUT;
@@ -999,15 +1006,13 @@ void Brain::handleCooperation() {
         settings.confirmMs = std::clamp(get_parameter("strategy.cooperation.owner_confirm_ms").as_double(), 100.0, 3000.0);
         std::vector<team_cooperation::Peer> peers;
         peers.push_back({selfId, data->tmImAlive,
-            tree->getEntry<int>("control_state") == 3 &&
-                (selfRole == "striker" || selfGoalieClaimsBall) &&
-                tree->getEntry<bool>("ball_location_known"),
+            data->tmCanControlBall,
             data->tmImInVisualKick, data->tmMyCost, 0.0,
             data->ballArbitration.announcement(teamNowMs)});
         for (int tmIdx : aliveTmIdxs) {
             const auto &tm = data->tmStatus[tmIdx];
             const bool goalieClaim = tm.role == "goal_keeper" &&
-                (tm.isInVisualKick || (tm.ballDetected &&
+                (tm.isInVisualKick || (tm.ballLocationKnown &&
                  goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
             peers.push_back({tmIdx + 1, tm.isAlive,
                 tm.canControl && (tm.role == "striker" || goalieClaim) && tm.ballLocationKnown,
@@ -1018,10 +1023,33 @@ void Brain::handleCooperation() {
         data->tmImLead = data->ballArbitration.update(teamNowMs, selfId, quorum, peers, settings);
         data->teamOwnership = data->ballArbitration.announcement(teamNowMs);
     } else {
-        data->tmImLead = data->tmImAlive && ownerId == selfId;
+        data->tmImLead = data->tmImAlive && data->tmCanControlBall && ownerId == selfId;
         data->teamOwnership = {selfId, data->tmImLead ? selfId : 0, 0, 0};
     }
     tree->setEntry<bool>("is_lead", data->tmImLead);
+
+    static double lastTeamConsoleMs = -std::numeric_limits<double>::infinity();
+    if (teamNowMs - lastTeamConsoleMs >= 1000.0) {
+        std::cout << "[Team] player=" << selfId << " port=" << 10000 + config->teamId
+                  << " online=" << aliveTmIdxs.size() << "/" << std::max(0, gcAliveCount - 1)
+                  << " ball_source=" << (data->ballFromTeammate ?
+                      (sharedBallKnown ? "shared" : "expired") :
+                      (hasFreshLocalBall() ? "local" : "none"))
+                  << " shared_from=" << data->tmBallPlayerId
+                  << " candidate=" << data->tmCanControlBall
+                  << " owner=" << data->teamOwnership.owner << " lead=" << data->tmImLead;
+        for (int i = 0; i < numOfPlayers; ++i) {
+            if (i == selfIdx) continue;
+            const auto &tm = data->tmStatus[i];
+            const double age = teamNowMs - tm.teamReceivedMs;
+            std::cout << " P" << i + 1 << "(alive=" << tm.isAlive
+                      << ",age_ms=" << (std::isfinite(age) ? age : -1.0)
+                      << ",sees_ball=" << tm.ballDetected << ",candidate=" << tm.canControl
+                      << ",protocol=" << (tm.teamSession ? 31204 : 0) << ")";
+        }
+        std::cout << std::endl;
+        lastTeamConsoleMs = teamNowMs;
+    }
     log_(format("shared owner: coordinator=%d owner=%d revision=%u lead=%d",
         data->teamOwnership.coordinator, data->teamOwnership.owner,
         data->teamOwnership.revision, data->tmImLead));
@@ -1447,15 +1475,16 @@ void Brain::updateCostToKick() {
     double cost = 0.;
 
 
-    // Keep the time since this robot last saw the ball as an ownership cost.
-    // This intentionally keeps growing while only a teammate supplies the ball.
-    const double localBallAgeCost = std::max(
-        0.0, msecsSince(data->ball.timePoint) / 1000.0);
+    // 共享球按接收年龄计费；从未看过球的守门员不能背负“从系统启动
+    // 至今”的巨大成本，导致即使拿到共享位置也永远无法参与清球。
+    const auto &costBall = data->ballFromTeammate ? data->tmBall : data->ball;
+    const double localBallAgeCost = costBall.timePoint.nanoseconds() > 0
+        ? std::clamp(msecsSince(costBall.timePoint) / 1000.0, 0.0, 3.0) : 3.0;
     cost += localBallAgeCost;
     log_(format("local ball age cost: %.1f", localBallAgeCost));
 
 
-    const bool localBallKnown = tree->getEntry<bool>("ball_location_known");
+    const bool localBallKnown = hasFreshLocalBall();
     const bool ballLocationKnown =
         localBallKnown || tree->getEntry<bool>("tm_ball_pos_reliable");
     if (!localBallKnown) {
@@ -3061,6 +3090,7 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         data->ballDetected = true;
 
         data->ball = ballObjs[indexRealBall];
+        data->ballFromTeammate = false;
         data->ball.confidence = bestConfidence;
 
         tree->setEntry<bool>("ball_location_known", true);

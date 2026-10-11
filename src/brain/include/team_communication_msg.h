@@ -28,8 +28,8 @@ struct TeamCommunicationMsg
     int playerRole; // 角色：1 前锋，2 守门员，3 未知。
     bool isAlive; // 是否具备有效上场状态，具体资格由策略层判断。
     bool isLead; // 发送方的控球状态，新协作逻辑依据有效的 ownership 授权设置。
-    bool ballDetected; // 当前是否检测到球。
-    bool ballLocationKnown; // 是否知道球的位置，也可由记忆或队友信息得到。
+    bool ballDetected; // 本机是否有新鲜的直接视觉检测；共享球不能重新标成检测到。
+    bool ballLocationKnown; // 有新鲜本机球或共享球，供仲裁判断能否接近球。
     double ballConfidence; // 球信息的置信度。
     double ballRange; // 机器人到球的距离，单位为米。
     double cost; // 到达并处理球的估计成本，用于比较主攻候选，通常越小越有利。
@@ -113,7 +113,7 @@ struct TeamOwnershipPacket {
     // revision 为决策版本，leaseMs 为授权剩余有效时间（毫秒）。
     team_cooperation::Announcement ownership;
     std::uint64_t session = 0; // 本次通信实例的固定编号，重启后改变，用于区分新旧实例消息。
-    std::uint32_t canControl = 0; // 1 表示具备参与自主足球控球的资格，0 表示尚未具备。
+    std::uint32_t canControl = 0; // 本帧控球候选资格，含角色、有效球源和共享球重识别状态。
     std::uint32_t reserved = 0; // 预留扩展字段，当前必须为 0。
 };
 static_assert(sizeof(TeamCommunicationMsg) == 128, "v2 team packet layout changed");

@@ -160,6 +160,7 @@ public:
     void pubKickMsg();
     // 同一球源同时用于视觉踢球启动、续踢和信息发布。
     kick_strategy::BallSource getKickBallSource();
+    bool hasFreshLocalBall(); // 本机直接视觉或短暂记忆，不能把队友球当成本机视觉
 
     // 用于动态调整 vision 的校准参数
     void pubCalParamMsg(double pitch, double yaw, double z);

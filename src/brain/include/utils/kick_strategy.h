@@ -98,8 +98,9 @@ enum class ClearanceAction { defend, approach, align, kick };
 // 所有主动接近和踢球都要求共享控球权；冷却期间仍可调整，不必退回门线。
 inline ClearanceAction clearanceAction(bool authorized, double range,
                                        double visualKickRange, bool aligned,
-                                       bool cooldownReady) {
+                                       bool cooldownReady, bool localSourceUsable = true) {
     if (!authorized || !std::isfinite(range) || range <= 0.05) return ClearanceAction::defend;
+    if (!localSourceUsable) return ClearanceAction::approach;
     if (range > visualKickRange) return ClearanceAction::approach;
     if (!aligned || !cooldownReady) return ClearanceAction::align;
     return ClearanceAction::kick;

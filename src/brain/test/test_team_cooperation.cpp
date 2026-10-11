@@ -4,6 +4,8 @@
 #include <stdexcept>
 
 #include "team_communication_msg.h"
+#include "utils/team_ball.h"
+#include "utils/kick_strategy.h"
 
 using namespace team_cooperation;
 
@@ -211,6 +213,83 @@ void packetTests() {
     check(!decodeTeamPacket(nullptr, 0, decoded), "null packet accepted");
 }
 
+void sharedBallTests() {
+    // 前锋 2 看见己方禁区球，守门员 1 与前锋 3 看不见。
+    // 接收机离球只有 0.36 m，旧距离门槛会拒绝这份报告。
+    TeamOwnershipPacket packet{}, decoded{};
+    fillPacket(packet.state);
+    packet.state.validation = VALIDATION_COMMUNICATION_OWNERSHIP;
+    packet.state.ballPosToField = {-3.2, 0.2, 0.0};
+    packet.state.ballRange = 1.2;
+    packet.session = 43;
+    packet.canControl = 1;
+    check(decodeTeamPacket(&packet, sizeof(packet), decoded), "ball report wire decode failed");
+    const auto &m = decoded.state;
+    std::vector<team_ball::Report> reports{{m.playerId, m.isAlive, m.ballDetected,
+        m.ballLocationKnown, 100.0, m.ballConfidence, m.ballRange,
+        m.ballPosToField.x, m.ballPosToField.y}};
+    for (const Position receiver : std::vector<Position>{{-3.5, 0.0}, {-2.3, 1.0}}) {
+        const int selected = team_ball::selectReport(reports, 800.0, 60.0, 9.0, 6.0);
+        check(selected == 0, "near own-penalty ball was rejected for unseen teammate");
+        near(reports[selected].x, -3.2, "shared field x changed between robots");
+        near(reports[selected].y, 0.2, "shared field y changed between robots");
+        const double range = std::hypot(reports[selected].x - receiver.x,
+                                      reports[selected].y - receiver.y);
+        check(range < 1.5, "regression fixture must reproduce old distance rejection");
+        check(kick_strategy::goalieCanClaim(-3.2, 0.2, range, 9, 2, 5, 0.3, 2.2),
+              "shared ball cannot qualify for own-penalty clearance");
+        check(kick_strategy::clearanceAction(true, range, 1.2, true, true, false) ==
+              kick_strategy::ClearanceAction::approach, "shared ball started a blind goalie kick");
+    }
+    check(kick_strategy::clearanceAction(false, 0.4, 1.2, true, true, false) ==
+          kick_strategy::ClearanceAction::defend, "shared ball bypassed ownership");
+    check(kick_strategy::clearanceAction(true, 0.4, 1.2, true, true, true) ==
+          kick_strategy::ClearanceAction::kick, "reacquired local ball cannot be cleared");
+    check(team_ball::freshLocal(true, false, 100, 800), "fresh local ball not preferred");
+    check(!team_ball::freshLocal(true, true, 100, 800), "shared ball became a local observation");
+    check(!team_ball::freshLocal(true, false, 801, 800), "stalled local ball kept priority");
+    reports[0].ageMs = 801;
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == -1, "stale packet refreshed shared ball");
+    reports[0].ageMs = 100;
+    reports[0].detected = false;
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == -1, "relayed ball caused an endless echo");
+    reports[0].detected = true;
+    reports[0].confidence = 59;
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == -1, "low-confidence ball accepted");
+    reports[0].confidence = 90;
+    reports[0].x = std::numeric_limits<double>::quiet_NaN();
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == -1, "NaN shared position accepted");
+    reports[0].x = 100;
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == -1, "outside-field shared position accepted");
+    reports[0].x = -3.2;
+    reports.push_back({3, true, true, true, 100, 90, 0.5, -3.1, 0.2});
+    check(team_ball::selectReport(reports, 800, 60, 9, 6) == 1,
+          "closest visual observer did not win shared-ball selection");
+
+    near(team_ball::approachSpeed(0.4, 0.6), 0, "shared approach walked into unseen ball");
+    check(team_ball::approachSpeed(0.7, 0.6) >= 0.3, "shared approach stalls in gait dead zone");
+    near(team_ball::approachSpeed(2.0, 0.6), 0.6, "shared approach exceeded speed cap");
+    team_ball::Recovery recovery;
+    check(recovery.canPursue(0, true, true, 0.4, -3.2, 0.2), "initial shared pursuit denied");
+    check(recovery.canPursue(1990, true, true, 0.4, -3.2, 0.2), "shared recovery timed out early");
+    check(!recovery.canPursue(2000, true, true, 0.4, -3.2, 0.2), "blind owner held ball indefinitely");
+    check(!recovery.canPursue(4000, true, false, 0.4, -3.15, 0.2), "blind owner reclaimed unmoved ball");
+    check(recovery.canPursue(4100, true, false, 1.0, -2.7, 0.2), "moved ball did not enable recovery");
+    recovery.canPursue(4200, true, true, 0.4, -2.7, 0.2);
+    check(!recovery.canPursue(6200, true, true, 0.4, -2.7, 0.2), "second recovery did not time out");
+    check(recovery.canPursue(6300, false, true, 0.4, -2.7, 0.2), "local reacquisition stayed blocked");
+
+    Network net;
+    net.nodes[0].canControl = true; // 守门员通过共享球成为候选
+    net.nodes[0].cost = 2.0;
+    net.run(3000);
+    check(net.owner() == 1, "shared-ball goalie received no majority grant");
+    net.nodes[0].canControl = false; // 近球 2 s 仍不能重识别，资格随消息发布
+    net.run(3000);
+    check(net.owner() == 2, "blind goalie did not release to visible striker");
+    // Network::run 每帧还检查同时主控和仍在退出动作的机器人总数 <= 1。
+}
+
 void geometryTests() {
     near(segmentDistance({-1, 0}, {1, 0}, {0, -1}, {0, 1}), 0, "crossing routes missed");
     near(segmentDistance({0, 0}, {1, 0}, {2, 0}, {3, 0}), 1, "collinear gap wrong");
@@ -256,8 +335,9 @@ int main() {
     try {
         arbitrationTests();
         packetTests();
+        sharedBallTests();
         geometryTests();
-        std::cout << "Team cooperation: arbitration, packet decoding and geometry passed\n";
+        std::cout << "Team cooperation: arbitration, shared ball, packet decoding and geometry passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;
