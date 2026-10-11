@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -268,6 +269,210 @@ class RobotSyncTests(unittest.TestCase):
         self.assertEqual(sync.merge_gc_launch(merged.decode(), merged.decode())[0], merged)
 
 
+class BuildProgressTests(unittest.TestCase):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    def test_package_count_and_percentage_reset_for_each_package(self):
+        output = self.Terminal()
+        progress = sync.BuildProgress('192.168.133.43', output)
+        progress.consume('__K1_BUILD_TOTAL__=2\n')
+        progress.consume('Starting >>> booster_interface\n')
+        progress.consume('\x1b[32m[ 72%] Building CXX object main.cpp.o\x1b[0m\n')
+        self.assertEqual(progress.percent, 72)
+        progress.refresh(force=True)
+        self.assertIn('72%', output.getvalue())
+        progress.consume('Finished <<< booster_interface [3.2s]\n')
+        progress.consume('Starting >>> brain\n')
+        self.assertIsNone(progress.percent)
+        self.assertEqual(progress.completed, {'booster_interface'})
+        self.assertIn('1/2 pkgs', output.getvalue())
+        progress.consume('Finished <<< brain [4.0s]\n')
+        progress.finish(True)
+        self.assertIn('2/2 pkgs', output.getvalue())
+        self.assertIn('complete [################] 100%', output.getvalue())
+
+    def test_quiet_build_refreshes_elapsed_time_without_inventing_percentage(self):
+        now = [0.0]
+        output = self.Terminal()
+        progress = sync.BuildProgress('192.168.133.43', output, clock=lambda: now[0])
+        progress.consume('Starting >>> brain\n')
+        now[0] = 11.0
+        progress.refresh()
+        self.assertIn('00:11', output.getvalue())
+        self.assertIn('wait', output.getvalue())
+        self.assertNotIn('%', output.getvalue())
+        progress.consume('[ 72%] Building CXX object brain_tree.cpp.o\n')
+        now[0] = 20.0
+        progress.refresh()
+        self.assertIn('72%', output.getvalue())
+        self.assertIn('00:20', output.getvalue())
+        self.assertEqual(progress.percent, 72)
+
+    def test_failed_package_does_not_count_as_finished_or_show_success(self):
+        output = self.Terminal()
+        progress = sync.BuildProgress('192.168.133.43', output)
+        for line in ('__K1_BUILD_TOTAL__=2', 'Starting >>> brain',
+                     '[ 72%] Building CXX object brain.cpp.o',
+                     'Failed <<< brain [2.0s, exited with code 2]'):
+            progress.consume(line + '\n')
+        progress.finish(False)
+        self.assertEqual(progress.completed, set())
+        self.assertIn('0/2 pkgs', output.getvalue())
+        self.assertIn('FAILED', output.getvalue())
+        self.assertNotIn('100%', output.getvalue())
+        self.assertNotIn(' OK', output.getvalue())
+
+    def test_stream_keeps_log_and_animates_during_silence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'build.log'
+            output = self.Terminal()
+            progress = sync.BuildProgress('192.168.133.43', output)
+            program = ('import time\nprint("__K1_BUILD_TOTAL__=1", flush=True)\n'
+                       'print("Starting >>> brain", flush=True)\ntime.sleep(1.2)\n'
+                       'print("[ 72%] Building CXX object brain.cpp.o", flush=True)\n'
+                       'print("Finished <<< brain [1.2s]", flush=True)\n')
+            code, _ = sync.stream_build([sys.executable, '-u', '-c', program], 5, progress, log)
+            self.assertEqual(code, 0)
+            self.assertIn('00:01', output.getvalue())
+            self.assertIn('1/1 pkgs', output.getvalue())
+            self.assertIn('[ 72%] Building CXX object', log.read_text())
+
+    def test_stream_failure_preserves_diagnostics_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'build.log'
+            output = io.StringIO()
+            progress = sync.BuildProgress('192.168.133.43', output)
+            program = ('import sys\nprint("__K1_BUILD_TOTAL__=1")\n'
+                       'print("Starting >>> brain")\nprint("[ 60%] Compiling")\n'
+                       'print("error: simulated compiler failure", file=sys.stderr)\n'
+                       'sys.exit(2)\n')
+            code, detail = sync.stream_build([sys.executable, '-u', '-c', program], 5, progress, log)
+            self.assertEqual(code, 2)
+            self.assertIn('error: simulated compiler failure', detail)
+            self.assertIn('error: simulated compiler failure', log.read_text())
+            self.assertIn('FAILED', output.getvalue())
+            self.assertNotIn('\r', output.getvalue())
+            self.assertNotIn('100%', output.getvalue())
+
+    def test_timeout_stops_local_command_and_reports_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = io.StringIO()
+            progress = sync.BuildProgress('192.168.133.43', output)
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                sync.stream_build([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                  0.2, progress, Path(temp) / 'build.log')
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertIn('FAILED', output.getvalue())
+
+    @unittest.skipUnless(shutil.which('colcon') and shutil.which('cmake') and shutil.which('c++'),
+                         'Real build check needs colcon/CMake/C++ on Linux')
+    def test_real_colcon_build_supplies_package_count_and_make_progress(self):
+        with tempfile.TemporaryDirectory(prefix='k1 build progress ') as temp:
+            root = Path(temp)
+            packages = ('booster_interface', 'brain', 'vision', 'game_controller')
+            for name in packages:
+                folder = root / 'src' / name
+                folder.mkdir(parents=True)
+                dependency = '<depend>booster_interface</depend>' if name == 'brain' else ''
+                (folder / 'package.xml').write_text(
+                    f'<package format="3"><name>{name}</name><version>0.0.1</version>'
+                    '<description>Progress fixture</description>'
+                    '<maintainer email="test@example.com">Test</maintainer>'
+                    '<license>Apache-2.0</license>' + dependency +
+                    '<export><build_type>cmake</build_type></export></package>')
+                (folder / 'CMakeLists.txt').write_text(
+                    f'cmake_minimum_required(VERSION 3.16)\nproject({name} LANGUAGES CXX)\n'
+                    'add_executable(example main.cpp)\ninstall(TARGETS example DESTINATION bin)\n')
+                (folder / 'main.cpp').write_text('int main() { return 0; }\n')
+            # The fixture is plain CMake; it needs no robot/ROS installation.
+            command = sync.build_command(str(root)).replace('source /opt/ros/humble/setup.bash', 'true')
+            progress = sync.BuildProgress('192.168.133.43', self.Terminal())
+            log = root / 'build.log'
+            code, detail = sync.stream_build(['bash', '-c', command], 60, progress, log)
+            self.assertEqual(code, 0, detail)
+            self.assertEqual(progress.total, 4)
+            self.assertEqual(progress.completed, set(packages))
+            self.assertRegex(log.read_text(), r'\[\s*\d+%\]')
+
+
+class BuildPreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'robot'
+        (self.root / 'src/brain').mkdir(parents=True)
+
+    def module(self, name='booster_interface'):
+        copied = self.root / f'build/{name}/ament_cmake_python/{name}/{name}'
+        generated = self.root / f'build/{name}/rosidl_generator_py/{name}'
+        for path in (copied, generated):
+            path.mkdir(parents=True)
+            (path / '__init__.py').write_bytes(b'# generated message module\n')
+        (copied / 'message.so').write_bytes(b'old compiled message\n')
+        return copied, generated
+
+    def test_copy_to_symlink_transition_preserves_backup_and_is_repeatable(self):
+        copied, generated = self.module()
+        with self.assertRaises(FileExistsError):
+            copied.symlink_to(generated, target_is_directory=True)
+        result = sync.prepare_symlink_build(self.root, 'test-build')
+        self.assertEqual(result['moved'], 1)
+        saved = Path(result['changes'][0]['backup'])
+        self.assertEqual((saved / 'message.so').read_bytes(), b'old compiled message\n')
+        copied.symlink_to(generated, target_is_directory=True)
+        self.assertEqual(copied.resolve(), generated)
+        self.assertEqual(sync.prepare_symlink_build(self.root, 'test-build')['moved'], 0)
+        self.assertEqual(list((self.root / 'src/brain').iterdir()), [])
+
+    def test_unrelated_build_directory_without_generated_counterpart_is_preserved(self):
+        copied, generated = self.module()
+        (generated / '__init__.py').unlink()
+        self.assertEqual(sync.prepare_symlink_build(self.root, 'test-build')['moved'], 0)
+        self.assertTrue((copied / 'message.so').is_file())
+        self.assertFalse((self.root / '.robot-sync-backups').exists())
+
+    def test_backup_collision_is_rejected_before_any_directory_is_moved(self):
+        first, _ = self.module('aaa_interface')
+        last, _ = self.module('zzz_interface')
+        saved = self.root / '.robot-sync-backups/test-build/build-conflicts' / last.relative_to(self.root)
+        saved.mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, 'backup already exists'):
+            sync.prepare_symlink_build(self.root, 'test-build')
+        self.assertTrue(first.is_dir())
+        self.assertTrue(last.is_dir())
+
+    def test_symlink_ancestor_cannot_alias_source_or_escape_workspace(self):
+        for outside in (False, True):
+            with self.subTest(outside=outside):
+                build = self.root / 'build'
+                target = Path(self.temp.name) / 'outside' if outside else self.root / 'src/brain'
+                target.mkdir(exist_ok=True)
+                build.symlink_to(target, target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    sync.prepare_symlink_build(self.root, 'test-build')
+                self.assertTrue(build.is_symlink())
+                build.unlink()
+
+    def test_failed_move_restores_already_moved_artifacts(self):
+        first, _ = self.module('aaa_interface')
+        last, _ = self.module('zzz_interface')
+        replace = sync.os.replace
+
+        def fail_second(source, target):
+            if Path(source) == last:
+                raise OSError('simulated filesystem failure')
+            replace(source, target)
+
+        with mock.patch.object(sync.os, 'replace', side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, 'simulated filesystem failure'):
+                sync.prepare_symlink_build(self.root, 'test-build')
+        for path in (first, last):
+            self.assertEqual((path / 'message.so').read_bytes(), b'old compiled message\n')
+
+
 class DriverIntegrationTests(unittest.TestCase):
     """Run the real driver/agent pipeline locally, without SSH or robot motion."""
 
@@ -277,6 +482,14 @@ class DriverIntegrationTests(unittest.TestCase):
         self.local = Path(self.temp.name) / 'local'
         self.robot = Path(self.temp.name) / 'robot'
         self.stages = set()
+        def cleanup_stages():
+            for path in self.stages:
+                resolved = path.resolve()
+                self.assertEqual(resolved.parent, Path('/tmp').resolve())
+                self.assertRegex(resolved.name, r'^k1-source-sync-\d{8}T\d{6}Z-[0-9a-f]{8}$')
+                if resolved.exists():
+                    shutil.rmtree(resolved)
+        self.addCleanup(cleanup_stages)
         for root in (self.local, self.robot):
             for folder in ('src/brain/config', 'src/game_controller/launch', 'scripts'):
                 (root / folder).mkdir(parents=True)
@@ -331,8 +544,13 @@ class DriverIntegrationTests(unittest.TestCase):
             def __init__(self, args):
                 pass
 
-            def ssh(self, host, command, timeout=300, stream=False):
+            def ssh(self, host, command, timeout=300, stream=False, progress=None, log_path=None):
                 owner.assertEqual(host, '192.168.133.43')
+                if progress is not None:
+                    code, detail = sync.stream_build(['bash', '-c', command], timeout, progress, log_path)
+                    if code:
+                        raise RuntimeError(f'{host}: SSH command failed ({code}): {detail}')
+                    return ''
                 result = subprocess.run(['bash', '-c', command], capture_output=True,
                                         timeout=timeout, check=True)
                 return result.stdout.decode('utf-8')
@@ -388,6 +606,53 @@ class DriverIntegrationTests(unittest.TestCase):
         self.assertEqual((self.robot / sync.BRAIN_CONFIG).read_text(), self.old_config)
         self.assertFalse((self.robot / 'src/brain/new.h').exists())
         self.assertFalse((self.robot / 'scripts/start.sh').exists())
+
+    def build_fixture(self):
+        name = 'booster_interface'
+        copied = self.robot / f'build/{name}/ament_cmake_python/{name}/{name}'
+        generated = self.robot / f'build/{name}/rosidl_generator_py/{name}'
+        for path in (copied, generated):
+            path.mkdir(parents=True)
+            (path / '__init__.py').write_bytes(b'# generated\n')
+        return copied, generated
+
+    def test_driver_build_prepares_remote_artifacts_before_building(self):
+        copied, generated = self.build_fixture()
+        self.args.build = True
+        command = 'python3 -c ' + sync.shlex.quote(
+            f'from pathlib import Path; Path({str(copied)!r}).symlink_to({str(generated)!r})')
+        with mock.patch.object(sync, 'build_command', return_value=command):
+            report = self.run_driver()
+        result = report['robots']['192.168.133.43']
+        self.assertEqual(result['build'], 'passed')
+        self.assertEqual(result['build_preparation']['moved'], 1)
+        self.assertTrue(Path(result['build_log']).is_file())
+        self.assertTrue(copied.is_symlink())
+        saved = Path(result['build_preparation']['changes'][0]['backup'])
+        self.assertEqual((saved / '__init__.py').read_bytes(), b'# generated\n')
+
+    def test_build_flag_does_not_modify_artifacts_in_preview(self):
+        copied, _ = self.build_fixture()
+        self.args.build = self.args.dry_run = True
+        with mock.patch.object(sync, 'build_command', side_effect=AssertionError('Must not build')):
+            report = self.run_driver()
+        self.assertNotIn('build_preparation', report['robots']['192.168.133.43'])
+        self.assertTrue(copied.is_dir())
+        self.assertFalse(copied.is_symlink())
+
+    def test_driver_failed_build_keeps_source_sync_result_and_full_log(self):
+        self.args.build = True
+        command = 'python3 -c ' + sync.shlex.quote(
+            'import sys; print("error: fixture build failed", file=sys.stderr); sys.exit(2)')
+        with mock.patch.object(sync, 'build_command', return_value=command):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'SSH command failed'):
+                sync.run_local(self.args)
+        report = sync.read_json(next((self.local / '.robot-sync').glob('*/result.json')))
+        result = report['robots']['192.168.133.43']
+        self.assertFalse(report['success'])
+        self.assertEqual(result['state'], 'synced')
+        self.assertEqual(result['build'], 'failed')
+        self.assertIn('error: fixture build failed', Path(result['build_log']).read_text())
 
 
 if __name__ == '__main__':

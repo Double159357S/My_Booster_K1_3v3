@@ -96,6 +96,14 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(test_kick_geometry PRIVATE cxx_std_17)
   add_test(NAME test_kick_geometry COMMAND test_kick_geometry)
+  add_executable(test_kick_strategy test/test_kick_strategy.cpp)
+  target_include_directories(test_kick_strategy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(test_kick_strategy PRIVATE cxx_std_17)
+  add_test(NAME test_kick_strategy COMMAND test_kick_strategy)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME test_kick_behavior_tree COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_kick_behavior_tree.py)
   add_executable(test_team_cooperation test/test_team_cooperation.cpp)
   target_include_directories(test_team_cooperation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)

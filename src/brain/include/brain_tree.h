@@ -86,6 +86,8 @@ private:
     double lastDeltaDir = 0.0;
     bool hasLastDeltaDir = false;
     rclcpp::Time timeLastTick;
+    string lastReportedDecision;
+    rclcpp::Time timeLastDecisionLog;
 };
 
 class NewDecide : public SyncActionNode
@@ -98,7 +100,7 @@ private:
     Brain *brain;
 };
 
-// 守门员四态决策：guard_idle / guard_defend / block_kick / intercept_kick。
+// 守门员先 clear_approach / clear_align，再 block_kick / intercept_kick；无控球权时防守。
 class Analyze2 : public SyncActionNode
 {
 public:

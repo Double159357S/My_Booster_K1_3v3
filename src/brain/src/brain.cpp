@@ -14,6 +14,7 @@
 
 #include "brain.h"
 #include "utils/kick_geometry.h"
+#include "utils/kick_strategy.h"
 #include "utils/print.h"
 #include "utils/math.h"
 #include "utils/misc.h"
@@ -129,8 +130,10 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("strategy.enable_directional_kick", false);
 
     declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 600.0);
-    declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 5.0);
-    declare_parameter<double>("strategy.goalie_visual_kick_max_direction_error", 1.2);
+    declare_parameter<double>("strategy.goalie_clearance_max_ball_range", 2.2);
+    declare_parameter<double>("strategy.goalie_clearance_area_margin", 0.3);
+    declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 1.2);
+    declare_parameter<double>("strategy.goalie_visual_kick_max_direction_error", 0.55);
     declare_parameter<double>("strategy.goalie_simple_x_kp", 0.9);
     declare_parameter<double>("strategy.goalie_simple_y_kp", 2.2);
     declare_parameter<double>("strategy.goalie_simple_threat_vxf", -0.03);
@@ -143,18 +146,19 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.goalie_simple_vtheta_kp", 1.4);
     declare_parameter<double>("strategy.goalie_simple_vtheta_limit", 1.5);
     declare_parameter<bool>("strategy.enable_auto_visual_kick", false);
-    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.2);
-    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 4.0);
-    declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.8);
-    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.35);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.05);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 1.4);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.35);
+    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.25);
+    declare_parameter<double>("strategy.auto_visual_kick_max_body_error", 0.25);
     declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
     declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
-    declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.45);
+    declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.8);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_memory_kick_msg", true);
     declare_parameter<double>("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", 650.0);
-    declare_parameter<double>("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", 0.45);
-    declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 80.0);
+    declare_parameter<double>("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", 0.8);
+    declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 160.0);
     declare_parameter<double>("strategy.auto_visual_kick.exit_decelerate_ms", 140.0);
     declare_parameter<int>("strategy.auto_visual_kick.max_parallel_count", 1);
     declare_parameter<double>("strategy.auto_visual_kick.yield_my_cost_min", 4.0);
@@ -482,6 +486,35 @@ void Brain::tick()
     }
 }
 
+kick_strategy::BallSource Brain::getKickBallSource() {
+    kick_strategy::BallObservation ball;
+    ball.detected = data->ballDetected;
+    ball.known = tree->getEntry<bool>("ball_location_known");
+    ball.lost = data->lose_ball;
+    ball.ageMs = data->ball.timePoint.nanoseconds() > 0
+        ? msecsSince(data->ball.timePoint) : std::numeric_limits<double>::infinity();
+    // 最近真实球的场地坐标按当前位姿投影；不会反复使用旧的机器人坐标。
+    const auto relative = data->field2robot({data->ball.posToField.x, data->ball.posToField.y, 0.0});
+    ball.x = relative.x;
+    ball.y = relative.y;
+    ball.predictionReliable = data->reliableBallPredict &&
+        std::isfinite(data->ball.reliablePredictPosToField.x) &&
+        std::isfinite(data->ball.reliablePredictPosToField.y);
+    ball.predictedX = data->ball.reliablePredictPosToRobot.x;
+    ball.predictedY = data->ball.reliablePredictPosToRobot.y;
+    const double freshMs = std::min(
+        std::clamp(get_parameter("strategy.auto_visual_kick.current_real_ball_max_age_ms").as_double(), 50.0, 1000.0),
+        std::clamp(get_parameter("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms").as_double(), 50.0, 1000.0));
+    const double holdMs = std::clamp(get_parameter(
+        "strategy.auto_visual_kick.real_ball_hold_ms").as_double(), 150.0, 3000.0);
+    const double rejectRange = std::max(
+        std::clamp(get_parameter("strategy.auto_visual_kick.near_ball_memory_reject_range").as_double(), 0.3, 3.0),
+        std::clamp(get_parameter("strategy.auto_visual_kick.no_detection_kick_msg_reject_range").as_double(), 0.3, 3.0));
+    return kick_strategy::selectBallSource(ball, freshMs, holdMs, rejectRange,
+        get_parameter("strategy.auto_visual_kick.allow_predicted_kick_msg").as_bool(),
+        get_parameter("strategy.auto_visual_kick.allow_memory_kick_msg").as_bool());
+}
+
 void Brain::pubKickMsg() {
     if (!pubKickBall || (config->enableCom && !data->tmImLead)) return;
     const bool goalieVisualKick =
@@ -495,51 +528,20 @@ void Brain::pubKickMsg() {
         std::isfinite(data->goalieVisualKickTargetField.x) &&
         std::isfinite(data->goalieVisualKickTargetField.y);
 
-    const double realBallAgeMs = data->ball.timePoint.nanoseconds() > 0
-        ? msecsSince(data->ball.timePoint)
-        : std::numeric_limits<double>::infinity();
-    double realBallMaxAgeMs = 650.0;
-    double predictedRejectRange = 0.45;
-    bool allowPredicted = true;
-    bool allowMemory = true;
-    get_parameter("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", realBallMaxAgeMs);
-    get_parameter("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", predictedRejectRange);
-    get_parameter("strategy.auto_visual_kick.allow_predicted_kick_msg", allowPredicted);
-    get_parameter("strategy.auto_visual_kick.allow_memory_kick_msg", allowMemory);
-    realBallMaxAgeMs = std::clamp(realBallMaxAgeMs, 50.0, 1000.0);
-    predictedRejectRange = std::clamp(predictedRejectRange, 0.3, 3.0);
-
-    const bool realBallFresh = data->ballDetected &&
-        (!data->tmImInVisualKick ||
-         (realBallAgeMs >= 0.0 && realBallAgeMs <= realBallMaxAgeMs));
-    const double predictedRange = std::hypot(
-        data->ball.reliablePredictPosToRobot.x,
-        data->ball.reliablePredictPosToRobot.y);
-    const bool predictedBallUsable = allowPredicted && data->reliableBallPredict &&
-        std::isfinite(predictedRange) &&
-        (!data->tmImInVisualKick || predictedRange > predictedRejectRange);
-    const bool memoryBallUsable = allowMemory &&
-        tree->getEntry<bool>("ball_location_known") &&
-        realBallAgeMs >= 0.0 && realBallAgeMs <= 1000.0 &&
-        std::isfinite(data->ball.posToRobot.x) &&
-        std::isfinite(data->ball.posToRobot.y) &&
-        (!data->tmImInVisualKick || data->ball.range > predictedRejectRange);
-
+    const auto source = getKickBallSource();
     Point ballField;
     Pose2D ballRobot;
     if (goalieInterceptTarget) {
         ballField = data->goalieVisualKickTargetField;
         ballRobot = data->field2robot({ballField.x, ballField.y, 0.0});
-    } else if (realBallFresh) {
-        ballField = data->ball.posToField;
-        ballRobot = {data->ball.posToRobot.x, data->ball.posToRobot.y, 0.0};
-    } else if (predictedBallUsable) {
+    } else if (source == kick_strategy::BallSource::predicted) {
         ballField = data->ball.reliablePredictPosToField;
         ballRobot = {data->ball.reliablePredictPosToRobot.x,
                      data->ball.reliablePredictPosToRobot.y, 0.0};
-    } else if (memoryBallUsable) {
+    } else if (source != kick_strategy::BallSource::none) {
         ballField = data->ball.posToField;
-        ballRobot = {data->ball.posToRobot.x, data->ball.posToRobot.y, 0.0};
+        // 记忆中的相对坐标属于旧姿态，转身或移动后必须重新投影。
+        ballRobot = data->field2robot({ballField.x, ballField.y, 0.0});
     } else {
         return;
     }
@@ -936,13 +938,22 @@ void Brain::handleCooperation() {
         bool visualKick = false;
     };
     vector<BallOwnerCandidate> ownerCandidates;
-    const double goalieClaimBallX = -config->fieldDimensions.circleRadius - 2.0;
+    const auto &goalieField = config->fieldDimensions;
+    const double goalieClearanceRange = std::clamp(get_parameter(
+        "strategy.goalie_clearance_max_ball_range").as_double(), 0.8, 3.0);
+    const double goalieClearanceMargin = std::clamp(get_parameter(
+        "strategy.goalie_clearance_area_margin").as_double(), 0.0, 0.7);
+    const auto goalieCanClaim = [&](double x, double y, double range) {
+        return kick_strategy::goalieCanClaim(x, y, range, goalieField.length,
+            goalieField.penaltyAreaLength, goalieField.penaltyAreaWidth,
+            goalieClearanceMargin, goalieClearanceRange);
+    };
     const string selfRole = tree->getEntry<string>("player_role");
     const bool selfGoalieClaimsBall =
         selfRole == "goal_keeper" &&
         (data->tmImInVisualKick ||
-         (data->ballDetected && !data->lose_ball && std::isfinite(data->ball.range) &&
-          data->ball.range < 1.5 && data->ball.posToField.x < goalieClaimBallX));
+         (data->ballDetected && !data->lose_ball &&
+          goalieCanClaim(data->ball.posToField.x, data->ball.posToField.y, data->ball.range)));
     if (selfRole == "striker" || selfGoalieClaimsBall) {
         ownerCandidates.push_back({selfId, data->tmMyCost, data->tmImInVisualKick});
     }
@@ -951,8 +962,8 @@ void Brain::handleCooperation() {
         const bool teammateGoalieClaimsBall =
             tm.role == "goal_keeper" &&
             (tm.isInVisualKick ||
-             (tm.ballDetected && std::isfinite(tm.ballRange) && tm.ballRange < 1.5 &&
-              tm.ballPosToField.x < goalieClaimBallX));
+             (tm.ballDetected &&
+              goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
         if (tm.role == "striker" || teammateGoalieClaimsBall) {
             ownerCandidates.push_back({tmIdx + 1,
                 std::isfinite(tm.cost) ? tm.cost : 1e9,
@@ -996,8 +1007,8 @@ void Brain::handleCooperation() {
         for (int tmIdx : aliveTmIdxs) {
             const auto &tm = data->tmStatus[tmIdx];
             const bool goalieClaim = tm.role == "goal_keeper" &&
-                (tm.isInVisualKick || (tm.ballDetected && tm.ballRange < 1.5 &&
-                 tm.ballPosToField.x < goalieClaimBallX));
+                (tm.isInVisualKick || (tm.ballDetected &&
+                 goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
             peers.push_back({tmIdx + 1, tm.isAlive,
                 tm.canControl && (tm.role == "striker" || goalieClaim) && tm.ballLocationKnown,
                 tm.isInVisualKick, tm.cost, teamNowMs - tm.teamReceivedMs, tm.ownership});
@@ -1028,6 +1039,10 @@ void Brain::handleCooperation() {
         && data->ballDetected
         && !data->lose_ball
         && data->ball.range < 1.2
+        // 禁区内只是清球，不交接守门角色；带球离开禁区后才请求队友补位。
+        && !kick_strategy::inGoalieClearanceArea(data->ball.posToField.x,
+            data->ball.posToField.y, goalieField.length, goalieField.penaltyAreaLength,
+            goalieField.penaltyAreaWidth, goalieClearanceMargin)
         && (data->tmImLead || data->tmImInVisualKick)
         && msecsSince(data->tmLastCmdChangeTime) > CMD_COOLDOWN 
     ) {

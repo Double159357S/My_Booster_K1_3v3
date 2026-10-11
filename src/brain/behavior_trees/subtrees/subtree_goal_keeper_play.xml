@@ -23,7 +23,12 @@
             <ReactiveSequence _while="!ball_out">
                <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
                <CalcKickDir />
-               <Sequence>
+               <ReactiveSequence>
+                  <Chase _while="goalie_mode == 'clear_approach'" vx_limit="0.8"
+                     vy_limit="0.4" vtheta_limit="1.5" dist="0.4" safe_dist="0.5" />
+                  <Adjust _while="goalie_mode == 'clear_align'" range="0.4"
+                     vx_limit="0.5" vy_limit="0.4" vtheta_limit="1.5"
+                     tangential_speed_near="0.22" turn_threshold="0.3" />
                   <ReactiveSequence _while="goalie_mode == 'block_kick' || goalie_mode == 'intercept_kick'">
                      <RLVisionKick min_msec_kick="1500" max_msec_kick="7000" range="3.5" />
                   </ReactiveSequence>
@@ -34,7 +39,7 @@
                   <ReactiveSequence _while="goalie_mode == 'guard_defend'">
                      <Intercept2 dist_to_goalline="1.0" />
                   </ReactiveSequence>
-               </Sequence>
+               </ReactiveSequence>
             </ReactiveSequence>
          </ReactiveSequence>
       </ReactiveSequence>

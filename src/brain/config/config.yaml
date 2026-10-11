@@ -48,8 +48,10 @@ brain_node:
       enable_shoot: false 
       enable_directional_kick: false 
       goalie_visual_kick_cooldown_ms: 600.0
-      goalie_visual_kick_max_ball_range: 5.0
-      goalie_visual_kick_max_direction_error: 1.2 # 守门员启动视觉踢球前，球方向与解围方向的最大误差(rad)
+      goalie_clearance_max_ball_range: 2.2 # 门前球在此距离内可申请控球并主动接近(m)
+      goalie_clearance_area_margin: 0.3 # 清球范围为己方禁区，向前和两侧增加此余量(m)
+      goalie_visual_kick_max_ball_range: 1.2 # 更远先普通追球，靠近后再启动视觉踢球
+      goalie_visual_kick_max_direction_error: 0.55 # 清球路线和身体朝向均需对准(rad)
       goalie_simple_x_kp: 0.9
       goalie_simple_y_kp: 2.2
       goalie_simple_threat_vxf: -0.03
@@ -77,18 +79,19 @@ brain_node:
         ymax: 0.3 
       enable_auto_visual_kick: true
       auto_visual_kick_enable_dist_min: 0.05 # 避免将本体的部分识别为球
-      auto_visual_kick_enable_dist_max: 5.0
-      auto_visual_kick_enable_angle: 1.5
-      auto_visual_kick_max_direction_error: 1.8 # 未对准期望踢球方向时继续 Adjust，不直接进入 VisualKick
+      auto_visual_kick_enable_dist_max: 1.4 # 更远的球先追近，避免远距离直接接管踢球
+      auto_visual_kick_enable_angle: 0.35
+      auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
+      auto_visual_kick_max_body_error: 0.25 # 身体朝向也必须对准，不能只检查球所在方向
       auto_visual_kick:
         real_ball_hold_ms: 1000.0
-        current_real_ball_max_age_ms: 650.0
-        near_ball_memory_reject_range: 0.45
+        current_real_ball_max_age_ms: 650.0 # 允许脚边真实球短暂漏检，不要求每帧都有检测
+        near_ball_memory_reject_range: 0.8
         allow_predicted_kick_msg: true
         allow_memory_kick_msg: true
-        kick_msg_real_ball_max_age_ms: 650.0
-        no_detection_kick_msg_reject_range: 0.45
-        startup_decelerate_ms: 80.0
+        kick_msg_real_ball_max_age_ms: 650.0 # 与启动检查共用球源有效期
+        no_detection_kick_msg_reject_range: 0.8
+        startup_decelerate_ms: 160.0
         exit_decelerate_ms: 140.0
         max_parallel_count: 1
         yield_my_cost_min: 4.0

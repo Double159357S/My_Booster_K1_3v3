@@ -12,7 +12,7 @@
 
 ```bash
 ./scripts/build_brain.sh
-colcon test --packages-select brain --ctest-args -R 'test_(team_cooperation|kick_geometry)$' --output-on-failure
+colcon test --packages-select brain --ctest-args -R 'test_(team_cooperation|kick_geometry|kick_strategy|kick_behavior_tree)$' --output-on-failure
 colcon test-result --verbose
 ```
 
@@ -40,3 +40,5 @@ colcon test-result --verbose
 ## 回归测试
 
 `test_team_cooperation` 覆盖成本抖动、持续优势交接、踢球期间保持主攻、退出踢球后的交接、协调机器人断联及重启、无多数确认、丢包与乱序、缓存授权过期、四种通信包格式，以及接应路线和多队友速度约束。`test_kick_geometry` 保留原有踢球几何测试。
+
+守门员清球和前锋射门的更新、参数与复测步骤见 [KICKING.md](KICKING.md)，`test_kick_strategy` 验证清球、对准和球源有效期，`test_kick_behavior_tree` 验证决策的动作入口。

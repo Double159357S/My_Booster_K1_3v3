@@ -57,8 +57,10 @@ brain_node:
       enable_shoot: false
       enable_directional_kick: false
       goalie_visual_kick_cooldown_ms: 600.0 # 守门员视觉踢球冷却时间，毫秒
-      goalie_visual_kick_max_ball_range: 5.0 # 守门员视觉踢球允许的最大球距，米
-      goalie_visual_kick_max_direction_error: 1.2 # 守门员解围方向最大误差，弧度
+      goalie_clearance_max_ball_range: 2.2 # 门前球的主动接近范围，米；仍需共享控球权
+      goalie_clearance_area_margin: 0.3 # 己方禁区清球范围的余量，米
+      goalie_visual_kick_max_ball_range: 1.2 # 更远先普通追球，靠近后启动视觉踢球
+      goalie_visual_kick_max_direction_error: 0.55 # 解围路线和身体朝向的最大误差，弧度
       goalie_simple_x_kp: 0.9
       goalie_simple_y_kp: 2.2
       goalie_simple_threat_vxf: -0.03
@@ -86,18 +88,19 @@ brain_node:
         ymax: 0.3 # 触发区域 y 上限，米
       enable_auto_visual_kick: true
       auto_visual_kick_enable_dist_min: 0.05 # 自动视觉踢球的最小球距，米；过滤紧贴本体的误检
-      auto_visual_kick_enable_dist_max: 5.0 # 自动视觉踢球的最大球距，米
-      auto_visual_kick_enable_angle: 1.5 # 允许的球方向偏角，弧度
-      auto_visual_kick_max_direction_error: 1.8 # 相对期望踢球方向的最大误差，弧度
+      auto_visual_kick_enable_dist_max: 1.4 # 更远先追近，再对准踢球
+      auto_visual_kick_enable_angle: 0.35 # 允许的球方向偏角，弧度
+      auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
+      auto_visual_kick_max_body_error: 0.25 # 身体朝向的最大误差，弧度
       auto_visual_kick:
         real_ball_hold_ms: 1000.0 # 近期真实球检测保持时间，毫秒
-        current_real_ball_max_age_ms: 650.0 # 当前真实球检测的最大年龄，毫秒
-        near_ball_memory_reject_range: 0.45 # 近距离时拒绝仅凭记忆启动踢球的距离，米
+        current_real_ball_max_age_ms: 650.0 # 允许真实球短暂漏检，毫秒
+        near_ball_memory_reject_range: 0.8 # 超过真实球宽限期后，拒绝近距离旧记忆，米
         allow_predicted_kick_msg: true
         allow_memory_kick_msg: true
-        kick_msg_real_ball_max_age_ms: 650.0 # 发布踢球信息时允许的真实检测年龄，毫秒
-        no_detection_kick_msg_reject_range: 0.45 # 近距离且无检测时拒绝踢球信息的范围，米
-        startup_decelerate_ms: 80.0 # 启动视觉踢球前的减速时间，毫秒
+        kick_msg_real_ball_max_age_ms: 650.0 # 与启动检查共用球源有效期，毫秒
+        no_detection_kick_msg_reject_range: 0.8 # 超过真实球宽限期后，拒绝近距离旧目标，米
+        startup_decelerate_ms: 160.0 # 启动视觉踢球前的减速时间，毫秒
         exit_decelerate_ms: 140.0 # 退出视觉踢球时的减速时间，毫秒
         max_parallel_count: 1 # 同队同时执行视觉踢球的机器人数量上限
         yield_my_cost_min: 4.0

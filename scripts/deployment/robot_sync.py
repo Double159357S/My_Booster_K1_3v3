@@ -6,12 +6,14 @@ uses PyYAML already supplied by ROS. No robot process is stopped or started.
 """
 import argparse
 import ast
+from collections import deque
 import hashlib
 import io
 import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
+import queue
 import re
 import shlex
 import shutil
@@ -20,6 +22,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -456,6 +460,141 @@ def rollback(root, backup_id, dry_run=False):
     return {'restored': len(record['changes']), 'dry_run': dry_run}
 
 
+class BuildProgress:
+    """Show actual package/CMake progress; keep ticking while output is quiet."""
+
+    def __init__(self, host, output=None, clock=time.monotonic):
+        self.host, self.output, self.clock = host, output or sys.stdout, clock
+        self.interactive = self.output.isatty()
+        self.started = clock()
+        self.last_refresh = float('-inf')
+        self.total, self.completed = None, set()
+        self.package, self.percent, self.state = 'preparing', None, 'running'
+        self.line_width = 0
+
+    def consume(self, line):
+        text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line).strip()
+        total = re.fullmatch(r'__K1_BUILD_TOTAL__=(\d+)', text)
+        start = re.match(r'Starting\s+>>>\s+(\S+)', text)
+        end = re.match(r'Finished\s+<<<\s+(\S+)', text)
+        failed = re.match(r'(Failed|Aborted)\s+<<<\s+(\S+)', text)
+        percent = re.match(r'\[\s*(\d{1,3})%\]', text)
+        if total:
+            self.total = int(total[1])
+        elif start:
+            self.package, self.percent = start[1], None
+        elif end:
+            self.completed.add(end[1])
+            self.package, self.percent = 'next package', None
+        elif failed:
+            self.package, self.state = failed[2], 'failed'
+        elif percent and 0 <= int(percent[1]) <= 100:
+            self.percent = int(percent[1])
+        # The full stream stays in the build log. Compact repetitive Make and
+        # installation output here, while keeping diagnostics/start/end visible.
+        if not total and not percent and not text.startswith(
+                ('-- Installing:', '-- Up-to-date:', '-- Symlinking:')):
+            self.clear()
+            self.output.write(line.rstrip('\r\n') + '\n')
+            self.output.flush()
+        self.refresh(force=bool(total or start or end or failed))
+
+    def clear(self):
+        if self.interactive and self.line_width:
+            self.output.write('\r' + ' ' * self.line_width + '\r')
+            self.line_width = 0
+
+    def refresh(self, force=False):
+        now = self.clock()
+        # In redirected output use occasional whole lines instead of carriage
+        # returns. Normal PowerShell terminals get an in-place animated bar.
+        if not force and now - self.last_refresh < (0.5 if self.interactive else 10):
+            return
+        elapsed = max(0, int(now - self.started))
+        if self.percent is None:
+            position = elapsed % 16
+            bar = '-' * position + '>' + '-' * (15 - position)
+            value = 'wait'
+        else:
+            filled = self.percent * 16 // 100
+            bar = '#' * filled + '-' * (16 - filled)
+            value = f'{self.percent}%'
+        package = self.package if len(self.package) <= 22 else self.package[:19] + '...'
+        status = (f'{self.host} | {len(self.completed)}/{self.total if self.total is not None else "?"} pkgs '
+                  f'| {package} [{bar}] {value} | {elapsed // 60:02}:{elapsed % 60:02}')
+        if self.state != 'running':
+            status += ' ' + ('OK' if self.state == 'passed' else 'FAILED')
+        if self.interactive:
+            width = max(20, shutil.get_terminal_size((100, 20)).columns - 1)
+            status = status[:width]
+            self.output.write('\r' + status + ' ' * max(0, self.line_width - len(status)))
+            self.line_width = len(status)
+        else:
+            self.output.write(status + '\n')
+        self.output.flush()
+        self.last_refresh = now
+
+    def finish(self, success):
+        self.state = 'passed' if success else 'failed'
+        if success:
+            self.package, self.percent = 'complete', 100
+        self.refresh(force=True)
+        if self.interactive:
+            self.output.write('\n')
+            self.output.flush()
+            self.line_width = 0
+
+
+def stream_build(command, timeout, progress, log_path):
+    """Drain SSH output without blocking the progress heartbeat or timeout."""
+    events = queue.Queue()
+    tail = deque(maxlen=20)
+    deadline = time.monotonic() + timeout
+    with Path(log_path).open('w', encoding='utf-8') as log:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
+            def read_output():
+                try:
+                    for line in process.stdout:
+                        events.put(line)
+                except Exception as error:
+                    events.put(error)
+                finally:
+                    events.put(None)
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            try:
+                progress.refresh(force=True)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        line = events.get(timeout=min(0.5, remaining))
+                    except queue.Empty:
+                        progress.refresh()
+                        continue
+                    if line is None:
+                        break
+                    if isinstance(line, Exception):
+                        raise line
+                    log.write(line)
+                    log.flush()
+                    tail.append(line)
+                    progress.consume(line)
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                progress.finish(code == 0)
+                return code, ''.join(tail)
+            except BaseException:
+                process.kill()
+                process.wait()
+                progress.finish(False)
+                raise
+            finally:
+                reader.join(timeout=1)
+
+
 class Transport:
     def __init__(self, args):
         self.args = args
@@ -465,8 +604,13 @@ class Transport:
         auth = ['-i', a.key_file] if a.key_file else ['-pwfile', a.password_file]
         return ['-batch', '-hostkey', a.host_key, '-l', a.user] + auth
 
-    def ssh(self, host, command, timeout=300, stream=False):
+    def ssh(self, host, command, timeout=300, stream=False, progress=None, log_path=None):
         args = [self.args.plink, '-ssh', '-no-antispoof'] + self.authentication() + [host, command]
+        if progress is not None:
+            code, detail = stream_build(args, timeout, progress, log_path)
+            if code:
+                raise RuntimeError(f'{host}: SSH command failed ({code}): {detail.strip()}')
+            return ''
         result = subprocess.run(args, stdout=None if stream else subprocess.PIPE,
                                 stderr=None if stream else subprocess.PIPE,
                                 timeout=timeout)
@@ -501,14 +645,88 @@ def make_archive(root, changes, path):
                 tar.addfile(info, io.BytesIO(data))
 
 
+def prepare_symlink_build(root, run_id):
+    """Back up copied ROS message modules that block a symlink build.
+
+    Only touch the generated ament Python module directory, with a matching
+    rosidl_generator_py module. Source, install output and robot settings stay
+    outside this operation. Existing symlinks already have the desired type.
+    """
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', run_id or ''):
+        raise ValueError('Invalid backup ID')
+    root = Path(root).resolve()
+
+    def checked(name):
+        path = root / relative_path(name)
+        if not path.resolve().is_relative_to(root):
+            raise ValueError('Build preparation path escapes workspace: ' + name)
+        # Even links pointing inside the workspace could alias source/settings.
+        current = root
+        for part in path.relative_to(root).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError('Build preparation path contains a symlink: ' + name)
+        return path
+
+    build = checked('build')
+    backup_name = '.robot-sync-backups/' + run_id + '/build-conflicts'
+    changes = []
+    if build.is_dir():
+        for package in sorted(build.iterdir()):
+            if package.is_symlink() or not package.is_dir() or not re.fullmatch(r'[a-z][a-z0-9_]*', package.name):
+                continue
+            name = package.name
+            relative = f'build/{name}/ament_cmake_python/{name}/{name}'
+            copied = root / relative
+            if copied.is_symlink() or not copied.is_dir():
+                continue
+            checked(relative)
+            generated = checked(f'build/{name}/rosidl_generator_py/{name}')
+            if not (generated / '__init__.py').is_file():
+                continue
+            saved = checked(backup_name + '/' + relative)
+            if saved.exists():
+                raise ValueError('Build conflict backup already exists: ' + str(saved))
+            changes.append({'path': relative, 'backup': str(saved)})
+    if not changes:
+        return {'moved': 0, 'changes': []}
+    # Validate every candidate before moving any directory. Keep a separate
+    # artifact record; source rollback must not restore old build directories.
+    backup = checked(backup_name)
+    backup.mkdir(parents=True, exist_ok=True)
+    record = {'state': 'prepared', 'changes': changes}
+    write_json(backup / 'manifest.json', record)
+    moved = []
+    try:
+        for item in changes:
+            saved = Path(item['backup'])
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(root / item['path'], saved)
+            moved.append(item)
+    except Exception:
+        for item in reversed(moved):
+            os.replace(item['backup'], root / item['path'])
+        record['state'] = 'automatically_restored'
+        write_json(backup / 'manifest.json', record)
+        raise
+    record['state'] = 'backed_up'
+    write_json(backup / 'manifest.json', record)
+    return {'moved': len(changes), 'backup': str(backup), 'changes': changes}
+
+
 def build_command(remote_root):
     # Build without starting/stopping the Demo; cap parallelism on the Jetson.
-    body = ('set -e\ncd -- ' + shlex.quote(remote_root) + '\n'
+    selection = '--packages-up-to brain vision game_controller'
+    body = ('set -e -o pipefail\ncd -- ' + shlex.quote(remote_root) + '\n'
             'source /opt/ros/humble/setup.bash\n'
             'if [ -f install/setup.bash ]; then source install/setup.bash; fi\n'
             'export CMAKE_BUILD_PARALLEL_LEVEL=1\nexport MAKEFLAGS=-j1\n'
+            'export PYTHONUNBUFFERED=1\n'
+            'task_build_count=$(colcon list --names-only ' + selection + ' | wc -l)\n'
+            'printf "__K1_BUILD_TOTAL__=%s\\n" "$task_build_count"\n'
             'colcon build --symlink-install --executor sequential --parallel-workers 1 '
-            '--packages-up-to brain vision game_controller')
+            '--event-handlers console_direct+ console_start_end+ console_cohesion- console_stderr- '
+            + selection)
     return 'bash -lc ' + shlex.quote(body)
 
 
@@ -580,9 +798,22 @@ def run_local(args):
                     report['robots'][host].update({'state': 'synced', 'result': result})
                     print(f"{host}: synced {result['changed']} files; backup: {result['backup']}", flush=True)
             if args.build and not args.dry_run:
-                for host in hosts:
+                for host, base, _ in prepared:
+                    result = json.loads(transport.ssh(host, shlex.join(
+                        base + ['--operation', 'prepare-build', '--run-id', run_id])))
+                    report['robots'][host]['build_preparation'] = result
+                    if result['moved']:
+                        print(f"{host}: backed up {result['moved']} conflicting build directories; "
+                              f"backup: {result['backup']}", flush=True)
                     print('Building on ' + host + ' (single worker) ...', flush=True)
-                    transport.ssh(host, build_command(args.remote_root), timeout=7200, stream=True)
+                    log_path = report_dir / (host + '.build.log')
+                    report['robots'][host]['build_log'] = str(log_path)
+                    try:
+                        transport.ssh(host, build_command(args.remote_root), timeout=7200, stream=True,
+                                      progress=BuildProgress(host), log_path=log_path)
+                    except Exception:
+                        report['robots'][host]['build'] = 'failed'
+                        raise
                     report['robots'][host]['build'] = 'passed'
             for host, base, _ in prepared:
                 try:
@@ -619,6 +850,8 @@ def remote_agent(args):
         result = apply_plan(root, stage, args.run_id, args.archive_hash)
     elif args.operation in ('rollback', 'rollback-preview'):
         result = rollback(root, args.rollback, args.operation == 'rollback-preview')
+    elif args.operation == 'prepare-build':
+        result = prepare_symlink_build(root, args.run_id)
     elif args.operation == 'cleanup':
         # stage is an exact, resolved directory under /tmp created by this run.
         shutil.rmtree(stage)

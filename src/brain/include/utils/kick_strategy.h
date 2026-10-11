@@ -1,0 +1,143 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+
+#include "kick_geometry.h"
+
+namespace kick_strategy {
+
+struct AlignmentLimits {
+    double minRange = 0.05;
+    double maxRange = 1.4;
+    double bearing = 0.35;
+    double approachError = 0.25;
+    double bodyError = 0.25;
+};
+
+enum class BallSource { none, real, recentReal, predicted, memory };
+
+struct BallObservation {
+    bool detected = false;
+    bool known = false;
+    bool lost = false;
+    double ageMs = 0.0;
+    double x = 0.0, y = 0.0;
+    bool predictionReliable = false;
+    double predictedX = 0.0, predictedY = 0.0;
+};
+
+// 启动判断和 /kick_ball 发布共用此选择器。脚边漏检一两帧时沿用最近
+// 的真实球坐标；超过短暂宽限期后，不用近距离的旧记忆或预测继续踢。
+inline BallSource selectBallSource(const BallObservation &ball, double freshMs,
+                                   double holdMs, double nearRejectRange,
+                                   bool allowPredicted, bool allowMemory) {
+    if (ball.lost || !std::isfinite(ball.ageMs) || ball.ageMs < 0.0 ||
+        ball.ageMs > holdMs) return BallSource::none;
+    const double range = std::hypot(ball.x, ball.y);
+    const bool realValid = std::isfinite(range) && range > 0.05;
+    if (realValid && ball.ageMs <= freshMs) {
+        if (ball.detected) return BallSource::real;
+        if (allowMemory && ball.known) return BallSource::recentReal;
+    }
+    const double predictedRange = std::hypot(ball.predictedX, ball.predictedY);
+    const bool predictionValid = ball.predictionReliable &&
+        std::isfinite(predictedRange) && predictedRange > 0.05;
+    if ((realValid && range <= nearRejectRange) ||
+        (predictionValid && predictedRange <= nearRejectRange)) return BallSource::none;
+    if (allowPredicted && predictionValid) return BallSource::predicted;
+    if (allowMemory && ball.known && realValid) return BallSource::memory;
+    return BallSource::none;
+}
+
+inline bool isRecentReal(BallSource source) {
+    return source == BallSource::real || source == BallSource::recentReal;
+}
+
+// 同时检查机器人到球的路线和身体朝向，球在侧面时不能直接启动踢球。
+inline bool alignedForKick(double ballX, double ballY, double robotHeading,
+                           double kickDirection, const AlignmentLimits &limits) {
+    if (!std::isfinite(ballX) || !std::isfinite(ballY) ||
+        !std::isfinite(robotHeading) || !std::isfinite(kickDirection)) return false;
+    const double range = std::hypot(ballX, ballY);
+    const double bearing = std::atan2(ballY, ballX);
+    return ballX > 0.0 && range > limits.minRange && range <= limits.maxRange &&
+        std::abs(bearing) <= limits.bearing &&
+        kick_geometry::angleDistance(robotHeading + bearing, kickDirection) <= limits.approachError &&
+        kick_geometry::angleDistance(robotHeading, kickDirection) <= limits.bodyError;
+}
+
+// 减速时的小幅姿态变化不反复取消启动；明显偏转仍会退出重新调整。
+inline AlignmentLimits startupAlignmentLimits(AlignmentLimits limits) {
+    limits.bearing += 0.05;
+    limits.approachError += 0.05;
+    limits.bodyError += 0.05;
+    limits.maxRange += 0.1;
+    return limits;
+}
+
+inline bool inGoalieClearanceArea(double ballX, double ballY, double fieldLength,
+                                  double penaltyLength, double penaltyWidth,
+                                  double margin) {
+    if (!std::isfinite(ballX) || !std::isfinite(ballY)) return false;
+    const double goalLine = -fieldLength / 2.0;
+    return ballX >= goalLine - 0.15 &&
+        ballX <= std::min(0.0, goalLine + penaltyLength + margin) &&
+        std::abs(ballY) <= penaltyWidth / 2.0 + margin;
+}
+
+inline bool goalieCanClaim(double ballX, double ballY, double range,
+                            double fieldLength, double penaltyLength,
+                            double penaltyWidth, double margin, double maxRange) {
+    return std::isfinite(range) && range > 0.05 && range <= maxRange &&
+        inGoalieClearanceArea(ballX, ballY, fieldLength, penaltyLength, penaltyWidth, margin);
+}
+
+enum class ClearanceAction { defend, approach, align, kick };
+
+// 所有主动接近和踢球都要求共享控球权；冷却期间仍可调整，不必退回门线。
+inline ClearanceAction clearanceAction(bool authorized, double range,
+                                       double visualKickRange, bool aligned,
+                                       bool cooldownReady) {
+    if (!authorized || !std::isfinite(range) || range <= 0.05) return ClearanceAction::defend;
+    if (range > visualKickRange) return ClearanceAction::approach;
+    if (!aligned || !cooldownReady) return ClearanceAction::align;
+    return ClearanceAction::kick;
+}
+
+struct AdjustmentVelocity { double x = 0.0, y = 0.0; };
+
+inline double adjustmentHeadingError(double bearing, double approachError,
+                                      double bodyError, double turnThreshold) {
+    return std::abs(approachError) <= turnThreshold ? bodyError : bearing;
+}
+
+inline double effectiveAdjustmentSpeed(double speed, double minimum = 0.3) {
+    if (!std::isfinite(speed) || std::abs(speed) <= 1e-5) return 0.0;
+    return std::copysign(std::max(std::abs(speed), minimum), speed);
+}
+
+inline double adjustmentTurnVelocity(double bearing, double approachError,
+                                      double bodyError, double turnThreshold,
+                                      double factor, double noTurnThreshold) {
+    const double error = adjustmentHeadingError(bearing, approachError, bodyError, turnThreshold);
+    if (!std::isfinite(error) || std::abs(error) <= std::min(noTurnThreshold, 0.02)) return 0.0;
+    return effectiveAdjustmentSpeed(error * factor);
+}
+
+// 对准后停止横移；仍需调整时给步态可执行的最低速度，避免小指令被忽略。
+// 角度/距离死区抑制噪声，球太近时允许退到调整距离。
+inline AdjustmentVelocity adjustmentVelocity(double range, double bearing,
+                                              double directionError, double standOff,
+                                              double tangentialSpeed, double rampAngle) {
+    if (!std::isfinite(range) || range <= 0.05 || !std::isfinite(bearing) ||
+        !std::isfinite(directionError)) return {};
+    const double radial = std::abs(range - standOff) <= 0.04 ? 0.0 :
+        std::clamp(range - standOff, -0.3, 0.5);
+    const double tangent = std::abs(directionError) <= 0.02 ? 0.0 :
+        -tangentialSpeed * std::clamp(directionError / std::max(0.05, rampAngle), -1.0, 1.0);
+    return {effectiveAdjustmentSpeed(radial * std::cos(bearing) - tangent * std::sin(bearing)),
+            effectiveAdjustmentSpeed(radial * std::sin(bearing) + tangent * std::cos(bearing))};
+}
+
+} // namespace kick_strategy

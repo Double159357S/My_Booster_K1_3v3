@@ -44,6 +44,7 @@
 #include "locator.h"
 #include "robot_client.h"
 #include "ball_state_estimator.h"
+#include "utils/kick_strategy.h"
 
 
 using namespace std;
@@ -157,6 +158,8 @@ public:
 
     // [临时内部使用] 发布球的位置, 以及踢球方向消息, 用于测试运控的新 kick 动作
     void pubKickMsg();
+    // 同一球源同时用于视觉踢球启动、续踢和信息发布。
+    kick_strategy::BallSource getKickBallSource();
 
     // 用于动态调整 vision 的校准参数
     void pubCalParamMsg(double pitch, double yaw, double z);

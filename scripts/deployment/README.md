@@ -45,6 +45,16 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 
 同步后自动编译加 `-Build`，使用单并发构建 `brain`、`vision`、`game_controller` 及其依赖。使用此选项前先停止 Demo。脚本不启动或停止机器人程序；更新完成后自行重启 Demo。
 
+编译时自动显示进度条、已完成包数、当前包的 CMake 编译百分比和总耗时，例如：
+
+```text
+192.168.133.43 | 4/7 pkgs | brain [###########-----] 72% | 02:15
+```
+
+`4/7` 表示已有 4 个包完成，不代表总耗时完成了 4/7。没有编译百分比时显示 `wait` 动画；长时间编译单个文件时百分比可能不变，耗时仍会刷新。全部成功后显示 `OK`，失败时显示 `FAILED`。完整编译日志保存在本地 `.robot-sync/<运行编号>/<机器人IP>.build.log`，报告中也会记录其路径。重定向输出时改为间隔输出进度行。
+
+如果旧构建的普通目录阻碍创建符号链接（报错 `existing path cannot be removed: Is a directory`），脚本会先把对应的 ROS 消息生成目录备份到 `.robot-sync-backups/<运行编号>/build-conflicts`，再编译。无需手动删除整个 `build` 或 `install`。
+
 已明确目标时可以省略地址询问：
 
 ```powershell
@@ -59,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1" -IpPrefix 1
 
 ## 验证
 
-本地有 21 项测试，包含地址输入检查以及实际驱动与远端助手的完整预览、复制、配置保留、重复同步和回滚流程；测试使用临时目录模拟机器人，不通过 SSH 连接设备。在带有 PyYAML 的 Linux/WSL 中执行：
+测试包含地址输入检查、预览、复制、配置保留、重复同步、回滚、构建冲突处理，以及编译进度、静默刷新、失败和超时；使用临时目录模拟机器人，不通过 SSH 连接设备。安装了 colcon/CMake/C++ 时，还会实际编译 4 个极小的示例包来验证进度输出。在带有 PyYAML 的 Linux/WSL 中执行：
 
 ```bash
 python3 scripts/deployment/test_robot_sync.py
