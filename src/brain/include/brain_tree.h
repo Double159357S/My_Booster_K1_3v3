@@ -100,7 +100,7 @@ private:
     Brain *brain;
 };
 
-// 守门员先 clear_approach / clear_align，再 block_kick / intercept_kick；无控球权时防守。
+// 守门员接近、调整后清球；冷却或队友挡路时 clear_wait 保持已对准的姿态。
 class Analyze2 : public SyncActionNode
 {
 public:
@@ -111,6 +111,7 @@ public:
 private:
     Brain *brain;
     bool _interceptKickDisabled = false;
+    double _lastConsoleMs = 0.0;
     bool _interceptKickCloseStartValid = false;
     rclcpp::Time _interceptKickCloseStartTime;
 };
@@ -365,7 +366,7 @@ private:
     rclcpp::Time _sessionStartTime;
     rclcpp::Time _lastProgressTime;
     rclcpp::Time _headScanStartTime;
-    // VisualKick 接管头部后持续保持低头，避免 CamFindAndTrackBall 在后续帧抬头。
+    // 前锋 VisualKick 接管头部；守门员持续由 CamTrackBall 跟踪近球。
     rclcpp::Time _lastHeadCommandTime;
     bool _headCommandSent = false;
 

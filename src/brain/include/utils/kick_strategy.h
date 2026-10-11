@@ -76,6 +76,13 @@ inline AlignmentLimits startupAlignmentLimits(AlignmentLimits limits) {
     return limits;
 }
 
+// 启动条件只管进入 SDK。SDK 执行后的调整、转身和短暂漏检由其退出逻辑
+// 处理，避免行为树每帧重新套用启动门槛而中断踢球。
+inline bool keepVisualKickSession(bool active, bool previousDecisionIsKick,
+                                   bool authorized, bool ballOut) {
+    return active && previousDecisionIsKick && authorized && !ballOut;
+}
+
 inline bool inGoalieClearanceArea(double ballX, double ballY, double fieldLength,
                                   double penaltyLength, double penaltyWidth,
                                   double margin) {
@@ -93,7 +100,7 @@ inline bool goalieCanClaim(double ballX, double ballY, double range,
         inGoalieClearanceArea(ballX, ballY, fieldLength, penaltyLength, penaltyWidth, margin);
 }
 
-enum class ClearanceAction { defend, approach, align, kick };
+enum class ClearanceAction { defend, approach, align, wait, kick };
 
 // 所有主动接近和踢球都要求共享控球权；冷却期间仍可调整，不必退回门线。
 inline ClearanceAction clearanceAction(bool authorized, double range,
@@ -102,7 +109,8 @@ inline ClearanceAction clearanceAction(bool authorized, double range,
     if (!authorized || !std::isfinite(range) || range <= 0.05) return ClearanceAction::defend;
     if (!localSourceUsable) return ClearanceAction::approach;
     if (range > visualKickRange) return ClearanceAction::approach;
-    if (!aligned || !cooldownReady) return ClearanceAction::align;
+    if (!aligned) return ClearanceAction::align;
+    if (!cooldownReady) return ClearanceAction::wait;
     return ClearanceAction::kick;
 }
 
@@ -130,12 +138,13 @@ inline double adjustmentTurnVelocity(double bearing, double approachError,
 // 角度/距离死区抑制噪声，球太近时允许退到调整距离。
 inline AdjustmentVelocity adjustmentVelocity(double range, double bearing,
                                               double directionError, double standOff,
-                                              double tangentialSpeed, double rampAngle) {
+                                              double tangentialSpeed, double rampAngle,
+                                              double directionTolerance = 0.02) {
     if (!std::isfinite(range) || range <= 0.05 || !std::isfinite(bearing) ||
         !std::isfinite(directionError)) return {};
     const double radial = std::abs(range - standOff) <= 0.04 ? 0.0 :
         std::clamp(range - standOff, -0.3, 0.5);
-    const double tangent = std::abs(directionError) <= 0.02 ? 0.0 :
+    const double tangent = std::abs(directionError) <= directionTolerance ? 0.0 :
         -tangentialSpeed * std::clamp(directionError / std::max(0.05, rampAngle), -1.0, 1.0);
     return {effectiveAdjustmentSpeed(radial * std::cos(bearing) - tangent * std::sin(bearing)),
             effectiveAdjustmentSpeed(radial * std::sin(bearing) + tangent * std::cos(bearing))};

@@ -31,9 +31,9 @@ brain_node:
       ball_memory_timeout: 3.0 
       ball_lost_msecs: 1000.0
       tm_ball_dist_threshold: 1.5  
-      limit_near_ball_speed: true #靠近球时减速（普通追球时，距离球 小于 2 米，将前进速度指令上限限制为 0.6 m/s，减少冲过球或撞到附近队友。）
+      limit_near_ball_speed: true # 近球按 near_ball_range 限速，避免冲过球；远球保持追近速度
       near_ball_speed_limit: 0.6 
-      near_ball_range: 2.0 
+      near_ball_range: 1.0 # 只在近球处限速；远距离接近恢复原 Demo 的速度
       soft_kickoff: true          # 所有开球(比赛开球/任意球/角球/门球)均用软速度，降低出界/失误风险
       soft_kickoff_speed: 0.3
       kick_range: 1.0 
@@ -48,6 +48,7 @@ brain_node:
       enable_shoot: false 
       enable_directional_kick: false 
       goalie_visual_kick_cooldown_ms: 600.0
+      goalie_visual_kick_startup_decelerate_ms: 80.0 # 本机确认并对准后，短暂站稳即可接管清球
       goalie_clearance_max_ball_range: 2.2 # 门前球在此距离内可申请控球并主动接近(m)
       goalie_clearance_area_margin: 0.3 # 清球范围为己方禁区，向前和两侧增加此余量(m)
       goalie_visual_kick_max_ball_range: 1.2 # 更远先普通追球，靠近后再启动视觉踢球

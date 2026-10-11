@@ -29,6 +29,7 @@
                   <Adjust _while="goalie_mode == 'clear_align'" range="0.4"
                      vx_limit="0.5" vy_limit="0.4" vtheta_limit="1.5"
                      tangential_speed_near="0.22" turn_threshold="0.3" />
+                  <SetVelocity _while="goalie_mode == 'clear_wait'" />
                   <ReactiveSequence _while="goalie_mode == 'block_kick' || goalie_mode == 'intercept_kick'">
                      <RLVisionKick min_msec_kick="1500" max_msec_kick="7000" range="3.5" />
                   </ReactiveSequence>

@@ -6,6 +6,7 @@
 #include "team_communication_msg.h"
 #include "utils/team_ball.h"
 #include "utils/kick_strategy.h"
+#include "utils/goalie_strategy.h"
 
 using namespace team_cooperation;
 
@@ -290,6 +291,57 @@ void sharedBallTests() {
     // Network::run 每帧还检查同时主控和仍在退出动作的机器人总数 <= 1。
 }
 
+void goalieRoleTests() {
+    using goalie_strategy::Candidate;
+    const auto protectedRole = [](bool goalie, bool known, bool kicking,
+                                  double x, double range) {
+        return goalie_strategy::protectClearanceRole(
+            goalie, known, kicking, x, 0.0, range, 9.0, 2.0, 5.0, 0.3, 2.2);
+    };
+    // Reproduce a closer striker arriving during a goalkeeper SDK startup.
+    // The old selection excluded every kicking player on the following tick,
+    // switching the keeper to striker and halting the running behavior tree.
+    for (int tick = 0; tick < 200; ++tick) {
+        const bool kicking = tick >= 8;
+        const std::vector<Candidate> team = {
+            {1, 1.0, kicking, protectedRole(true, true, kicking, -3.5, 0.4)},
+            {2, 0.3, false, false}, {3, 2.0, true, false},
+        };
+        check(goalie_strategy::select(team, 0.15) == 1,
+              "goalkeeper role changed during clearance or SDK startup");
+    }
+    check(protectedRole(true, false, true, -3.5, 0.4),
+          "brief detection loss changed goalkeeper during SDK exit");
+    check(!protectedRole(false, true, true, -3.5, 0.4),
+          "kicking striker was promoted to protected goalkeeper");
+    check(!protectedRole(true, false, false, -3.5, 0.4),
+          "unknown ball locked goalkeeper assignment indefinitely");
+    check(!protectedRole(true, true, false, -3.5, 2.3),
+          "distant ball prevented normal goalie election");
+    check(!protectedRole(true, true, true, -1.8, 0.4),
+          "attacking outside penalty area blocked goalkeeper handoff");
+    check(goalie_strategy::select({{1, 0.5, true, false}, {2, 1.0, false, false}}, 0.15) == 2,
+          "attacking player prevented another robot from covering goal");
+    check(goalie_strategy::select({{3, 0.6, false, false}, {2, 0.5, false, false}}, 0.15) == 2,
+          "normal goalkeeper tie did not choose deterministic player");
+    // Adjacent pairs are within the tie margin but endpoints are not.
+    // Each robot used to consider self first, producing different results.
+    const std::vector<Candidate> overlappingTies = {
+        {1, 0.30, false, false}, {2, 0.16, false, false}, {3, 0.05, false, false},
+    };
+    std::vector<int> order{0, 1, 2};
+    do {
+        const std::vector<Candidate> reordered = {
+            overlappingTies[order[0]], overlappingTies[order[1]], overlappingTies[order[2]],
+        };
+        check(goalie_strategy::select(reordered, 0.15) == 2,
+              "goalkeeper selection depends on self-first candidate order");
+    } while (std::next_permutation(order.begin(), order.end()));
+    check(goalie_strategy::select({{1, std::numeric_limits<double>::quiet_NaN(), false, true}}, 0.15) == 0,
+          "invalid goalkeeper pose was accepted");
+    check(goalie_strategy::select({}, 0.15) == 0, "empty goalkeeper list selected a player");
+}
+
 void geometryTests() {
     near(segmentDistance({-1, 0}, {1, 0}, {0, -1}, {0, 1}), 0, "crossing routes missed");
     near(segmentDistance({0, 0}, {1, 0}, {2, 0}, {3, 0}), 1, "collinear gap wrong");
@@ -336,8 +388,9 @@ int main() {
         arbitrationTests();
         packetTests();
         sharedBallTests();
+        goalieRoleTests();
         geometryTests();
-        std::cout << "Team cooperation: arbitration, shared ball, packet decoding and geometry passed\n";
+        std::cout << "Team cooperation: arbitration, shared ball, goalie roles, packet decoding and geometry passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

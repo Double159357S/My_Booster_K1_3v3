@@ -12,6 +12,7 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 2. IP 段，只填前三段，例如 `192.168.133`；填错会立即提示重新输入。
 3. 机器人尾号，例如 `.43`；多台可输入 `.43,.21`，也支持 `43 21`。
 4. SSH 密码，本次运行只输入一次，适用于所选机器使用相同密码的情况。
+5. 同步成功后选择后续操作：`1` 仅同步（直接回车也是此项）、`2` 编译、`3` 编译并启动 Demo。预览和回滚不询问此项。
 
 **没有默认机器人，也不会扫描或自动选择其他 IP。** 空尾号会退出。
 
@@ -43,15 +44,36 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 
 已明确本地路径时，可用 `-LocalRoot "D:\Projects\My_Booster_K1_3v3"` 跳过路径询问。
 
-同步后自动编译加 `-Build`，使用单并发构建 `brain`、`vision`、`game_controller` 及其依赖。使用此选项前先停止 Demo。脚本不启动或停止机器人程序；更新完成后自行重启 Demo。
-
-编译时自动显示进度条、已完成包数、当前包的 CMake 编译百分比和总耗时，例如：
+默认只同步代码。同步成功后，菜单如下：
 
 ```text
-192.168.133.43 | 4/7 pkgs | brain [###########-----] 72% | 02:15
+同步完成。请选择后续操作：1 仅同步（默认）；2 编译；3 编译并启动 Demo:
 ```
 
-`4/7` 表示已有 4 个包完成，不代表总耗时完成了 4/7。没有编译百分比时显示 `wait` 动画；长时间编译单个文件时百分比可能不变，耗时仍会刷新。全部成功后显示 `OK`，失败时显示 `FAILED`。完整编译日志保存在本地 `.robot-sync/<运行编号>/<机器人IP>.build.log`，报告中也会记录其路径。重定向输出时改为间隔输出进度行。
+- `1`：结束同步，显示手动编译、加载环境和启动命令。
+- `2`：所选机器人同时编译，每台通过 `./scripts/build.sh` 并行构建工程中的全部包；结束后由你启动。
+- `3`：先同时编译所有目标；全部成功后，在各台同一个 SSH shell 内执行 `source install/setup.bash` 和 `./scripts/start.sh`。任何一台编译失败都不会进入启动步骤。
+
+编译前请在机器人上退出 AI、停止 Demo。选择 `3` 会执行现有 `start.sh` 中的停止旧节点和启动流程。启动命令完成不等于已经确认视觉、通信和比赛状态正常。
+
+也可以用 `-Build` 直接选择编译，或 `-Start` 直接选择编译并启动，跳过操作菜单。每台按 `nproc` 设置并发；有依赖关系的包会等依赖完成，独立包并行构建。
+
+选择仅同步后，你在机器人终端手动执行：
+
+```bash
+cd ~/Workspace/K1_5v5_demo_1.7
+./scripts/build.sh && source install/setup.bash && ./scripts/start.sh
+```
+
+编译失败会保留失败退出码，后面的加载环境和启动不会执行。使用 `-RemoteRoot` 时，脚本显示的是对应目录的命令。
+
+编译时显示完成包数、进度条、正在编译的包和总耗时，例如：
+
+```text
+192.168.133.43 | 4/7 pkgs | brain,vision [#########-------] packages | 02:15
+```
+
+`4/7` 表示已有 4 个包完成，进度条按包数计算，不代表耗时完成了 4/7。并行输出中的 CMake 百分比无法准确归属某个包，因此不显示混杂的单包百分比。全部成功后显示 `OK`，失败时显示 `FAILED`。完整日志保存在 `.robot-sync/<运行编号>/<机器人IP>.build.log`，每台分别记录。多台同时编译时使用带 IP 的进度行，避免进度条互相覆盖。
 
 如果旧构建的普通目录阻碍创建符号链接（报错 `existing path cannot be removed: Is a directory`），脚本会先把对应的 ROS 消息生成目录备份到 `.robot-sync-backups/<运行编号>/build-conflicts`，再编译。无需手动删除整个 `build` 或 `install`。
 
@@ -69,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1" -IpPrefix 1
 
 ## 验证
 
-测试包含地址输入检查、预览、复制、配置保留、重复同步、回滚、构建冲突处理，以及编译进度、静默刷新、失败和超时；使用临时目录模拟机器人，不通过 SSH 连接设备。安装了 colcon/CMake/C++ 时，还会实际编译 4 个极小的示例包来验证进度输出。在带有 PyYAML 的 Linux/WSL 中执行：
+测试包含地址输入、同步、配置保留、回滚、并行进度、多台同时构建、菜单默认仅同步、编译失败阻止启动及环境加载顺序。使用临时目录和模拟命令，不通过 SSH 连接设备，默认不执行编译。在带有 PyYAML 的 Linux/WSL 中执行：
 
 ```bash
 python3 scripts/deployment/test_robot_sync.py

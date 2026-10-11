@@ -25,12 +25,14 @@ constexpr double kVisionKickHeadScanPitch = 0.4;
 constexpr double kVisionKickHeadDownPitch = 0.7;
 constexpr double kVisionKickHeadCommandIntervalMs = 100.0;
 
-double visualKickDecelerateMs(Brain *brain, bool startup)
+double visualKickDecelerateMs(Brain *brain, bool startup, bool goalieKick = false)
 {
-    double value = startup ? 160.0 : 140.0;
-    brain->get_parameter(startup
-        ? "strategy.auto_visual_kick.startup_decelerate_ms"
-        : "strategy.auto_visual_kick.exit_decelerate_ms", value);
+    double value = startup ? (goalieKick ? 80.0 : 160.0) : 140.0;
+    const string parameter = startup
+        ? (goalieKick ? "strategy.goalie_visual_kick_startup_decelerate_ms"
+                     : "strategy.auto_visual_kick.startup_decelerate_ms")
+        : "strategy.auto_visual_kick.exit_decelerate_ms";
+    brain->get_parameter(parameter, value);
     return std::clamp(value, 20.0, startup ? 500.0 : 700.0);
 }
 
@@ -301,6 +303,9 @@ NodeStatus StepOnSpot::tick()
 
 NodeStatus CamTrackBall::tick()
 {
+    // 前锋 SDK 会话自行控制头部；守门员继续凝视已确认的球，不重新扫头。
+    if (brain->data->tmImInVisualKick &&
+        !brain->tree->getEntry<bool>("goalie_block_kick_active")) return NodeStatus::SUCCESS;
     double pitch, yaw, ballX, ballY, deltaX, deltaY;
     const double pixToleranceX = brain->config->camPixX * 3 / 10.; // 球距离视野中心的像素差小于这个容差, 则认为在视野中心了.
     const double pixToleranceY = brain->config->camPixY * 3 / 10.;
@@ -434,6 +439,8 @@ CamFindBall::CamFindBall(const string &name, const NodeConfig &config, Brain *_b
 
 NodeStatus CamFindBall::tick()
 {
+    // 踢球时短暂漏检不能触发大范围扫头，否则会把脚边球移出视野。
+    if (brain->data->tmImInVisualKick) return NodeStatus::SUCCESS;
     if (brain->data->ballDetected)
     {
         return NodeStatus::SUCCESS;
@@ -1423,12 +1430,20 @@ NodeStatus Adjust::tick()
         st = stNear;
     }
 
+    double directionTolerance = 0.02;
+    brain->get_parameter(brain->tree->getEntry<string>("player_role") == "goal_keeper"
+        ? "strategy.goalie_visual_kick_max_direction_error"
+        : "strategy.auto_visual_kick_max_direction_error", directionTolerance);
+    directionTolerance = std::clamp(directionTolerance, 0.02, 0.6);
+    // 路线进入允许误差后，停止绕球，只完成身体转向。继续横移会把已经
+    // 对准的路线再次推偏，尤其是守门员门前清球时。
     const auto adjustment = kick_strategy::adjustmentVelocity(
-        ballRange, ballYaw, deltaDir, range, st, turnThreshold);
+        ballRange, ballYaw, deltaDir, range, st, turnThreshold, directionTolerance);
     vx = adjustment.x;
     vy = adjustment.y;
     vtheta = kick_strategy::adjustmentTurnVelocity(ballYaw, deltaDir,
-        toPInPI(kickDir - brain->data->robotPoseToField.theta), turnThreshold,
+        toPInPI(kickDir - brain->data->robotPoseToField.theta),
+        std::max(turnThreshold, directionTolerance),
         vthetaFactor, noTurnThreshold);
     if (fabs(ballYaw) > turnFirstThreshold && fabs(deltaDir) < M_PI / 4) {
         vx = 0;
@@ -1551,6 +1566,15 @@ NodeStatus StrikerDecide::tick() {
     string lastDecision, position;
     getInput("decision_in", lastDecision);
     getInput("position", position);
+
+    if (kick_strategy::keepVisualKickSession(brain->data->tmImInVisualKick,
+            lastDecision == "auto_visual_kick", brain->data->tmImLead,
+            brain->tree->getEntry<bool>("ball_out"))) {
+        // RLVisionKick 自己检查失球、无进展、队友距离和最长执行时间。
+        // 不把它的脚位调整误当成新的启动对准失败。
+        setOutput("decision_out", string("auto_visual_kick"));
+        return NodeStatus::SUCCESS;
+    }
 
     bool enableAutoVisualKick = false;
     brain->get_parameter("strategy.enable_auto_visual_kick", enableAutoVisualKick);
@@ -1920,6 +1944,11 @@ NodeStatus Analyze2::tick()
     maxDirectionError = std::clamp(maxDirectionError, 0.2, M_PI);
     const bool cooldownOk = RLVisionKick::getLastExitTime().nanoseconds() == 0 ||
         brain->msecsSince(RLVisionKick::getLastExitTime()) >= cooldownMs;
+    const double cooldownRemaining = RLVisionKick::getLastExitTime().nanoseconds() == 0
+        ? 0.0 : std::max(0.0, cooldownMs - brain->msecsSince(RLVisionKick::getLastExitTime()));
+    const double teammateDistance = brain->teammateDistance();
+    const double teammateStopDistance = std::clamp(brain->get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
 
     const double desiredClearanceDir = kick_geometry::directionToOpponentGoal(
         source.field.x, source.field.y, brain->config->fieldDimensions.length / 2.0);
@@ -1976,6 +2005,8 @@ NodeStatus Analyze2::tick()
     } else if (!clearanceReady) {
         nextMode = brain->data->ballDetected ? "guard_defend" : "guard_idle";
         _interceptKickDisabled = false;
+    } else if (!sessionActive && teammateDistance < teammateStopDistance) {
+        nextMode = "clear_wait"; // 等队友让开，不能一边等待一边继续绕球
     } else if (currentMode == "intercept_kick" && sessionActive && !_interceptKickDisabled) {
         nextMode = "intercept_kick";
     } else if (!_interceptKickDisabled && target.interceptEntryReady && cooldownOk) {
@@ -1987,6 +2018,7 @@ NodeStatus Analyze2::tick()
             maxRange, clearanceDirectionReady, cooldownOk, !source.shared);
         if (action == kick_strategy::ClearanceAction::approach) nextMode = "clear_approach";
         else if (action == kick_strategy::ClearanceAction::align) nextMode = "clear_align";
+        else if (action == kick_strategy::ClearanceAction::wait) nextMode = "clear_wait";
         else if (action == kick_strategy::ClearanceAction::kick) nextMode = "block_kick";
         else nextMode = "guard_defend";
     }
@@ -2002,11 +2034,18 @@ NodeStatus Analyze2::tick()
         brain->data->goalieVisualKickSubState = "none";
         brain->data->goalieVisualKickTargetValid = false;
     }
-    if (nextMode != currentMode) {
+    const double consoleMs = team_cooperation::steadyNowMs();
+    if (nextMode != currentMode || consoleMs - _lastConsoleMs >= 1000.0) {
         std::cout << "[Goalie] " << currentMode << " -> " << nextMode
                   << " range=" << source.range
                   << " direction_error=" << clearanceDirectionError
-                  << " lead=" << brain->data->tmImLead << std::endl;
+                  << " lead=" << brain->data->tmImLead
+                  << " source=" << (source.shared ? "shared" : source.real ? "local" :
+                                        source.predicted ? "predicted" : "none")
+                  << " cooldown_ms=" << cooldownRemaining
+                  << " teammate_distance=" << teammateDistance
+                  << " active=" << active << std::endl;
+        _lastConsoleMs = consoleMs;
     }
     brain->tree->setEntry<string>("goalie_mode", nextMode);
     return NodeStatus::SUCCESS;
@@ -2272,6 +2311,10 @@ NodeStatus RLVisionKick::onStart()
     if (!brain->data->tmImLead || brain->teammateDistance() < clearance ||
         !visualKickBallUsable(brain, goalieKick) ||
         (!goalieKick && !strikerVisualKickAligned(brain))) {
+        RCLCPP_INFO_THROTTLE(brain->get_logger(), *brain->get_clock(), 1000,
+            "[RLVisionKick] start deferred: lead=%d teammate_distance=%.2f ball_usable=%d goalie=%d",
+            brain->data->tmImLead, brain->teammateDistance(),
+            visualKickBallUsable(brain, goalieKick), goalieKick);
         brain->data->tmImInVisualKick = false;
         brain->tree->setEntry<bool>("goalie_block_kick_active", false);
         brain->data->goalieVisualKickSubState = "none";
@@ -2284,7 +2327,7 @@ NodeStatus RLVisionKick::onStart()
     brain->tree->setEntry<bool>("goalie_block_kick_active",
         goalieKick);
 
-    startDecelerate(visualKickDecelerateMs(brain, true));
+    startDecelerate(visualKickDecelerateMs(brain, true, goalieKick));
     stepDecelerate();
 
     return NodeStatus::RUNNING;
@@ -2361,6 +2404,9 @@ NodeStatus RLVisionKick::onRunning()
                     return NodeStatus::SUCCESS;
                 }
                 brain->client->RLVisionKick(true);
+                std::cout << "[RLVisionKick] started goalie=" << goalieKick
+                          << " startup_ms=" << _decelDurationMs
+                          << " ball_range=" << brain->data->ball.range << std::endl;
                 _headScanStartTime = brain->get_clock()->now();
                 _visionKickStarted = true;
             }
@@ -2368,10 +2414,10 @@ NodeStatus RLVisionKick::onRunning()
         return NodeStatus::RUNNING;
     }
 
-    if (_visionKickStarted) {
+    if (_visionKickStarted && !goalieKick) {
         double headMsec = brain->msecsSince(_headScanStartTime);
-        // 先沿用 robocup_blue 的两段找球动作，再持续低头。CamFindAndTrackBall
-        // 每帧都会先发头部命令，因此这里必须在 VisualKick 的整个会话中保持接管。
+        // 前锋沿用 SDK 的两段头部动作。守门员由上游 CamTrackBall 持续跟球，
+        // 已确认的近球不再经历 300ms 抬头扫描及强制 yaw=0 导致的漏检。
         const double targetPitch = headMsec < 300.0
             ? kVisionKickHeadScanPitch
             : kVisionKickHeadDownPitch;
@@ -2532,7 +2578,8 @@ bool RLVisionKick::isMinIntervalSatisfied(double minIntervalMsec)
 
 void RLVisionKick::recordExitTime()
 {
-    _lastExitTime = brain->get_clock()->now();
+    // 启动被取消时 SDK 还没执行；此时不应再强制等待一整轮清球冷却。
+    if (_visionKickStarted) _lastExitTime = brain->get_clock()->now();
 }
 
 void RLVisionKick::startDecelerate(double durationMs)

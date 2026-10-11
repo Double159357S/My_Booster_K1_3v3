@@ -43,6 +43,17 @@ int main() {
     ok &= check("large settling change cancels SDK start",
         !alignedForKick(0.4, 0.0, 0.6, 0.0, starting));
 
+    ok &= check("active SDK keeps its slot during foot alignment and missed frames",
+        keepVisualKickSession(true, true, true, false));
+    ok &= check("new kicks must still pass entry checks",
+        !keepVisualKickSession(false, true, true, false));
+    ok &= check("revoked ownership interrupts the SDK",
+        !keepVisualKickSession(true, true, false, false));
+    ok &= check("ball out interrupts the SDK",
+        !keepVisualKickSession(true, true, true, true));
+    ok &= check("finished SDK does not revive an unrelated decision",
+        !keepVisualKickSession(true, false, true, false));
+
     BallObservation observation;
     observation.known = true;
     observation.detected = true;
@@ -106,8 +117,12 @@ int main() {
         clearanceAction(true, 1.8, 1.2, true, true) == ClearanceAction::approach);
     ok &= check("close misaligned ball means align",
         clearanceAction(true, 0.9, 1.2, false, true) == ClearanceAction::align);
-    ok &= check("cooldown allows adjustment instead of retreat",
-        clearanceAction(true, 0.9, 1.2, true, false) == ClearanceAction::align);
+    ok &= check("aligned keeper waits without retreating or orbiting during cooldown",
+        clearanceAction(true, 0.9, 1.2, true, false) == ClearanceAction::wait);
+    ok &= check("misaligned keeper can still adjust during cooldown",
+        clearanceAction(true, 0.9, 1.2, false, false) == ClearanceAction::align);
+    ok &= check("shared ball still requires local confirmation before cooldown or kick",
+        clearanceAction(true, 0.4, 1.2, true, true, false) == ClearanceAction::approach);
     ok &= check("aligned clearance starts kick",
         clearanceAction(true, 0.9, 1.2, true, true) == ClearanceAction::kick);
     ok &= check("placeholder ball cannot start kick",
@@ -133,6 +148,12 @@ int main() {
         adjustmentHeadingError(0.0, 0.0, -0.08, 0.5), -0.08));
     ok &= check("large orbit error keeps ball in view", near(
         adjustmentHeadingError(0.4, 1.2, -1.0, 0.5), 0.4));
+    const auto bodyOnly = adjustmentVelocity(0.4, 0.0, 0.14, 0.4, 0.15, 0.5, 0.25);
+    ok &= check("accepted approach line stays fixed while body turns", near(bodyOnly.y, 0.0));
+    const auto keeperBodyOnly = adjustmentVelocity(0.4, 0.0, 0.4, 0.4, 0.22, 0.3, 0.55);
+    ok &= check("keeper does not keep orbiting an accepted clearance line", near(keeperBodyOnly.y, 0.0));
+    const auto outsideLine = adjustmentVelocity(0.4, 0.0, 0.7, 0.4, 0.22, 0.3, 0.55);
+    ok &= check("keeper still orbits a genuinely wrong approach line", outsideLine.y < 0.0);
 
     // A simple planar trajectory must settle on the shot line, rather than
     // orbit forever with a constant lateral speed after alignment.

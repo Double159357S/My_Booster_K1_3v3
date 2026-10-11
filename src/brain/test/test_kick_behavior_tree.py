@@ -41,10 +41,13 @@ class MatchMotionRouting(unittest.TestCase):
                 self.assertEqual(selected_actions(tree, "decision", decision, set(expected.values())), [action])
 
     def test_goalie_modes_have_one_action(self):
-        tree = ET.parse(TREES / "subtree_goal_keeper_play.xml").getroot()
+        root = ET.parse(TREES / "subtree_goal_keeper_play.xml").getroot()
+        tree = root.find(".//ReactiveSequence[@_while='!ball_out']")
+        self.assertIsNotNone(tree)
         expected = {
             "clear_approach": "Chase", "clear_align": "Adjust", "block_kick": "RLVisionKick",
             "intercept_kick": "RLVisionKick", "guard_idle": "GoalieIdleHome", "guard_defend": "Intercept2",
+            "clear_wait": "SetVelocity",
         }
         for mode, action in expected.items():
             with self.subTest(mode=mode):

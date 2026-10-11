@@ -1,7 +1,8 @@
 ﻿#requires -Version 5.1
 <#
 Ask for the local project, IP prefix and robot suffixes, then sync sources.
-Use -DryRun to preview or -Build to compile after syncing.
+After syncing, choose sync only, parallel build, or build/load/start.
+Use -DryRun to preview, -Build to build, or -Start to build and start.
 #>
 [CmdletBinding()]
 param(
@@ -16,7 +17,8 @@ param(
     [string]$KeyFile,
     [string]$RollbackBackup,
     [switch]$DryRun,
-    [switch]$Build
+    [switch]$Build,
+    [switch]$Start
 )
 $ErrorActionPreference = 'Stop'
 $taskTemporaryDirectory = $null
@@ -94,6 +96,8 @@ try {
     )
     if ($DryRun) { $arguments += '--dry-run' }
     if ($Build) { $arguments += '--build' }
+    if ($Start) { $arguments += '--start' }
+    if (-not ($DryRun -or $RollbackBackup -or $Build -or $Start)) { $arguments += '--choose-action' }
     if ($RollbackBackup) { $arguments += @('--rollback', $RollbackBackup) }
 
     if ($KeyFile) {

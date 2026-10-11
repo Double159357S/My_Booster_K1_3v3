@@ -40,9 +40,9 @@ brain_node:
       ball_memory_timeout: 3.0 # 球记忆失效时间，超过这个时间，认为球丢了
       ball_lost_msecs: 1000.0 # 球丢失判定时间，毫秒
       tm_ball_dist_threshold: 1.5 # 队友发送的球的位置与我当前位置的距离，如果大于此值，则认为队友的信息准确.
-      limit_near_ball_speed: false # 是否限制在 chase 时靠近球时的速度
+      limit_near_ball_speed: true # 近球减速，远球按行为树速度上限追近
       near_ball_speed_limit: 0.6 # 靠近球时的速度限制
-      near_ball_range: 2.0 # 靠近球时的范围，在这个范围内，限制速度
+      near_ball_range: 1.0 # 只在近球处限速；远距离接近恢复原 Demo 的速度
       soft_kickoff: true # 比赛开球及角球、门球等重启使用软速度
       soft_kickoff_speed: 0.3 # 软开球速度参数，沿用当前值
       kick_range: 1.0 # 仅在这个 range 之内才会执行 kick 或 disrupt
@@ -57,6 +57,7 @@ brain_node:
       enable_shoot: false
       enable_directional_kick: false
       goalie_visual_kick_cooldown_ms: 600.0 # 守门员视觉踢球冷却时间，毫秒
+      goalie_visual_kick_startup_decelerate_ms: 80.0 # 清球启动前站稳时间，毫秒
       goalie_clearance_max_ball_range: 2.2 # 门前球的主动接近范围，米；仍需共享控球权
       goalie_clearance_area_margin: 0.3 # 己方禁区清球范围的余量，米
       goalie_visual_kick_max_ball_range: 1.2 # 更远先普通追球，靠近后启动视觉踢球
@@ -151,7 +152,7 @@ brain_node:
       avoid_during_kick: false # 是否在 kick 时避障，如果为 true, 则有障碍物时就不会踢球，只会挡住对方
       kick_ao_safe_dist: 1.5 # kick 时的避障安全距离
       kick_ao_use_shoot: false # 当 avoid_during_kick 为 true 时，此值为 true 时，使用 shoot 进行踢球; 此值为 false 时，则直接不踢，只原地踏步.
-      avoid_during_chase: false # 是否在 chase 时避障
+      avoid_during_chase: true # 追球避障；与默认协作配置一致
       chase_ao_safe_dist: 1.5 # chase 时的避障安全距离
       always_turn_left: false # 在 gotoreadyposition 时，如果有障碍，永远向左转
 

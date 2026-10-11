@@ -1,6 +1,7 @@
 import importlib.util
 import contextlib
 import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import tarfile
 import time
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -324,6 +326,20 @@ class BuildProgressTests(unittest.TestCase):
         self.assertNotIn('100%', output.getvalue())
         self.assertNotIn(' OK', output.getvalue())
 
+    def test_parallel_progress_keeps_other_active_packages_when_one_finishes(self):
+        output = self.Terminal()
+        progress = sync.BuildProgress('192.168.133.43', output, parallel=True)
+        for line in ('__K1_BUILD_TOTAL__=3', 'Starting >>> brain',
+                     'Starting >>> vision', '[ 72%] Building CXX object vision.cpp.o',
+                     'Finished <<< vision [2.0s]'):
+            progress.consume(line + '\n')
+        self.assertEqual(progress.active, {'brain'})
+        self.assertEqual(progress.completed, {'vision'})
+        self.assertIsNone(progress.percent)
+        self.assertIn('1/3 pkgs', output.getvalue())
+        self.assertIn('brain [', output.getvalue())
+        self.assertNotIn('72%', output.getvalue())
+
     def test_stream_keeps_log_and_animates_during_silence(self):
         with tempfile.TemporaryDirectory() as temp:
             log = Path(temp) / 'build.log'
@@ -367,12 +383,17 @@ class BuildProgressTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 5)
             self.assertIn('FAILED', output.getvalue())
 
-    @unittest.skipUnless(shutil.which('colcon') and shutil.which('cmake') and shutil.which('c++'),
-                         'Real build check needs colcon/CMake/C++ on Linux')
+    @unittest.skipUnless(os.environ.get('K1_RUN_COMPILE_TESTS') == '1' and
+                         shutil.which('colcon') and shutil.which('cmake') and shutil.which('c++'),
+                         'Compilation fixture is opt-in (K1_RUN_COMPILE_TESTS=1)')
     def test_real_colcon_build_supplies_package_count_and_make_progress(self):
         with tempfile.TemporaryDirectory(prefix='k1 build progress ') as temp:
             root = Path(temp)
             packages = ('booster_interface', 'brain', 'vision', 'game_controller')
+            (root / 'scripts').mkdir()
+            build_script = root / 'scripts/build.sh'
+            build_script.write_bytes((Path(__file__).resolve().parents[1] / 'build.sh').read_bytes())
+            build_script.chmod(0o755)
             for name in packages:
                 folder = root / 'src' / name
                 folder.mkdir(parents=True)
@@ -396,6 +417,85 @@ class BuildProgressTests(unittest.TestCase):
             self.assertEqual(progress.total, 4)
             self.assertEqual(progress.completed, set(packages))
             self.assertRegex(log.read_text(), r'\[\s*\d+%\]')
+
+
+class PostSyncWorkflowTests(unittest.TestCase):
+    def test_action_menu_defaults_retries_and_handles_closed_input(self):
+        self.assertEqual(sync.choose_action(mock.Mock(return_value='')), 'sync')
+        self.assertEqual(sync.choose_action(mock.Mock(side_effect=EOFError)), 'sync')
+        reader = mock.Mock(side_effect=['invalid', '2'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sync.choose_action(reader), 'build')
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(sync.choose_action(mock.Mock(return_value='3')), 'start')
+
+    def test_build_uses_all_packages_and_parallel_execution(self):
+        body = sync.shlex.split(sync.build_command('/tmp/demo with spaces'))[2]
+        self.assertIn("cd -- '/tmp/demo with spaces'", body)
+        self.assertIn('colcon list --names-only | wc -l', body)
+        self.assertIn('./scripts/build.sh', body)
+        self.assertIn('--executor parallel', body)
+        self.assertIn('--parallel-workers "$task_build_jobs"', body)
+        self.assertNotIn('--packages-up-to', body)
+        self.assertNotIn('sequential', body)
+        self.assertNotIn('MAKEFLAGS=-j1', body)
+
+    def test_start_sources_new_environment_in_the_same_shell_before_starting(self):
+        root = "/tmp/demo with a quote's"
+        body = sync.shlex.split(sync.start_command(root))[2]
+        self.assertIn('cd -- ' + sync.shlex.quote(root), body)
+        self.assertLess(body.index('source install/setup.bash'), body.index('./scripts/start.sh'))
+        self.assertIn('set -e -o pipefail', body)
+        self.assertEqual(sync.manual_commands(root).count('&&'), 2)
+
+    def test_two_selected_robots_build_concurrently_and_all_results_are_saved(self):
+        self.check_parallel_build(failed_host=None)
+
+    def test_one_failed_robot_does_not_prevent_the_other_result(self):
+        self.check_parallel_build(failed_host='192.168.133.43')
+
+    def check_parallel_build(self, failed_host):
+        hosts = ['192.168.133.43', '192.168.133.21']
+        barrier = threading.Barrier(2)
+        with tempfile.TemporaryDirectory() as temp:
+            report = {'run_id': 'test-parallel', 'robots': {host: {} for host in hosts}}
+            args = SimpleNamespace(remote_root='/tmp/fake-demo')
+            def ssh(host, command, **kwargs):
+                if 'progress' not in kwargs:
+                    return '{"moved": 0}'
+                barrier.wait(timeout=5)  # Fails if targets are built one at a time.
+                Path(kwargs['log_path']).write_text('simulated output; no compiler invoked\n')
+                if host == failed_host:
+                    raise RuntimeError(host + ': simulated build failure')
+                return ''
+            transport = SimpleNamespace(ssh=mock.Mock(side_effect=ssh))
+            prepared = [(host, ['fake-agent'], None) for host in hosts]
+            with contextlib.redirect_stdout(io.StringIO()):
+                if failed_host:
+                    with self.assertRaisesRegex(RuntimeError, 'simulated build failure'):
+                        sync.build_robots(transport, args, prepared, report, Path(temp))
+                else:
+                    sync.build_robots(transport, args, prepared, report, Path(temp))
+            for host in hosts:
+                robot = report['robots'][host]
+                self.assertEqual(robot['build'], 'failed' if host == failed_host else 'passed')
+                self.assertTrue(Path(robot['build_log']).is_file())
+
+    @unittest.skipUnless(os.name == 'posix', 'Shell workflow test needs Linux/WSL')
+    def test_build_script_preserves_failure_without_printing_build_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            for name, content in [('colcon', '#!/bin/bash\nexit 2\n'),
+                                  ('espeak', '#!/bin/bash\necho SHOULD_NOT_RUN\n')]:
+                tool = folder / name
+                tool.write_text(content)
+                tool.chmod(0o755)
+            env = dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'])
+            result = subprocess.run(['bash', str(Path(__file__).resolve().parents[1] / 'build.sh')],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn('Build complete', result.stdout)
+            self.assertNotIn('SHOULD_NOT_RUN', result.stdout)
 
 
 class BuildPreparationTests(unittest.TestCase):
@@ -537,7 +637,7 @@ class DriverIntegrationTests(unittest.TestCase):
             local_root=str(self.local), remote_root=str(self.robot),
             hosts='192.168.133.43', ip_prefix=None, robot_ids=None,
             password_file='unused-test-auth', key_file=None,
-            rollback=None, build=False, dry_run=False)
+            rollback=None, build=False, start=False, choose_action=False, dry_run=False)
         owner = self
 
         class LocalTransport:
@@ -585,6 +685,45 @@ class DriverIntegrationTests(unittest.TestCase):
         self.assertEqual((self.robot / sync.BRAIN_CONFIG).read_text(), self.old_config)
         self.assertFalse((self.robot / 'src/brain/new.h').exists())
         self.assertFalse((self.robot / '.robot-sync-backups').exists())
+
+    def test_menu_is_after_sync_and_defaults_to_no_build_or_start(self):
+        self.args.choose_action = True
+        def answer():
+            self.assertEqual((self.robot / 'src/brain/code.cpp').read_bytes(), b'new source\n')
+            return 'sync'
+        with mock.patch.object(sync, 'choose_action', side_effect=answer), \
+                mock.patch.object(sync, 'build_command', side_effect=AssertionError('Must not build')), \
+                mock.patch.object(sync, 'start_command', side_effect=AssertionError('Must not start')):
+            report = self.run_driver()
+        self.assertEqual(report['action'], 'sync')
+        self.assertNotIn('build', report['robots']['192.168.133.43'])
+
+    def test_build_and_start_loads_environment_only_after_success(self):
+        self.args.start = True
+        marker = self.robot / 'built.marker'
+        started = self.robot / 'started.marker'
+        build = 'python3 -c ' + sync.shlex.quote(f'from pathlib import Path; Path({str(marker)!r}).touch()')
+        start = 'python3 -c ' + sync.shlex.quote(
+            f'from pathlib import Path; assert Path({str(marker)!r}).is_file(); Path({str(started)!r}).touch()')
+        with mock.patch.object(sync, 'build_command', return_value=build), \
+                mock.patch.object(sync, 'start_command', return_value=start):
+            report = self.run_driver()
+        self.assertEqual(report['action'], 'start')
+        self.assertEqual(report['robots']['192.168.133.43']['build'], 'passed')
+        self.assertEqual(report['robots']['192.168.133.43']['start'], 'command_completed')
+        self.assertTrue(started.is_file())
+
+    def test_failed_build_never_calls_start_and_cleans_staging(self):
+        self.args.start = True
+        with mock.patch.object(sync, 'build_command', return_value='exit 2'), \
+                mock.patch.object(sync, 'start_command', side_effect=AssertionError('Must not start')):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                sync.run_local(self.args)
+        report = sync.read_json(next((self.local / '.robot-sync').glob('*/result.json')))
+        self.assertFalse(report['success'])
+        self.assertEqual(report['robots']['192.168.133.43']['build'], 'failed')
+        self.assertNotIn('start', report['robots']['192.168.133.43'])
+        self.assertTrue(all(not path.exists() for path in self.stages))
 
     def test_driver_sync_repeat_and_rollback(self):
         import yaml

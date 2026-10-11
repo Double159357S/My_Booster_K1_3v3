@@ -15,6 +15,7 @@
 #include "brain.h"
 #include "utils/kick_geometry.h"
 #include "utils/kick_strategy.h"
+#include "utils/goalie_strategy.h"
 #include "utils/print.h"
 #include "utils/math.h"
 #include "utils/misc.h"
@@ -130,6 +131,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("strategy.enable_directional_kick", false);
 
     declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 600.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_startup_decelerate_ms", 80.0);
     declare_parameter<double>("strategy.goalie_clearance_max_ball_range", 2.2);
     declare_parameter<double>("strategy.goalie_clearance_area_margin", 0.3);
     declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 1.2);
@@ -670,25 +672,18 @@ int Brain::selectGoaliePlayerId(bool *communicationHealthy,
 
     int eligibleCount = 0;
     int freshPoseCount = 0;
-    int selected = 0;
-    double selectedDistance = std::numeric_limits<double>::infinity();
-    int selectedNotKicking = 0;
-    double selectedNotKickingDistance = std::numeric_limits<double>::infinity();
-    auto consider = [&](int id, const Pose2D &pose, bool inVisualKick) {
-        const double distance = distanceToGoal(pose);
-        if (distance < selectedDistance - tieMargin ||
-            (std::abs(distance - selectedDistance) <= tieMargin &&
-             (selected == 0 || id < selected))) {
-            selected = id;
-            selectedDistance = distance;
-        }
-        if (!inVisualKick &&
-            (distance < selectedNotKickingDistance - tieMargin ||
-             (std::abs(distance - selectedNotKickingDistance) <= tieMargin &&
-              (selectedNotKicking == 0 || id < selectedNotKicking)))) {
-            selectedNotKicking = id;
-            selectedNotKickingDistance = distance;
-        }
+    std::vector<goalie_strategy::Candidate> candidates;
+    const auto &fd = config->fieldDimensions;
+    const double margin = std::clamp(get_parameter(
+        "strategy.goalie_clearance_area_margin").as_double(), 0.0, 0.7);
+    const double maxRange = std::clamp(get_parameter(
+        "strategy.goalie_clearance_max_ball_range").as_double(), 0.8, 3.0);
+    auto consider = [&](int id, const Pose2D &pose, bool inVisualKick,
+                        bool goalie, bool ballKnown, const Point &ball, double range) {
+        const bool clearing = goalie_strategy::protectClearanceRole(goalie,
+            ballKnown, inVisualKick, ball.x, ball.y, range, fd.length,
+            fd.penaltyAreaLength, fd.penaltyAreaWidth, margin, maxRange);
+        candidates.push_back({id, distanceToGoal(pose), inVisualKick, clearing});
     };
 
     for (int i = 0; i < playerCount; ++i) {
@@ -696,7 +691,10 @@ int Brain::selectGoaliePlayerId(bool *communicationHealthy,
         ++eligibleCount;
         if (i == selfIdx) {
             if (poseUsable(data->robotPoseToField)) {
-                consider(i + 1, data->robotPoseToField, data->tmImInVisualKick);
+                consider(i + 1, data->robotPoseToField, data->tmImInVisualKick,
+                    tree->getEntry<string>("player_role") == "goal_keeper",
+                    hasFreshLocalBall() || tree->getEntry<bool>("tm_ball_pos_reliable"),
+                    data->ball.posToField, data->ball.range);
                 ++freshPoseCount;
             }
             continue;
@@ -707,10 +705,11 @@ int Brain::selectGoaliePlayerId(bool *communicationHealthy,
             : std::numeric_limits<double>::infinity();
         if (!tm.isAlive || !std::isfinite(ageMs) || ageMs > freshMs ||
             !poseUsable(tm.robotPoseToField)) continue;
-        consider(i + 1, tm.robotPoseToField, tm.isInVisualKick);
+        consider(i + 1, tm.robotPoseToField, tm.isInVisualKick,
+            tm.role == "goal_keeper", tm.ballLocationKnown, tm.ballPosToField, tm.ballRange);
         ++freshPoseCount;
     }
-    if (selectedNotKicking > 0) selected = selectedNotKicking;
+    const int selected = goalie_strategy::select(candidates, tieMargin);
 
     const bool healthy = eligibleCount > 0 && freshPoseCount == eligibleCount;
     if (communicationHealthy) *communicationHealthy = healthy;

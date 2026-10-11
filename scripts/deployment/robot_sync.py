@@ -2,11 +2,13 @@
 """Windows/PuTTY source sync driver and isolated Linux remote agent.
 
 Local side needs only Python's standard library. The remote configuration merge
-uses PyYAML already supplied by ROS. No robot process is stopped or started.
+uses PyYAML already supplied by ROS. Sync alone never builds or starts the Demo;
+post-sync build/start actions require an explicit option or interactive choice.
 """
 import argparse
 import ast
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import io
 import ipaddress
@@ -463,9 +465,11 @@ def rollback(root, backup_id, dry_run=False):
 class BuildProgress:
     """Show actual package/CMake progress; keep ticking while output is quiet."""
 
-    def __init__(self, host, output=None, clock=time.monotonic):
+    def __init__(self, host, output=None, clock=time.monotonic, parallel=False, interactive=None):
         self.host, self.output, self.clock = host, output or sys.stdout, clock
-        self.interactive = self.output.isatty()
+        self.interactive = self.output.isatty() if interactive is None else interactive
+        self.parallel = parallel
+        self.active = set()
         self.started = clock()
         self.last_refresh = float('-inf')
         self.total, self.completed = None, set()
@@ -482,20 +486,24 @@ class BuildProgress:
         if total:
             self.total = int(total[1])
         elif start:
+            self.active.add(start[1])
             self.package, self.percent = start[1], None
         elif end:
             self.completed.add(end[1])
+            self.active.discard(end[1])
             self.package, self.percent = 'next package', None
         elif failed:
+            self.active.discard(failed[2])
             self.package, self.state = failed[2], 'failed'
-        elif percent and 0 <= int(percent[1]) <= 100:
+        elif percent and not self.parallel and 0 <= int(percent[1]) <= 100:
             self.percent = int(percent[1])
         # The full stream stays in the build log. Compact repetitive Make and
         # installation output here, while keeping diagnostics/start/end visible.
         if not total and not percent and not text.startswith(
                 ('-- Installing:', '-- Up-to-date:', '-- Symlinking:')):
             self.clear()
-            self.output.write(line.rstrip('\r\n') + '\n')
+            prefix = self.host + ' | ' if not self.interactive else ''
+            self.output.write(prefix + line.rstrip('\r\n') + '\n')
             self.output.flush()
         self.refresh(force=bool(total or start or end or failed))
 
@@ -511,7 +519,13 @@ class BuildProgress:
         if not force and now - self.last_refresh < (0.5 if self.interactive else 10):
             return
         elapsed = max(0, int(now - self.started))
-        if self.percent is None:
+        if self.parallel and self.total:
+            # Interleaved CMake percentages cannot be assigned to a package.
+            # Show completed packages instead of inventing a per-package value.
+            filled = min(16, len(self.completed) * 16 // self.total)
+            bar = '#' * filled + '-' * (16 - filled)
+            value = 'packages'
+        elif self.percent is None:
             position = elapsed % 16
             bar = '-' * position + '>' + '-' * (15 - position)
             value = 'wait'
@@ -519,7 +533,8 @@ class BuildProgress:
             filled = self.percent * 16 // 100
             bar = '#' * filled + '-' * (16 - filled)
             value = f'{self.percent}%'
-        package = self.package if len(self.package) <= 22 else self.package[:19] + '...'
+        package = ','.join(sorted(self.active)) if self.parallel and self.active else self.package
+        package = package if len(package) <= 30 else package[:27] + '...'
         status = (f'{self.host} | {len(self.completed)}/{self.total if self.total is not None else "?"} pkgs '
                   f'| {package} [{bar}] {value} | {elapsed // 60:02}:{elapsed % 60:02}')
         if self.state != 'running':
@@ -715,27 +730,91 @@ def prepare_symlink_build(root, run_id):
 
 
 def build_command(remote_root):
-    # Build without starting/stopping the Demo; cap parallelism on the Jetson.
-    selection = '--packages-up-to brain vision game_controller'
+    # Use the same entry point as manual builds. Colcon schedules every package
+    # in parallel once its dependencies are ready; each package can also use CPUs.
     body = ('set -e -o pipefail\ncd -- ' + shlex.quote(remote_root) + '\n'
             'source /opt/ros/humble/setup.bash\n'
             'if [ -f install/setup.bash ]; then source install/setup.bash; fi\n'
-            'export CMAKE_BUILD_PARALLEL_LEVEL=1\nexport MAKEFLAGS=-j1\n'
+            'task_build_jobs=$(nproc)\n'
+            'export CMAKE_BUILD_PARALLEL_LEVEL="$task_build_jobs"\n'
+            'export MAKEFLAGS="-j$task_build_jobs"\n'
             'export PYTHONUNBUFFERED=1\n'
-            'task_build_count=$(colcon list --names-only ' + selection + ' | wc -l)\n'
+            'task_build_count=$(colcon list --names-only | wc -l)\n'
             'printf "__K1_BUILD_TOTAL__=%s\\n" "$task_build_count"\n'
-            'colcon build --symlink-install --executor sequential --parallel-workers 1 '
-            '--event-handlers console_direct+ console_start_end+ console_cohesion- console_stderr- '
-            + selection)
+            './scripts/build.sh --symlink-install --executor parallel '
+            '--parallel-workers "$task_build_jobs" '
+            '--event-handlers console_direct+ console_start_end+ console_cohesion- console_stderr-')
     return 'bash -lc ' + shlex.quote(body)
+
+
+def start_command(remote_root):
+    # Environment loading and startup must happen in the same SSH shell.
+    body = ('set -e -o pipefail\ncd -- ' + shlex.quote(remote_root) + '\n'
+            'source /opt/ros/humble/setup.bash\n'
+            'source install/setup.bash\n'
+            './scripts/start.sh')
+    return 'bash -lc ' + shlex.quote(body)
+
+
+def choose_action(reader=None):
+    reader = reader or input
+    while True:
+        try:
+            value = reader('同步完成。请选择后续操作：1 仅同步（默认）；2 编译；3 编译并启动 Demo: ').strip()
+        except EOFError:
+            return 'sync'
+        if value in ('', '1', '2', '3'):
+            return {'': 'sync', '1': 'sync', '2': 'build', '3': 'start'}[value]
+        print('请输入 1、2 或 3。', flush=True)
+
+
+def manual_commands(remote_root):
+    return ('cd -- ' + shlex.quote(remote_root) + '\n'
+            './scripts/build.sh && source install/setup.bash && ./scripts/start.sh')
+
+
+def build_robots(transport, args, prepared, report, report_dir):
+    def build_one(host, base):
+        robot = report['robots'][host]
+        try:
+            result = json.loads(transport.ssh(host, shlex.join(
+                base + ['--operation', 'prepare-build', '--run-id', report['run_id']])))
+            robot['build_preparation'] = result
+            if result['moved']:
+                print(f"{host}: backed up {result['moved']} conflicting build directories; "
+                      f"backup: {result['backup']}", flush=True)
+            print('Building on ' + host + ' (parallel packages) ...', flush=True)
+            log_path = report_dir / (host + '.build.log')
+            robot['build_log'] = str(log_path)
+            progress = BuildProgress(host, parallel=True,
+                                     interactive=False if len(prepared) > 1 else None)
+            transport.ssh(host, build_command(args.remote_root), timeout=7200,
+                          stream=True, progress=progress, log_path=log_path)
+            robot['build'] = 'passed'
+        except Exception as error:
+            robot['build'] = 'failed'
+            robot['build_error'] = str(error)
+            raise
+
+    errors = []
+    # Finish every selected robot and retain every result even if another fails.
+    with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
+        tasks = {pool.submit(build_one, host, base): host for host, base, _ in prepared}
+        for task in as_completed(tasks):
+            try:
+                task.result()
+            except Exception as error:
+                errors.append(str(error))
+    if errors:
+        raise RuntimeError('\n'.join(errors))
 
 
 def run_local(args):
     root = Path(args.local_root).resolve()
     if not (root / 'src/brain').is_dir():
         raise ValueError('Invalid local project root')
-    if args.rollback and args.build:
-        raise ValueError('Do not combine rollback and build')
+    if args.rollback and (args.build or getattr(args, 'start', False)):
+        raise ValueError('Do not combine rollback and build/start')
     if not args.key_file and not args.password_file:
         raise ValueError('SSH authentication is required')
     hosts = select_hosts(args.hosts, args.ip_prefix, args.robot_ids)
@@ -797,31 +876,32 @@ def run_local(args):
                     result = json.loads(transport.ssh(host, shlex.join(command)))
                     report['robots'][host].update({'state': 'synced', 'result': result})
                     print(f"{host}: synced {result['changed']} files; backup: {result['backup']}", flush=True)
-            if args.build and not args.dry_run:
+            try:
+                action = 'start' if getattr(args, 'start', False) else 'build' if args.build else 'sync'
+                if not args.dry_run and not args.rollback:
+                    if getattr(args, 'choose_action', False) and action == 'sync':
+                        action = choose_action()
+                    report['action'] = action
+                    report['manual_commands'] = manual_commands(args.remote_root)
+                    if action in ('build', 'start'):
+                        build_robots(transport, args, prepared, report, report_dir)
+                    if action == 'start':
+                        # All selected robots must finish building before any starts.
+                        for host, _, _ in prepared:
+                            robot = report['robots'][host]
+                            try:
+                                print('Loading environment and starting Demo on ' + host + ' ...', flush=True)
+                                transport.ssh(host, start_command(args.remote_root), stream=True)
+                                robot['start'] = 'command_completed'
+                            except Exception as error:
+                                robot['start'], robot['start_error'] = 'failed', str(error)
+                                raise
+            finally:
                 for host, base, _ in prepared:
-                    result = json.loads(transport.ssh(host, shlex.join(
-                        base + ['--operation', 'prepare-build', '--run-id', run_id])))
-                    report['robots'][host]['build_preparation'] = result
-                    if result['moved']:
-                        print(f"{host}: backed up {result['moved']} conflicting build directories; "
-                              f"backup: {result['backup']}", flush=True)
-                    print('Building on ' + host + ' (single worker) ...', flush=True)
-                    log_path = report_dir / (host + '.build.log')
-                    report['robots'][host]['build_log'] = str(log_path)
                     try:
-                        transport.ssh(host, build_command(args.remote_root), timeout=7200, stream=True,
-                                      progress=BuildProgress(host), log_path=log_path)
-                    except Exception:
-                        report['robots'][host]['build'] = 'failed'
-                        raise
-                    report['robots'][host]['build'] = 'passed'
-            for host, base, _ in prepared:
-                try:
-                    transport.ssh(host, shlex.join(base + ['--operation', 'cleanup']))
-                except Exception as error:
-                    # Source sync already finished. Keep its result and report
-                    # a staging-cleanup failure separately.
-                    report['robots'][host]['cleanup_error'] = str(error)
+                        transport.ssh(host, shlex.join(base + ['--operation', 'cleanup']))
+                    except Exception as error:
+                        report['robots'][host]['cleanup_error'] = str(error)
             report['success'] = True
     except Exception as error:
         report['success'], report['error'] = False, str(error)
@@ -829,8 +909,16 @@ def run_local(args):
     finally:
         write_json(report_dir / 'result.json', report)
         print('Report: ' + str(report_dir / 'result.json'), flush=True)
-    print('Preview complete; robot source files unchanged.' if args.dry_run else
-          'Sync complete. Restart the Demo after all robots have been built.', flush=True)
+    if args.dry_run:
+        print('Preview complete; robot source files unchanged.', flush=True)
+    elif args.rollback:
+        print('Rollback complete.', flush=True)
+    elif report['action'] == 'start':
+        print('Sync/build complete; Demo startup commands completed on selected robots.', flush=True)
+    else:
+        print('Sync complete. ' + ('Build complete; load the new environment and start manually.'
+              if report['action'] == 'build' else 'No build/start was run.'), flush=True)
+        print('机器人上手动执行（编译成功后才会加载环境、启动）：\n' + manual_commands(args.remote_root), flush=True)
 
 
 def remote_agent(args):
@@ -878,6 +966,8 @@ def main():
     parser.add_argument('--key-file')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--build', action='store_true')
+    parser.add_argument('--start', action='store_true', help='Build all selected robots, then load environment and start Demo')
+    parser.add_argument('--choose-action', action='store_true', help='Ask for sync/build/start after syncing; default is sync only')
     parser.add_argument('--rollback')
     parser.add_argument('--remote-agent', action='store_true')
     parser.add_argument('--operation')
