@@ -419,6 +419,96 @@ class BuildProgressTests(unittest.TestCase):
             self.assertRegex(log.read_text(), r'\[\s*\d+%\]')
 
 
+class MenuInputTests(unittest.TestCase):
+    def test_batch_children_leave_piped_menu_answer_for_parent(self):
+        # Fake PuTTY tries to read stdin after source transfer. The parent must
+        # still receive the operator's answer; no SSH connection is made.
+        with tempfile.TemporaryDirectory() as temp:
+            probe = Path(temp) / 'probe.py'
+            probe.write_text(f'''
+import importlib.util
+import io
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
+from unittest import mock
+spec = importlib.util.spec_from_file_location('sync', {str(Path(sync.__file__).resolve())!r})
+sync = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sync)
+real_popen = subprocess.Popen
+def fake_putty(command, **kwargs):
+    if command[0] in ('fake-plink', 'fake-pscp'):
+        command = [sys.executable, '-u', '-c',
+                   'import sys; print("CHILD_INPUT=" + repr(sys.stdin.readline()))']
+    return real_popen(command, **kwargs)
+args = SimpleNamespace(plink='fake-plink', pscp='fake-pscp', key_file='fake-key',
+                       password_file=None, host_key='fake-fingerprint', user='test')
+transport = sync.Transport(args)
+with mock.patch.object(sync.subprocess, 'Popen', side_effect=fake_putty):
+    reply = transport.ssh('fake-host', 'fake-command')
+    assert reply.strip() == "CHILD_INPUT=''", reply
+    transport.ssh('fake-host', 'fake-command', stream=True)
+    transport.upload('fake-host', 'fake-source', 'fake-destination')
+    transport.ssh('fake-host', 'fake-command',
+                  progress=sync.BuildProgress('fake-host', io.StringIO()),
+                  log_path=Path({str(Path(temp) / 'output.log')!r}))
+print('CHOICE=' + sync.choose_action())
+''', encoding='utf-8')
+            result = subprocess.run([sys.executable, str(probe)], input='2\n',
+                                    capture_output=True, encoding='utf-8', timeout=15,
+                                    env=dict(os.environ, PYTHONUTF8='1'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('CHOICE=build', result.stdout)
+
+    def windows_kernel(self, mode):
+        import ctypes
+        from ctypes import wintypes
+        def get_mode(handle, pointer):
+            ctypes.cast(pointer, ctypes.POINTER(wintypes.DWORD)).contents.value = mode
+            return 1
+        return SimpleNamespace(
+            GetStdHandle=mock.Mock(return_value=42),
+            GetConsoleMode=mock.Mock(side_effect=get_mode),
+            SetConsoleMode=mock.Mock(return_value=1))
+
+    def test_windows_menu_repairs_line_echo_and_ctrl_c_then_restores_mode(self):
+        import ctypes
+        original = 0x40 | 0x10  # Quick Edit, mouse input; line/echo/Ctrl+C off.
+        kernel = self.windows_kernel(original)
+        def answer(prompt):
+            editable = kernel.SetConsoleMode.call_args.args[1]
+            self.assertEqual(editable & 0x87, 0x87)
+            self.assertFalse(editable & 0x40)
+            self.assertTrue(editable & 0x10)
+            return '2'
+        with mock.patch.object(sync.os, 'name', 'nt'), \
+                mock.patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sync.choose_action(answer), 'build')
+        self.assertEqual(kernel.SetConsoleMode.call_args.args, (42, original))
+        self.assertEqual(kernel.SetConsoleMode.call_count, 2)
+
+    def test_redirected_windows_input_needs_no_console_mode_change(self):
+        import ctypes
+        kernel = self.windows_kernel(0)
+        kernel.GetConsoleMode = mock.Mock(return_value=0)
+        with mock.patch.object(sync.os, 'name', 'nt'), \
+                mock.patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sync.choose_action(lambda prompt: ''), 'sync')
+        kernel.SetConsoleMode.assert_not_called()
+
+    def test_cancelled_menu_restores_console_and_selects_sync_only(self):
+        import ctypes
+        kernel = self.windows_kernel(0x47)
+        with mock.patch.object(sync.os, 'name', 'nt'), \
+                mock.patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sync.choose_action(mock.Mock(side_effect=KeyboardInterrupt)), 'sync')
+        self.assertEqual(kernel.SetConsoleMode.call_args.args, (42, 0x47))
+
+
 class PostSyncWorkflowTests(unittest.TestCase):
     def test_action_menu_defaults_retries_and_handles_closed_input(self):
         self.assertEqual(sync.choose_action(mock.Mock(return_value='')), 'sync')
@@ -697,6 +787,18 @@ class DriverIntegrationTests(unittest.TestCase):
             report = self.run_driver()
         self.assertEqual(report['action'], 'sync')
         self.assertNotIn('build', report['robots']['192.168.133.43'])
+
+    def test_cancel_at_menu_retains_synced_code_and_writes_success_report(self):
+        self.args.choose_action = True
+        with mock.patch('builtins.input', side_effect=KeyboardInterrupt), \
+                mock.patch.object(sync, 'build_command', side_effect=AssertionError('Must not build')), \
+                mock.patch.object(sync, 'start_command', side_effect=AssertionError('Must not start')):
+            report = self.run_driver()
+        self.assertEqual(report['action'], 'sync')
+        self.assertEqual(report['robots']['192.168.133.43']['state'], 'synced')
+        self.assertEqual((self.robot / 'src/brain/code.cpp').read_bytes(), b'new source\n')
+        self.assertNotIn('build', report['robots']['192.168.133.43'])
+        self.assertNotIn('start', report['robots']['192.168.133.43'])
 
     def test_build_and_start_loads_environment_only_after_success(self):
         self.args.start = True

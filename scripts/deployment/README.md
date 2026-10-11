@@ -50,6 +50,8 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 同步完成。请选择后续操作：1 仅同步（默认）；2 编译；3 编译并启动 Demo:
 ```
 
+此时文件已经同步。输入数字后按回车；直接回车或 `Ctrl+C` 都只结束操作选择，不编译、不启动。SSH 子进程不读取键盘，菜单会恢复 Windows 的行输入和字符回显，并暂时关闭鼠标选择暂停。如果旧脚本停在这里无法输入，先按 `Esc` 取消控制台文字选择，再输入 `1` 回车；也可以按 `Ctrl+C` 退出，已同步的文件不会撤回。
+
 - `1`：结束同步，显示手动编译、加载环境和启动命令。
 - `2`：所选机器人同时编译，每台通过 `./scripts/build.sh` 并行构建工程中的全部包；结束后由你启动。
 - `3`：先同时编译所有目标；全部成功后，在各台同一个 SSH shell 内执行 `source install/setup.bash` 和 `./scripts/start.sh`。任何一台编译失败都不会进入启动步骤。
@@ -91,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1" -IpPrefix 1
 
 ## 验证
 
-测试包含地址输入、同步、配置保留、回滚、并行进度、多台同时构建、菜单默认仅同步、编译失败阻止启动及环境加载顺序。使用临时目录和模拟命令，不通过 SSH 连接设备，默认不执行编译。在带有 PyYAML 的 Linux/WSL 中执行：
+测试包含地址输入、同步、配置保留、回滚、并行进度、多台同时构建、菜单默认仅同步、键盘输入隔离、Windows 输入模式恢复、取消菜单保留同步结果、编译失败阻止启动及环境加载顺序。使用临时目录和模拟命令，不通过 SSH 连接设备，默认不执行编译。在带有 PyYAML 的 Linux/WSL 中执行：
 
 ```bash
 python3 scripts/deployment/test_robot_sync.py

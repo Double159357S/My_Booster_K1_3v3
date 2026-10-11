@@ -9,6 +9,7 @@ import argparse
 import ast
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import hashlib
 import io
 import ipaddress
@@ -566,7 +567,8 @@ def stream_build(command, timeout, progress, log_path):
     tail = deque(maxlen=20)
     deadline = time.monotonic() + timeout
     with Path(log_path).open('w', encoding='utf-8') as log:
-        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
             def read_output():
                 try:
@@ -620,13 +622,16 @@ class Transport:
         return ['-batch', '-hostkey', a.host_key, '-l', a.user] + auth
 
     def ssh(self, host, command, timeout=300, stream=False, progress=None, log_path=None):
-        args = [self.args.plink, '-ssh', '-no-antispoof'] + self.authentication() + [host, command]
+        # Batch commands authenticate from a key/password file and never need
+        # the operator's keyboard. Do not let PuTTY inherit the menu's stdin.
+        args = [self.args.plink, '-ssh', '-T', '-no-antispoof'] + self.authentication() + [host, command]
         if progress is not None:
             code, detail = stream_build(args, timeout, progress, log_path)
             if code:
                 raise RuntimeError(f'{host}: SSH command failed ({code}): {detail.strip()}')
             return ''
-        result = subprocess.run(args, stdout=None if stream else subprocess.PIPE,
+        result = subprocess.run(args, stdin=subprocess.DEVNULL,
+                                stdout=None if stream else subprocess.PIPE,
                                 stderr=None if stream else subprocess.PIPE,
                                 timeout=timeout)
         if result.returncode:
@@ -636,7 +641,8 @@ class Transport:
 
     def upload(self, host, local, remote):
         command = [self.args.pscp, '-q', '-sftp'] + self.authentication() + [str(local), host + ':' + remote]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
         if result.returncode:
             raise RuntimeError(host + ': upload failed: ' + result.stderr.decode('utf-8', errors='replace'))
 
@@ -756,16 +762,54 @@ def start_command(remote_root):
     return 'bash -lc ' + shlex.quote(body)
 
 
+@contextmanager
+def console_line_input():
+    """Restore line editing/echo for the Windows menu, then restore its mode.
+
+    Native SSH clients can leave the shared console in raw input mode. Quick
+    Edit selections can also pause a console application. Disable Quick Edit
+    only while reading this menu. Pipes and Linux terminals need no changes.
+    """
+    restore = None
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = wintypes.DWORD()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            original = mode.value
+            # PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT | EXTENDED_FLAGS;
+            # clear QUICK_EDIT_MODE so selecting console text cannot freeze us.
+            editable = (original | 0x01 | 0x02 | 0x04 | 0x80) & ~0x40
+            if kernel.SetConsoleMode(handle, editable):
+                restore = lambda: kernel.SetConsoleMode(handle, original)
+    try:
+        yield
+    finally:
+        if restore is not None:
+            restore()
+
+
 def choose_action(reader=None):
     reader = reader or input
-    while True:
-        try:
-            value = reader('同步完成。请选择后续操作：1 仅同步（默认）；2 编译；3 编译并启动 Demo: ').strip()
-        except EOFError:
-            return 'sync'
-        if value in ('', '1', '2', '3'):
-            return {'': 'sync', '1': 'sync', '2': 'build', '3': 'start'}[value]
-        print('请输入 1、2 或 3。', flush=True)
+    print('\n文件已同步。输入 1/2/3 后按回车；直接回车或 Ctrl+C 仅结束同步。', flush=True)
+    with console_line_input():
+        while True:
+            try:
+                value = reader('同步完成。请选择后续操作：1 仅同步（默认）；2 编译；3 编译并启动 Demo: ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('\n已结束操作选择；代码已同步，未执行编译或启动。', flush=True)
+                return 'sync'
+            if value in ('', '1', '2', '3'):
+                return {'': 'sync', '1': 'sync', '2': 'build', '3': 'start'}[value]
+            print('请输入 1、2 或 3，再按回车。', flush=True)
 
 
 def manual_commands(remote_root):
