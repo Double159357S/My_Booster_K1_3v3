@@ -34,6 +34,18 @@ int main()
     using namespace kick_geometry;
     bool ok = true;
 
+    ok &= expectTrue("aligned shot", readyToKick(0, 0.1, -0.1, 0.2));
+    ok &= expectFalse("body sideways cannot kick", readyToKick(0, 0, 1.5, 0.2));
+    ok &= expectFalse("ball approach off target", readyToKick(0, 0.5, 0, 0.2));
+    ok &= expectFalse("invalid pose cannot kick", readyToKick(0, NAN, 0, 0.2));
+    ok &= expectTrue("alignment wraps pi", readyToKick(kPi, -kPi + 0.1, kPi - 0.1, 0.2));
+    ok &= expectNear("urgent intercept", interceptLateralSpeed(0.2, 2.2, 0.8, 0.3, 0.15), 0.8);
+    ok &= expectNear("opposite side intercept", interceptLateralSpeed(-0.2, 2.2, 0.8, 0.3, 0.15), -0.8);
+    ok &= expectNear("no trajectory", interceptLateralSpeed(0.2, 2.2, 0.8, INFINITY, 0.15), 0.44);
+    ok &= expectNear("arriving now", interceptLateralSpeed(0.2, 2.2, 0.8, 0.1, 0.15), 0.8);
+    ok &= expectNear("no error", interceptLateralSpeed(0, 2.2, 0.8, 0.3, 0.15), 0);
+    ok &= expectNear("invalid ball", interceptLateralSpeed(NAN, 2.2, 0.8, 0.3, 0.15), 0);
+
     const double deg = kPi / 180.0;
     ok &= expectNear("wrapped goal opening", minorArcWidth(170.0 * deg, -170.0 * deg),
                      20.0 * deg);

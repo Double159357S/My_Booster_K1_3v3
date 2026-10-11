@@ -130,7 +130,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
 
     declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 600.0);
     declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 5.0);
-    declare_parameter<double>("strategy.goalie_visual_kick_max_direction_error", 1.2);
+    declare_parameter<double>("strategy.goalie_visual_kick_max_direction_error", 0.35);
     declare_parameter<double>("strategy.goalie_simple_x_kp", 0.9);
     declare_parameter<double>("strategy.goalie_simple_y_kp", 2.2);
     declare_parameter<double>("strategy.goalie_simple_threat_vxf", -0.03);
@@ -140,19 +140,21 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.goalie_simple_t_plane_max", 6.0);
     declare_parameter<double>("strategy.goalie_simple_vy_max", 0.8);
     declare_parameter<double>("strategy.goalie_simple_vx_max", 1.2);
+    declare_parameter<double>("strategy.goalie_simple_reaction_seconds", 0.15);
+    declare_parameter<std::string>("strategy.cooperation.broadcast_address", "");
     declare_parameter<double>("strategy.goalie_simple_vtheta_kp", 1.4);
     declare_parameter<double>("strategy.goalie_simple_vtheta_limit", 1.5);
     declare_parameter<bool>("strategy.enable_auto_visual_kick", false);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.2);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 4.0);
     declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.8);
-    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.35);
+    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.2);
     declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
-    declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
+    declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 250.0);
     declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.45);
-    declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
-    declare_parameter<bool>("strategy.auto_visual_kick.allow_memory_kick_msg", true);
-    declare_parameter<double>("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", 650.0);
+    declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", false);
+    declare_parameter<bool>("strategy.auto_visual_kick.allow_memory_kick_msg", false);
+    declare_parameter<double>("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", 250.0);
     declare_parameter<double>("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", 0.45);
     declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 80.0);
     declare_parameter<double>("strategy.auto_visual_kick.exit_decelerate_ms", 140.0);
@@ -510,8 +512,8 @@ void Brain::pubKickMsg() {
     predictedRejectRange = std::clamp(predictedRejectRange, 0.3, 3.0);
 
     const bool realBallFresh = data->ballDetected &&
-        (!data->tmImInVisualKick ||
-         (realBallAgeMs >= 0.0 && realBallAgeMs <= realBallMaxAgeMs));
+        realBallAgeMs >= 0.0 && realBallAgeMs <= realBallMaxAgeMs &&
+        std::isfinite(data->ball.posToRobot.x) && std::isfinite(data->ball.posToRobot.y);
     const double predictedRange = std::hypot(
         data->ball.reliablePredictPosToRobot.x,
         data->ball.reliablePredictPosToRobot.y);
@@ -990,7 +992,7 @@ void Brain::handleCooperation() {
         peers.push_back({selfId, data->tmImAlive,
             tree->getEntry<int>("control_state") == 3 &&
                 (selfRole == "striker" || selfGoalieClaimsBall) &&
-                tree->getEntry<bool>("ball_location_known"),
+                (tree->getEntry<bool>("ball_location_known") || data->tm_ball_pos_reliable),
             data->tmImInVisualKick, data->tmMyCost, 0.0,
             data->ballArbitration.announcement(teamNowMs)});
         for (int tmIdx : aliveTmIdxs) {
@@ -4097,6 +4099,21 @@ void Brain::logLowFrequencyDiagnostics(const rclcpp::Time &now)
            << " sub_state=" << gameSubState
            << " control_state=" << controlState
            << " decision=" << decision;
+        const double teamNow = team_cooperation::steadyNowMs();
+        const auto grant = data->ballArbitration.announcement(teamNow);
+        ss << "\nteam enabled=" << config->enableCom
+           << " self=" << config->playerId << " coordinator=" << grant.coordinator
+           << " owner=" << grant.owner << " revision=" << grant.revision
+           << " lease_ms=" << grant.leaseMs << " granted=" << data->tmImLead
+           << " shared_ball=" << data->tm_ball_pos_reliable;
+        for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+            if (i + 1 == config->playerId) continue;
+            const auto &peer = data->tmStatus[i];
+            ss << "\npeer=" << i + 1 << " age_ms=" << teamNow - peer.teamReceivedMs
+               << " protocol=" << (peer.teamSession ? "ownership" : "legacy/absent")
+               << " alive=" << peer.isAlive << " ready=" << peer.canControl
+               << " ball_known=" << peer.ballLocationKnown << " cost=" << peer.cost;
+        }
         const string statusText = ss.str();
 
         RCLCPP_INFO(get_logger(), "[low_frequency_status]\n%s", statusText.c_str());

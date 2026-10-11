@@ -109,6 +109,20 @@ bool visualKickBallUsable(Brain *brain, bool goalieKick)
         (allowMemory && brain->tree->getEntry<bool>("ball_location_known"));
 }
 
+bool visualKickAligned(Brain *brain, bool goalieKick)
+{
+    const auto &pose = brain->data->robotPoseToField;
+    const bool intercept = visualKickGoalieTargetUsable(brain, goalieKick);
+    const auto &field = intercept ? brain->data->goalieVisualKickTargetField : brain->data->ball.posToField;
+    const double direction = goalieKick ? kick_geometry::directionToOpponentGoal(
+        field.x, field.y, brain->config->fieldDimensions.length / 2.0) : brain->data->kickDir;
+    const double approach = kick_geometry::directionToTarget(pose.x, pose.y, field.x, field.y);
+    const double tolerance = brain->get_parameter(goalieKick ?
+        "strategy.goalie_visual_kick_max_direction_error" :
+        "strategy.auto_visual_kick_max_direction_error").as_double();
+    return kick_geometry::readyToKick(direction, approach, pose.theta, tolerance);
+}
+
 bool kickoffTacticalPhase(Brain *brain)
 {
     return (brain->data->isKickingOff || brain->data->isOpponentKickingOff) &&
@@ -1662,7 +1676,9 @@ NodeStatus StrikerDecide::tick() {
     // 判断是否穿过了 KickDir
     double deltaDir = toPInPI(kickDir - dir_rb_f);
     const bool visualKickDirectionReady =
-        fabs(deltaDir) <= autoVisualKickMaxDirectionError;
+        kick_geometry::readyToKick(kickDir, dir_rb_f,
+            brain->data->robotPoseToField.theta, autoVisualKickMaxDirectionError) &&
+        visualKickCurrentRealBallFresh(brain);
     log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, deltaDir: %.2f, visualDirReady: %d, angleGoodForKick: %d, angleGoodForShoot: %d, shootPossible: %d, powerShootPossible: %d",
         ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, deltaDir,
         visualKickDirectionReady, angleGoodForKick, angleGoodForShoot,
@@ -1720,7 +1736,6 @@ NodeStatus StrikerDecide::tick() {
     else if (
         enableAutoVisualKick &&
         brain->data->tmImLead &&
-        brain->data->tmMyCostRank == 0 &&
         !brain->tree->getEntry<bool>("ball_out") &&
         !brain->data->lose_ball &&
         !powerShootPossible &&
@@ -1748,6 +1763,9 @@ NodeStatus StrikerDecide::tick() {
             (angleGoodForKick && !brain->data->isFreekickKickingOff) 
             || reachedKickDir
         )
+        && kick_geometry::readyToKick(kickDir, dir_rb_f,
+            brain->data->robotPoseToField.theta, KICK_THETA_RANGE)
+        && visualKickCurrentRealBallFresh(brain)
         && !avoidKick
         && brain->data->ballDetected
         && fabs(brain->data->ball.yawToRobot) < KICK_THETA_RANGE
@@ -1819,7 +1837,7 @@ struct GoaliePredictTarget
 GoalieBallSource getGoalieBallSource(Brain *brain)
 {
     GoalieBallSource source;
-    source.real = brain->data->ballDetected;
+    source.real = brain->data->ballDetected && visualKickCurrentRealBallFresh(brain);
     source.predicted = !source.real && brain->data->reliableBallPredict;
     if (source.real) {
         source.field = brain->data->ball.posToField;
@@ -1910,8 +1928,9 @@ NodeStatus Analyze2::tick()
         brain->data->robotPoseToField.theta + std::atan2(source.robot.y, source.robot.x));
     const double clearanceDirectionError = kick_geometry::angleDistance(
         desiredClearanceDir, sourceDirField);
-    const bool clearanceDirectionReady = target.interceptEntryReady ||
-        clearanceDirectionError <= maxDirectionError;
+    const bool clearanceDirectionReady = kick_geometry::readyToKick(
+        desiredClearanceDir, sourceDirField, brain->data->robotPoseToField.theta,
+        maxDirectionError);
 
     bool teammateInVisualKick = false;
     const int selfIdx = brain->config->playerId - 1;
@@ -1925,7 +1944,6 @@ NodeStatus Analyze2::tick()
 
     const bool baseReady = source.usable && brain->data->tmImLead &&
         !teammateInVisualKick &&
-        (brain->data->tmMyCostRank == 0 || brain->data->tmMyCost < 2.0) &&
         source.range <= maxRange && cooldownOk &&
         clearanceDirectionReady &&
         source.field.x < -brain->config->fieldDimensions.circleRadius - 2.0;
@@ -2243,7 +2261,7 @@ NodeStatus RLVisionKick::onStart()
     const double clearance = brain->get_parameter(
         "strategy.cooperation.teammate_stop_distance").as_double();
     if (!brain->data->tmImLead || brain->teammateDistance() < clearance ||
-        !visualKickBallUsable(brain, goalieKick)) {
+        (!visualKickBallUsable(brain, goalieKick) || !visualKickAligned(brain, goalieKick))) {
         brain->data->tmImInVisualKick = false;
         brain->tree->setEntry<bool>("goalie_block_kick_active", false);
         brain->data->goalieVisualKickSubState = "none";
@@ -2309,8 +2327,8 @@ NodeStatus RLVisionKick::onRunning()
     }
 
     if (_isDecelerating) {
-        if (!_pendingRobocupWalk && !visualKickBallUsable(brain, goalieKick)) {
-            logExit("start cancelled: no usable ball source");
+        if (!_pendingRobocupWalk && (!visualKickBallUsable(brain, goalieKick) || !visualKickAligned(brain, goalieKick))) {
+            logExit("start cancelled: ball stale or shot misaligned");
             clearState();
             recordExitTime();
             _isDecelerating = false;
@@ -2325,7 +2343,7 @@ NodeStatus RLVisionKick::onRunning()
                 clearState();
                 return NodeStatus::SUCCESS;
             } else if (!_visionKickStarted) {
-                if (!visualKickBallUsable(brain, goalieKick)) {
+                if (!visualKickBallUsable(brain, goalieKick) || !visualKickAligned(brain, goalieKick)) {
                     clearState();
                     recordExitTime();
                     return NodeStatus::SUCCESS;
@@ -2536,6 +2554,13 @@ bool RLVisionKick::stepDecelerate()
 
 NodeStatus Intercept2::tick()
 {
+    const auto source = getGoalieBallSource(brain);
+    const auto &robotPose = brain->data->robotPoseToField;
+    if (!source.usable || !std::isfinite(robotPose.x) ||
+        !std::isfinite(robotPose.y) || !std::isfinite(robotPose.theta)) {
+        brain->client->setVelocity(0, 0, 0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
     double distToGoalLine = 1.0;
     getInput("dist_to_goalline", distToGoalLine);
 
@@ -2544,7 +2569,7 @@ NodeStatus Intercept2::tick()
     const double goalLineX = -fd.length / 2.0;
     const double anchorX = goalLineX + distToGoalLine;
     const auto &pose = brain->data->robotPoseToField;
-    const auto &ball = brain->data->ball.posToField;
+    const auto &ball = source.field;
     const double ballVx = brain->data->ballEstVelX;
     const double ballVy = brain->data->ballEstVelY;
 
@@ -2564,10 +2589,12 @@ NodeStatus Intercept2::tick()
         }
     }
 
+    double arrivalSeconds = std::numeric_limits<double>::infinity();
     double targetY = std::clamp(ball.y, -halfGoalWidth, halfGoalWidth);
     if (threateningGoal && std::abs(ballVx) > minPredictVx) {
         const double timeToAnchor = (anchorX - ball.x) / ballVx;
         if (timeToAnchor > minPlaneTime && timeToAnchor < maxPlaneTime) {
+            arrivalSeconds = timeToAnchor;
             targetY = std::clamp(ball.y + timeToAnchor * ballVy,
                                  -halfGoalWidth, halfGoalWidth);
         }
@@ -2583,12 +2610,15 @@ NodeStatus Intercept2::tick()
     brain->get_parameter("strategy.goalie_simple_vtheta_limit", thetaMax);
 
     const double vxField = std::clamp(xKp * (anchorX - pose.x), -vxMax, vxMax);
-    const double vyField = std::clamp(yKp * (targetY - pose.y), -vyMax, vyMax);
+    double reactionSeconds = 0.15;
+    brain->get_parameter("strategy.goalie_simple_reaction_seconds", reactionSeconds);
+    const double vyField = kick_geometry::interceptLateralSpeed(
+        targetY - pose.y, yKp, vyMax, arrivalSeconds, reactionSeconds);
     double vxRobot = vxField * std::cos(pose.theta) + vyField * std::sin(pose.theta);
     double vyRobot = -vxField * std::sin(pose.theta) + vyField * std::cos(pose.theta);
     vxRobot = std::clamp(vxRobot, -vxMax, vxMax);
     vyRobot = std::clamp(vyRobot, -vyMax, vyMax);
-    const double vtheta = std::clamp(brain->data->ball.yawToRobot * thetaKp,
+    const double vtheta = std::clamp(kick_geometry::normalizeAngle(-pose.theta) * thetaKp,
                                      -thetaMax, thetaMax);
 
     brain->client->setVelocity(vxRobot, vyRobot, vtheta, false, false, false);

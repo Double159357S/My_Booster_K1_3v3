@@ -94,6 +94,18 @@ struct Network {
 };
 
 void arbitrationTests() {
+    Network pair;
+    pair.nodes[0].alive = false;
+    pair.isolate(1, true);
+    pair.run(3500);
+    check(pair.owner() == 2, "two strikers cannot elect without goalie");
+    pair.nodes[2].cost = 1.0;
+    pair.run(3500);
+    check(pair.owner() == 3, "two strikers cannot hand off ownership");
+    pair.isolate(2, true);
+    pair.run(2000);
+    check(pair.owner() == 0, "disconnected pair retains ownership");
+
     Network net;
     net.run(3000);
     check(net.owner() == 2, "equal costs should choose lower striker ID");
