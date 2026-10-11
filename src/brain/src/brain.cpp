@@ -477,6 +477,7 @@ void Brain::tick()
     updateMemory();
     handleSpecialStates();
     handleCooperation();
+    updateBallSpaceYield();
 
     tree->tick();
     // 行为树先写入守门员拦截目标，本帧立即发布给运控。
@@ -994,8 +995,11 @@ void Brain::handleCooperation() {
     const bool canPursueBall = data->sharedBallRecovery.canPursue(teamNowMs,
         data->ballFromTeammate, data->tmImLead, data->ball.range,
         data->ball.posToField.x, data->ball.posToField.y);
+    const bool activeKickSource = data->tmImInVisualKick &&
+        getKickBallSource() != kick_strategy::BallSource::none;
     data->tmCanControlBall = tree->getEntry<int>("control_state") == 3 &&
-        (selfRole == "striker" || selfGoalieClaimsBall) && strategyBallKnown && canPursueBall;
+        (selfRole == "striker" || selfGoalieClaimsBall || activeKickSource) &&
+        (strategyBallKnown || activeKickSource) && canPursueBall;
     if (config->enableCom) {
         team_cooperation::Settings settings;
         settings.freshMs = COM_TIMEOUT;
@@ -1007,15 +1011,15 @@ void Brain::handleCooperation() {
         peers.push_back({selfId, data->tmImAlive,
             data->tmCanControlBall,
             data->tmImInVisualKick, data->tmMyCost, 0.0,
-            data->ballArbitration.announcement(teamNowMs)});
+            data->ballArbitration.announcement(teamNowMs),
+            hasFreshLocalBall() && data->ballDetected && data->ball.range <= 1.2});
         for (int tmIdx : aliveTmIdxs) {
             const auto &tm = data->tmStatus[tmIdx];
-            const bool goalieClaim = tm.role == "goal_keeper" &&
-                (tm.isInVisualKick || (tm.ballLocationKnown &&
-                 goalieCanClaim(tm.ballPosToField.x, tm.ballPosToField.y, tm.ballRange)));
             peers.push_back({tmIdx + 1, tm.isAlive,
-                tm.canControl && (tm.role == "striker" || goalieClaim) && tm.ballLocationKnown,
-                tm.isInVisualKick, tm.cost, teamNowMs - tm.teamReceivedMs, tm.ownership});
+                // 候选资格由发送方判断，接收方不再用滞后的角色/球位二次剔除。
+                tm.canControl,
+                tm.isInVisualKick, tm.cost, teamNowMs - tm.teamReceivedMs, tm.ownership,
+                tm.ballDetected && tm.ballLocationKnown && tm.ballRange <= 1.2});
         }
         // Use the referee's on-field roster, not each receiver's visible peers.
         const int quorum = std::max(1, gcAliveCount / 2 + 1);
@@ -1035,8 +1039,20 @@ void Brain::handleCooperation() {
                       (sharedBallKnown ? "shared" : "expired") :
                       (hasFreshLocalBall() ? "local" : "none"))
                   << " shared_from=" << data->tmBallPlayerId
+                  << " role=" << selfRole
+                  << " control=" << tree->getEntry<int>("control_state")
+                  << " ball_range=" << data->ball.range
+                  << " ball_field=(" << data->ball.posToField.x << "," << data->ball.posToField.y << ")"
+                  << " goalie_claim=" << selfGoalieClaimsBall
                   << " candidate=" << data->tmCanControlBall
                   << " owner=" << data->teamOwnership.owner << " lead=" << data->tmImLead;
+        if (config->enableCom) {
+            std::cout << " coordinator=" << data->teamOwnership.coordinator
+                      << " phase=" << data->ballArbitration.phase()
+                      << " confirmations=" << data->ballArbitration.agreements()
+                      << "/" << data->ballArbitration.quorum()
+                      << " fresh=" << data->ballArbitration.freshCount();
+        }
         for (int i = 0; i < numOfPlayers; ++i) {
             if (i == selfIdx) continue;
             const auto &tm = data->tmStatus[i];
@@ -3821,6 +3837,88 @@ double Brain::teammateDistance() {
         if (std::isfinite(range)) result = std::min(result, range);
     }
     return result;
+}
+
+bool Brain::teammateBlocksKick() {
+    if (!tree->getEntry<bool>("odom_calibrated")) return false;
+    const double nowMs = team_cooperation::steadyNowMs();
+    const double freshMs = std::clamp(get_parameter(
+        "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const double stopDistance = std::clamp(get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+    const double direction = data->kickDir - data->robotPoseToField.theta;
+    for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+        const auto &tm = data->tmStatus[i];
+        const double age = nowMs - tm.teamReceivedMs;
+        if (i + 1 == config->playerId || !tm.isAlive || age < 0.0 || age > freshMs) continue;
+        const auto relative = data->field2robot(tm.robotPoseToField);
+        if (team_cooperation::blocksKick({relative.x, relative.y},
+                {data->ball.posToRobot.x, data->ball.posToRobot.y}, direction, stopDistance)) return true;
+    }
+    return false;
+}
+
+void Brain::updateBallSpaceYield() {
+    const bool wasYielding = tree->getEntry<bool>("yield_ball_space");
+    tree->setEntry<bool>("yield_ball_space", false);
+    data->teamYieldVelocity = {};
+    const int ownerId = data->teamOwnership.owner;
+    if (!config->enableCom || !data->tmImAlive || data->tmImInVisualKick ||
+        ownerId <= 0 || ownerId > config->numOfPlayers || ownerId == config->playerId ||
+        data->teamOwnership.leaseMs == 0 || tree->getEntry<int>("control_state") != 3 ||
+        tree->getEntry<string>("gc_game_state") != "PLAY" ||
+        tree->getEntry<string>("gc_game_sub_state_type") != "NONE" ||
+        tree->getEntry<bool>("gc_play_stopped") || tree->getEntry<bool>("penalty_kick_active") ||
+        tree->getEntry<bool>("wait_for_opponent_kickoff") || tree->getEntry<bool>("ball_out")) return;
+    const double nowMs = team_cooperation::steadyNowMs();
+    const double freshMs = std::clamp(get_parameter(
+        "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+    const auto &owner = data->tmStatus[ownerId - 1];
+    const double ownerAge = nowMs - owner.teamReceivedMs;
+    if (!owner.isAlive || ownerAge < 0.0 || ownerAge > freshMs) return;
+    const auto &pose = data->robotPoseToField;
+    const team_cooperation::Position self{pose.x, pose.y};
+    const team_cooperation::Position ownerPos{owner.robotPoseToField.x, owner.robotPoseToField.y};
+    const team_cooperation::Position ball = owner.ballLocationKnown
+        ? team_cooperation::Position{owner.ballPosToField.x, owner.ballPosToField.y}
+        : ownerPos; // SDK 短暂记忆期间不把占位球坐标当成让行路线
+    const double stop = std::clamp(get_parameter(
+        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+    // 退出让行的距离稍大，避免在边界来回切换守门/接应和让行。
+    const bool needsYield = team_cooperation::mustYield(self, ownerPos, ball,
+        stop + (wasYielding ? 0.35 : 0.2));
+    const auto &fd = config->fieldDimensions;
+    const double clearanceMargin = std::clamp(get_parameter(
+        "strategy.goalie_clearance_area_margin").as_double(), 0.0, 0.7);
+    // 非主控守门员让开后等待这次清球结束，不能立刻回到原拦截点
+    // 再挡住主控。授权改变、球离开禁区或主控走远后恢复守门。
+    const bool holdClear = wasYielding && data->yieldOwnerId == ownerId &&
+        tree->getEntry<string>("player_role") == "goal_keeper" &&
+        (owner.ballLocationKnown || owner.isInVisualKick) &&
+        kick_strategy::inGoalieClearanceArea(ball.x, ball.y, fd.length,
+            fd.penaltyAreaLength, fd.penaltyAreaWidth, clearanceMargin) &&
+        std::hypot(self.x - ownerPos.x, self.y - ownerPos.y) < 2.0;
+    if (!needsYield && !holdClear) return;
+    data->yieldOwnerId = ownerId;
+    tree->setEntry<bool>("yield_ball_space", true);
+    if (!needsYield) return;
+    std::vector<team_cooperation::Position> others;
+    for (int i = 0; i < config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+        const auto &tm = data->tmStatus[i];
+        const double age = nowMs - tm.teamReceivedMs;
+        if (i + 1 == config->playerId || !tm.isAlive || age < 0.0 || age > freshMs) continue;
+        others.push_back({tm.robotPoseToField.x - pose.x, tm.robotPoseToField.y - pose.y});
+    }
+    const double slow = std::max(stop + 0.1, get_parameter(
+        "strategy.cooperation.teammate_slow_distance").as_double());
+    const double approach = std::clamp(get_parameter(
+        "strategy.cooperation.teammate_approach_speed").as_double(), 0.0, 0.6);
+    const auto velocity = team_cooperation::yieldVelocity(self, ownerPos, ball, others,
+        config->fieldDimensions.length, config->fieldDimensions.width, stop, slow,
+        approach, config->playerId % 2 == 0 ? 1 : -1);
+    data->teamYieldVelocity = {
+        velocity.x * std::cos(pose.theta) + velocity.y * std::sin(pose.theta),
+        -velocity.x * std::sin(pose.theta) + velocity.y * std::cos(pose.theta), 0.0};
 }
 
 double Brain::distToObstacle(double angle) {

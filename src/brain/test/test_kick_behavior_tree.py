@@ -1,5 +1,6 @@
 """Check that match decisions actually reach a motion node in the shipped tree."""
 import ast
+import re
 from pathlib import Path
 import unittest
 import xml.etree.ElementTree as ET
@@ -10,9 +11,10 @@ TREES = Path(__file__).resolve().parents[1] / "behavior_trees" / "subtrees"
 
 def condition_matches(expression, variables):
     expression = expression.replace("||", " or ").replace("&&", " and ")
+    expression = re.sub(r"!(?!=)", "not ", expression).strip()
     parsed = ast.parse(expression, mode="eval")
     allowed = (ast.Expression, ast.BoolOp, ast.Or, ast.And, ast.Compare,
-               ast.Eq, ast.NotEq, ast.Name, ast.Load, ast.Constant)
+               ast.Eq, ast.NotEq, ast.Name, ast.Load, ast.Constant, ast.UnaryOp, ast.Not)
     if any(not isinstance(node, allowed) for node in ast.walk(parsed)):
         raise ValueError(f"Unsupported motion condition: {expression}")
     return bool(eval(compile(parsed, "<BT condition>", "eval"), {"__builtins__": {}}, variables))
@@ -29,6 +31,28 @@ def selected_actions(node, variable, value, action_types):
 
 
 class MatchMotionRouting(unittest.TestCase):
+    def test_yield_preempts_both_roles(self):
+        root = ET.parse(TREES.parent / "game.xml").getroot()
+        match = root.find(".//ReactiveSequence[@name='比赛']")
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0].get("_while"), "yield_ball_space")
+        self.assertEqual(match[1].get("_while"), "!yield_ball_space")
+        self.assertEqual([n.tag for n in match[0]], ["SubTree", "YieldBallSpace"])
+        for yielding in (True, False):
+            for role, expected in (("striker", "StrikerPlay"), ("goal_keeper", "GoalKeeperPlay")):
+                with self.subTest(yielding=yielding, role=role):
+                    states = {"yield_ball_space": yielding, "player_role": role}
+                    actions = []
+                    def visit(node):
+                        if node.get("_while") and not condition_matches(node.get("_while"), states):
+                            return
+                        if node.tag == "YieldBallSpace": actions.append(node.tag)
+                        elif node.tag == "SubTree" and node.get("ID") in ("StrikerPlay", "GoalKeeperPlay"):
+                            actions.append(node.get("ID"))
+                        for child in node: visit(child)
+                    for branch in match: visit(branch)
+                    self.assertEqual(actions, ["YieldBallSpace" if yielding else expected])
+
     def test_striker_decisions_have_one_action(self):
         tree = ET.parse(TREES / "subtree_striker_play.xml").getroot()
         expected = {

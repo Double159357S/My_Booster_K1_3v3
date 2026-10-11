@@ -234,6 +234,8 @@ public:
      */
     double distToObstacle(double angle);
     double teammateDistance();
+    bool teammateBlocksKick();
+    void updateBallSpaceYield();
 
     /**
      * @brief 计算前方角度范围x米内是否有障碍物

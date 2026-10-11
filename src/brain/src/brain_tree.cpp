@@ -192,6 +192,7 @@ void BrainTree::init()
     REGISTER_BUILDER(RoleSwitchIfNeeded)
 
     REGISTER_BUILDER(Assist)
+    REGISTER_BUILDER(YieldBallSpace)
     REGISTER_BUILDER(KickoffStand)
 
     // Action Nodes for debug
@@ -239,6 +240,7 @@ void BrainTree::initEntry()
 
     // 双机通讯相关
     setEntry<bool>("is_lead", true); // true 时代表自己为控球, false 时代表自己不控球, 而是给其它队员打配合.
+    setEntry<bool>("yield_ball_space", false);
     setEntry<string>("goalie_mode", "guard_idle");
     setEntry<bool>("goalie_block_kick_active", false);
     setEntry<bool>("penalty_kick_active", false);
@@ -1112,6 +1114,16 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     return NodeStatus::SUCCESS;
 }
 
+NodeStatus YieldBallSpace::tick() {
+    const auto &velocity = brain->data->teamYieldVelocity;
+    brain->client->setVelocity(velocity.x, velocity.y, 0.0, false, false, false);
+    RCLCPP_INFO_THROTTLE(brain->get_logger(), *brain->get_clock(), 1000,
+        "[Yield] player=%d owner=%d role=%s vx=%.2f vy=%.2f",
+        brain->config->playerId, brain->data->teamOwnership.owner,
+        brain->tree->getEntry<string>("player_role").c_str(), velocity.x, velocity.y);
+    return NodeStatus::SUCCESS;
+}
+
 NodeStatus Assist::tick() {
     auto log = [=](string msg) {
         brain->log->setTimeNow();
@@ -1947,8 +1959,7 @@ NodeStatus Analyze2::tick()
     const double cooldownRemaining = RLVisionKick::getLastExitTime().nanoseconds() == 0
         ? 0.0 : std::max(0.0, cooldownMs - brain->msecsSince(RLVisionKick::getLastExitTime()));
     const double teammateDistance = brain->teammateDistance();
-    const double teammateStopDistance = std::clamp(brain->get_parameter(
-        "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+    const bool kickSpaceBlocked = brain->teammateBlocksKick();
 
     const double desiredClearanceDir = kick_geometry::directionToOpponentGoal(
         source.field.x, source.field.y, brain->config->fieldDimensions.length / 2.0);
@@ -2005,7 +2016,7 @@ NodeStatus Analyze2::tick()
     } else if (!clearanceReady) {
         nextMode = brain->data->ballDetected ? "guard_defend" : "guard_idle";
         _interceptKickDisabled = false;
-    } else if (!sessionActive && teammateDistance < teammateStopDistance) {
+    } else if (!sessionActive && source.range <= maxRange && kickSpaceBlocked) {
         nextMode = "clear_wait"; // 等队友让开，不能一边等待一边继续绕球
     } else if (currentMode == "intercept_kick" && sessionActive && !_interceptKickDisabled) {
         nextMode = "intercept_kick";
@@ -2044,6 +2055,7 @@ NodeStatus Analyze2::tick()
                                         source.predicted ? "predicted" : "none")
                   << " cooldown_ms=" << cooldownRemaining
                   << " teammate_distance=" << teammateDistance
+                  << " kick_space_blocked=" << kickSpaceBlocked
                   << " active=" << active << std::endl;
         _lastConsoleMs = consoleMs;
     }
@@ -2306,15 +2318,13 @@ NodeStatus RLVisionKick::onStart()
         _progressKickDir = brain->data->kickDir;
     }
 
-    const double clearance = brain->get_parameter(
-        "strategy.cooperation.teammate_stop_distance").as_double();
-    if (!brain->data->tmImLead || brain->teammateDistance() < clearance ||
+    if (!brain->data->tmImLead || brain->teammateBlocksKick() ||
         !visualKickBallUsable(brain, goalieKick) ||
         (!goalieKick && !strikerVisualKickAligned(brain))) {
         RCLCPP_INFO_THROTTLE(brain->get_logger(), *brain->get_clock(), 1000,
-            "[RLVisionKick] start deferred: lead=%d teammate_distance=%.2f ball_usable=%d goalie=%d",
+            "[RLVisionKick] start deferred: lead=%d teammate_distance=%.2f ball_usable=%d goalie=%d kick_space_blocked=%d",
             brain->data->tmImLead, brain->teammateDistance(),
-            visualKickBallUsable(brain, goalieKick), goalieKick);
+            visualKickBallUsable(brain, goalieKick), goalieKick, brain->teammateBlocksKick());
         brain->data->tmImInVisualKick = false;
         brain->tree->setEntry<bool>("goalie_block_kick_active", false);
         brain->data->goalieVisualKickSubState = "none";
@@ -2372,11 +2382,11 @@ NodeStatus RLVisionKick::onRunning()
         return NodeStatus::SUCCESS;
     }
 
-    const double clearance = brain->get_parameter(
-        "strategy.cooperation.teammate_stop_distance").as_double();
-    if (!_pendingRobocupWalk &&
-        (!brain->data->tmImLead || brain->teammateDistance() < clearance)) {
-        return beginExit("ownership revoked or teammate too close");
+    if (!_pendingRobocupWalk && !brain->data->tmImLead) {
+        return beginExit("ownership revoked");
+    }
+    if (!_pendingRobocupWalk && brain->teammateBlocksKick()) {
+        return beginExit("teammate blocks kick space");
     }
 
     if (_isDecelerating) {

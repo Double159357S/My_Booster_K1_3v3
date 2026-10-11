@@ -76,8 +76,15 @@
                         </ReactiveSequence>
 
                         <ReactiveSequence _while="gc_game_state=='PLAY'" name="比赛">
-                            <SubTree ID="StrikerPlay" _autoremap="true" _while="player_role == 'striker'" />
-                            <SubTree ID="GoalKeeperPlay" _autoremap="true" _while="player_role == 'goal_keeper'" />
+                            <!-- 让行先于定位、接应和守门拦截，避免主控等队友而队友仍挤向门前。 -->
+                            <ReactiveSequence _while="yield_ball_space" name="非主控让出清球通道">
+                                <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+                                <YieldBallSpace />
+                            </ReactiveSequence>
+                            <ReactiveSequence _while="!yield_ball_space">
+                                <SubTree ID="StrikerPlay" _autoremap="true" _while="player_role == 'striker'" />
+                                <SubTree ID="GoalKeeperPlay" _autoremap="true" _while="player_role == 'goal_keeper'" />
+                            </ReactiveSequence>
                         </ReactiveSequence>
 
                         <ReactiveSequence _while="gc_game_state=='END'" name="比赛结束">

@@ -34,6 +34,7 @@ struct Peer {
     double cost = std::numeric_limits<double>::infinity();
     double ageMs = std::numeric_limits<double>::infinity();
     Announcement decision;
+    bool nearVisibleBall = false; // 本机直接看见近球，优先于只凭共享坐标接近
 };
 
 struct Settings {
@@ -50,6 +51,10 @@ struct Settings {
 // itself acts. Handoffs revoke the old grant before granting the next owner.
 class Arbitration {
 public:
+    const char *phase() const { return phase_; }
+    int agreements() const { return agreements_; }
+    int quorum() const { return quorum_; }
+    int freshCount() const { return freshCount_; }
     Announcement announcement(double nowMs) const {
         auto result = decision_;
         result.leaseMs = result.owner > 0
@@ -70,6 +75,10 @@ public:
             if (coordinator == 0 || p.id < coordinator) coordinator = p.id;
         }
         quorum = std::max(1, quorum);
+        quorum_ = quorum;
+        freshCount_ = freshCount;
+        agreements_ = 0;
+        phase_ = "no_quorum";
         if (coordinator != decision_.coordinator) {
             const int previousOwner = decision_.owner;
             decision_ = {coordinator, 0, decision_.revision + 1, 0};
@@ -98,8 +107,10 @@ public:
             const Peer *best = nullptr;
             for (const auto &p : peers) {
                 if (!candidate(p)) continue;
-                if (!best || p.cost < best->cost - 0.05 ||
-                    (std::fabs(p.cost - best->cost) <= 0.05 && p.id < best->id)) {
+                if (!best || (p.nearVisibleBall && !best->nearVisibleBall) ||
+                    (p.nearVisibleBall == best->nearVisibleBall &&
+                     (p.cost < best->cost - 0.05 ||
+                      (std::fabs(p.cost - best->cost) <= 0.05 && p.id < best->id)))) {
                     best = &p;
                 }
             }
@@ -107,8 +118,11 @@ public:
             if (decision_.owner > 0 && (!owner || !candidate(*owner))) {
                 revoke(nowMs, settings);
             } else if (decision_.owner > 0 && best && best->id != decision_.owner &&
-                       !owner->kicking && nowMs - ownerSince_ >= settings.holdMs &&
-                       best->cost + settings.switchMargin < owner->cost) {
+                       !owner->kicking &&
+                       ((best->nearVisibleBall && !owner->nearVisibleBall) ||
+                        (best->nearVisibleBall == owner->nearVisibleBall &&
+                         nowMs - ownerSince_ >= settings.holdMs &&
+                         best->cost + settings.switchMargin < owner->cost))) {
                 if (challenger_ != best->id) {
                     challenger_ = best->id;
                     challengeSince_ = nowMs;
@@ -125,7 +139,10 @@ public:
                     sameDecision(old->decision, decision_);
                 const bool stopped = !takeover_ && acknowledged &&
                     nowMs - revokedAt_ >= settings.exitGraceMs;
-                if (!stopped && nowMs < revokeDeadline_) return false;
+                if (!stopped && nowMs < revokeDeadline_) {
+                    phase_ = "handoff";
+                    return false;
+                }
                 revoking_ = false;
                 takeover_ = false;
             }
@@ -139,7 +156,10 @@ public:
         } else {
             const Peer *authority = getPeer(coordinator);
             if (!authority || authority->decision.coordinator != coordinator ||
-                authority->decision.leaseMs > settings.leaseMs) return false;
+                authority->decision.leaseMs > settings.leaseMs) {
+                phase_ = "no_authority";
+                return false;
+            }
             decision_ = authority->decision;
             // A stored packet must not renew a grant on every 100 Hz tick.
             validUntil_ = nowMs - authority->ageMs + decision_.leaseMs;
@@ -152,8 +172,13 @@ public:
             }
         }
         const Peer *self = getPeer(selfId);
-        return self && candidate(*self) && decision_.owner == selfId &&
+        agreements_ = agreements;
+        const bool authorized = self && candidate(*self) && decision_.owner == selfId &&
             decision_.owner > 0 && nowMs < validUntil_ && agreements >= quorum;
+        phase_ = authorized ? "ready" : decision_.owner == 0 ? "no_candidate" :
+            decision_.owner != selfId ? "support" :
+            !self || !candidate(*self) ? "ineligible" : "awaiting_echo";
+        return authorized;
     }
 
 private:
@@ -179,6 +204,8 @@ private:
     bool takeover_ = false;
     double revokedAt_ = 0.0;
     double revokeDeadline_ = 0.0;
+    int agreements_ = 0, quorum_ = 1, freshCount_ = 0;
+    const char *phase_ = "idle";
 };
 
 struct Position { double x = 0.0, y = 0.0; };
@@ -261,6 +288,60 @@ inline void limitTeamVelocity(double &vx, double &vy, double &omega,
             break;
         }
     }
+}
+
+// 视觉踢球会移动脚和身体。很近的队友始终阻止启动；其余只检查
+// 到球的路线和向前清球的通道，后方队友不再触发整圈停球。
+inline bool blocksKick(Position teammate, Position ball, double direction,
+                       double stopDistance) {
+    const double range = std::hypot(teammate.x, teammate.y);
+    if (range >= stopDistance) return false;
+    if (range < stopDistance * 0.6) return true;
+    const double corridor = stopDistance * 0.6;
+    const Position forward{std::cos(direction), std::sin(direction)};
+    return pointSegmentDistance(teammate, {}, ball) < corridor ||
+        pointSegmentDistance(teammate, {}, forward) < corridor;
+}
+
+inline bool mustYield(Position self, Position owner, Position ball,
+                      double clearance) {
+    return std::hypot(self.x - owner.x, self.y - owner.y) < clearance ||
+        (pointSegmentDistance(self, owner, ball) < clearance &&
+         std::hypot(self.x - ball.x, self.y - ball.y) < 1.6);
+}
+
+// 从可行方向中选择离主控和到球路线更远的一步。先应用相同的
+// 多队友避碰约束，避免普通 Assist 的目标或避障方向把让行者卡住。
+// 返回场地坐标速度；没有安全出口时保持停止，不强行穿过队友。
+inline Position yieldVelocity(Position self, Position owner, Position ball,
+                              const std::vector<Position> &others,
+                              double fieldLength, double fieldWidth,
+                              double stopDistance, double slowDistance,
+                              double approachLimit, int preferredSide) {
+    Position best{};
+    double bestScore = 0.0;
+    const double before = std::hypot(self.x - owner.x, self.y - owner.y);
+    const double corridorBefore = pointSegmentDistance(self, owner, ball);
+    auto outside = [&](Position p) {
+        return std::max(0.0, std::fabs(p.x) - (fieldLength / 2.0 - 0.2)) +
+            std::max(0.0, std::fabs(p.y) - (fieldWidth / 2.0 - 0.2));
+    };
+    for (int i = 0; i < 32; ++i) {
+        const double angle = i * 2.0 * std::acos(-1.0) / 32.0;
+        double vx = 0.4 * std::cos(angle), vy = 0.4 * std::sin(angle), omega = 0.0;
+        limitTeamVelocity(vx, vy, omega, others, stopDistance, slowDistance,
+            approachLimit, 0.4, 0.4);
+        if (std::hypot(vx, vy) < 0.25) continue;
+        const Position next{self.x + vx, self.y + vy};
+        if (outside(next) > outside(self) + 1e-6) continue;
+        const double gain = std::hypot(next.x - owner.x, next.y - owner.y) - before;
+        if (gain < 0.01) continue;
+        const double score = gain + 0.5 *
+            (pointSegmentDistance(next, owner, ball) - corridorBefore) +
+            0.03 * preferredSide * vy;
+        if (score > bestScore) { best = {vx, vy}; bestScore = score; }
+    }
+    return best;
 }
 
 } // namespace team_cooperation

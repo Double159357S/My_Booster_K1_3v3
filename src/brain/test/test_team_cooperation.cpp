@@ -24,6 +24,7 @@ struct Network {
     struct Node {
         Arbitration arbitration;
         bool alive = true, canControl = true, kicking = false, owns = false;
+        bool nearVisibleBall = false;
         double cost = 4.0, exitUntil = 0.0;
         std::array<Peer, 3> received{};
         std::array<double, 3> receivedAt{{-10000, -10000, -10000}};
@@ -63,7 +64,7 @@ struct Network {
             for (int i = 0; i < 3; ++i) {
                 auto &n = nodes[i];
                 std::vector<Peer> peers{{i + 1, n.alive, n.canControl, n.kicking,
-                    n.cost, 0.0, n.arbitration.announcement(now)}};
+                    n.cost, 0.0, n.arbitration.announcement(now), n.nearVisibleBall}};
                 for (int j = 0; j < 3; ++j) if (i != j) {
                     auto peer = n.received[j];
                     peer.ageMs = now - n.receivedAt[j];
@@ -85,7 +86,7 @@ struct Network {
                     auto &n = nodes[i];
                     packets.push_back({i, j, now + delay,
                         {i + 1, n.alive, n.canControl, n.kicking || now < n.exitUntil,
-                         n.cost, now + 1.0, n.arbitration.announcement(now)}});
+                         n.cost, now + 1.0, n.arbitration.announcement(now), n.nearVisibleBall}});
                 }
             }
         }
@@ -381,6 +382,64 @@ void geometryTests() {
         }
     }
 }
+
+void clearanceLivenessTests() {
+    Network net;
+    net.run(3000);
+    check(net.owner() == 2, "initial striker owner missing");
+    // 守门员调整朝向的成本更高，但已直接看见脚边球；共享球的
+    // 旧主控不能一直持有授权并停在 0.65 m 外等待自己的视觉。
+    net.nodes[0].canControl = true;
+    net.nodes[0].nearVisibleBall = true;
+    net.nodes[0].cost = 9.0;
+    net.run(1800);
+    check(net.owner() == 1, "visible near-ball goalie lost to blind lower-cost striker");
+    net.nodes[0].kicking = true;
+    net.nodes[1].nearVisibleBall = true;
+    net.nodes[1].cost = 1.0;
+    net.run(2500);
+    check(net.owner() == 1, "cluster interrupted active owner's kick");
+
+    const Position ball{0.35, 0.0};
+    check(!blocksKick({-0.65, 0.0}, ball, 0.0, 0.8), "rear teammate blocked forward clearance");
+    check(!blocksKick({0.0, 0.65}, ball, 0.0, 0.8), "side teammate blocked clear kick corridor");
+    check(blocksKick({0.65, 0.0}, ball, 0.0, 0.8), "forward teammate did not block kick");
+    check(blocksKick({-0.3, 0.0}, ball, 0.0, 0.8), "body contact zone did not stop kick");
+    check(blocksKick({0.0, 0.65}, {0.0, 0.35}, std::acos(-1.0) / 2.0, 0.8),
+          "rotated kick corridor ignored side teammate");
+
+    // 禁区内三台聚集：非主控守门员也必须退出拦截逻辑主动让行。
+    // 两个让行者同时朝两侧离开，不能只验证它们最终目标点安全。
+    const Position owner{-3.8, 0.0}, fieldBall{-3.3, 0.0};
+    std::array<Position, 2> supporters{{{-3.5, 0.2}, {-3.55, -0.2}}};
+    for (int tick = 0; tick < 100; ++tick) {
+        const auto before = supporters;
+        for (int i = 0; i < 2; ++i) {
+            const auto self = before[i], other = before[1 - i];
+            if (!mustYield(self, owner, fieldBall, 1.15)) continue;
+            const std::vector<Position> others{{owner.x - self.x, owner.y - self.y},
+                {other.x - self.x, other.y - self.y}};
+            const auto velocity = yieldVelocity(self, owner, fieldBall, others,
+                9.0, 6.0, 0.8, 1.3, 0.4, i == 0 ? 1 : -1);
+            check(std::hypot(velocity.x, velocity.y) > 0.1,
+                  "cluster left safe yielding robot stationary");
+            supporters[i] = {self.x + velocity.x * 0.1, self.y + velocity.y * 0.1};
+            check(std::hypot(supporters[i].x - owner.x, supporters[i].y - owner.y) >=
+                std::hypot(self.x - owner.x, self.y - owner.y), "yield approached owner");
+        }
+        check(std::hypot(supporters[0].x - supporters[1].x,
+                         supporters[0].y - supporters[1].y) >= 0.4 - 1e-8,
+              "simultaneous yield moved teammates into each other");
+    }
+    for (const auto &p : supporters) {
+        check(!mustYield(p, owner, fieldBall, 1.15), "yield never cleared goalie corridor");
+    }
+    const Position boundary{-4.25, 0.1};
+    const auto escape = yieldVelocity(boundary, owner, fieldBall,
+        {{owner.x - boundary.x, owner.y - boundary.y}}, 9.0, 6.0, 0.8, 1.3, 0.4, 1);
+    check(std::hypot(escape.x, escape.y) > 0.1 && boundary.x + escape.x >= -4.3,
+          "goal-line yielding was clipped into a permanent wait");
+}
 } // namespace
 
 int main() {
@@ -390,6 +449,7 @@ int main() {
         sharedBallTests();
         goalieRoleTests();
         geometryTests();
+        clearanceLivenessTests();
         std::cout << "Team cooperation: arbitration, shared ball, goalie roles, packet decoding and geometry passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

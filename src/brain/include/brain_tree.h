@@ -15,6 +15,16 @@ class Brain;
 using namespace std;
 using namespace BT;
 
+class YieldBallSpace : public SyncActionNode {
+public:
+    YieldBallSpace(const string &name, const NodeConfig &config, Brain *argBrain)
+        : SyncActionNode(name, config), brain(argBrain) {}
+    static PortsList providedPorts() { return {}; }
+    NodeStatus tick() override;
+private:
+    Brain *brain;
+};
+
 class BrainTree
 {
 public:
