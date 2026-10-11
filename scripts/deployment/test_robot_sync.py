@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 from types import SimpleNamespace
@@ -20,6 +21,27 @@ class RobotSyncTests(unittest.TestCase):
         reader = mock.Mock(side_effect=['192.168.133', '.43'])
         self.assertEqual(sync.select_hosts(reader=reader), ['192.168.133.43'])
         self.assertEqual(reader.call_count, 2)
+
+    def test_suffix_list_in_prefix_is_rejected_before_suffix_prompt(self):
+        reader = mock.Mock(side_effect=AssertionError('Unexpected suffix prompt'))
+        with self.assertRaisesRegex(ValueError, '尾号请在下一项'):
+            sync.select_hosts(ip_prefix='.43,.21', reader=reader)
+        reader.assert_not_called()
+
+    def test_prefix_cli_validates_without_authentication_or_connections(self):
+        backend = str(Path(__file__).with_name('robot_sync.py'))
+        for prefix, expected in [('192.168.133', 0), ('192.168.133.', 0),
+                                 ('.43,.21', 1), ('192.168.999', 1)]:
+            with self.subTest(prefix=prefix):
+                result = subprocess.run([sys.executable, backend, '--validate-prefix',
+                                         '--ip-prefix', prefix], capture_output=True,
+                                        encoding='utf-8', timeout=10)
+                self.assertEqual(result.returncode, expected)
+                if expected == 0:
+                    self.assertEqual(result.stdout.strip(), '192.168.133')
+                else:
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('192.168.133', result.stderr)
 
     def test_suffix_formats_select_only_explicitly_entered_robots(self):
         self.assertEqual(sync.select_hosts(ip_prefix='192.168.133', robot_ids='.43，.21'),

@@ -37,6 +37,20 @@ TEXT_SUFFIXES = {'.cpp', '.cc', '.c', '.h', '.hpp', '.sh', '.py', '.xml', '.yaml
                  '.yml', '.cmake', '.md', '.txt', '.json', '.ps1', '.msg', '.srv', '.cfg'}
 
 
+def validate_ip_prefix(value):
+    """Validate the subnet before asking for robot suffixes or connecting."""
+    prefix = (value or '').strip().rstrip('.')
+    error_message = (f'IP 段应填写前三段数字，例如 192.168.133；'
+                     f'.43,.21 这样的机器人尾号请在下一项填写。收到：{value!r}')
+    if len(prefix.split('.')) != 3:
+        raise ValueError(error_message)
+    try:
+        ipaddress.IPv4Address(prefix + '.1')
+    except ipaddress.AddressValueError as error:
+        raise ValueError(error_message) from error
+    return prefix
+
+
 def select_hosts(hosts=None, ip_prefix=None, robot_ids=None, reader=input):
     """Only addresses entered by the operator can become sync targets."""
     if hosts is not None:
@@ -50,13 +64,7 @@ def select_hosts(hosts=None, ip_prefix=None, robot_ids=None, reader=input):
     else:
         if ip_prefix is None:
             ip_prefix = reader('请输入 IP 段，例如 192.168.133：')
-        prefix = ip_prefix.strip().rstrip('.')
-        if len(prefix.split('.')) != 3:
-            raise ValueError('IP 段应为三段数字，例如 192.168.133')
-        try:
-            ipaddress.IPv4Address(prefix + '.1')
-        except ipaddress.AddressValueError as error:
-            raise ValueError('IP 段无效，例如应输入 192.168.133') from error
+        prefix = validate_ip_prefix(ip_prefix)
         if robot_ids is None:
             robot_ids = reader('请输入机器人尾号，例如 .43 或 .43,.21：')
         suffixes = [s for s in re.split(r'[,，;；\s]+', robot_ids.strip()) if s]
@@ -628,6 +636,7 @@ def main():
     parser.add_argument('--ip-prefix')
     parser.add_argument('--robot-ids')
     parser.add_argument('--select-only', action='store_true')
+    parser.add_argument('--validate-prefix', action='store_true')
     parser.add_argument('--user', default='booster')
     parser.add_argument('--host-key')
     parser.add_argument('--plink')
@@ -644,7 +653,9 @@ def main():
     parser.add_argument('--archive-hash')
     args = parser.parse_args()
     try:
-        if args.select_only:
+        if args.validate_prefix:
+            print(validate_ip_prefix(args.ip_prefix))
+        elif args.select_only:
             print(json.dumps(select_hosts(args.hosts, args.ip_prefix, args.robot_ids)))
         else:
             (remote_agent if args.remote_agent else run_local)(args)

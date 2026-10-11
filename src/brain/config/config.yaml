@@ -31,7 +31,7 @@ brain_node:
       ball_memory_timeout: 3.0 
       ball_lost_msecs: 1000.0
       tm_ball_dist_threshold: 1.5  
-      limit_near_ball_speed: true
+      limit_near_ball_speed: true #靠近球时减速（普通追球时，距离球 小于 2 米，将前进速度指令上限限制为 0.6 m/s，减少冲过球或撞到附近队友。）
       near_ball_speed_limit: 0.6 
       near_ball_range: 2.0 
       soft_kickoff: true          # 所有开球(比赛开球/任意球/角球/门球)均用软速度，降低出界/失误风险
@@ -149,9 +149,9 @@ brain_node:
       avoid_during_kick: false 
       kick_ao_safe_dist: 1.5 
       kick_ao_use_shoot: false 
-      avoid_during_chase: true
-      chase_ao_safe_dist: 1.5 
-      always_turn_left: false 
+      avoid_during_chase: true  # 追球时是否避免障碍物
+      chase_ao_safe_dist: 1.5 # 追球时安全距离
+      always_turn_left: false  # 是否 always_turn_left: false 时，追球时是否总向左转
 
     RLVisionKick:
       visual_kick_version: kV2 # kV1 | kV2 修改此参数可更改visualkick调用版本

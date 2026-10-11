@@ -62,8 +62,25 @@ try {
         if ($IpPrefix -or $RobotIds) { throw '不能同时指定 -Robots 和 IP 段/尾号。' }
         $selectionArguments = @('--hosts', ($Robots -join ','))
     } else {
-        if (-not $IpPrefix) { $IpPrefix = Read-Host '请输入 IP 段，例如 192.168.133' }
-        if (-not $RobotIds) { $RobotIds = Read-Host '请输入要同步的机器人尾号，例如 .43 或 .43,.21' }
+        # Validate the prefix before asking for suffixes. Interactive mistakes
+        # can be corrected without restarting or connecting to any robot.
+        $askForIpPrefix = -not $PSBoundParameters.ContainsKey('IpPrefix')
+        while ($true) {
+            if ($askForIpPrefix) {
+                $IpPrefix = Read-Host '请输入 IP 段（前三段，例如 192.168.133）'
+            }
+            $validatedPrefix = & $python.Source $backend '--validate-prefix' '--ip-prefix' $IpPrefix
+            if ($LASTEXITCODE -eq 0) {
+                $IpPrefix = ($validatedPrefix -join "`n")
+                break
+            }
+            if (-not $askForIpPrefix) {
+                throw 'IP 段参数无效，请填写 192.168.133 这样的前三段数字。尚未连接任何机器人。'
+            }
+            Write-Host '请重新输入 IP 段；机器人尾号将在下一项询问。' -ForegroundColor Yellow
+        }
+        Write-Host ("IP 段：$IpPrefix") -ForegroundColor Cyan
+        if (-not $RobotIds) { $RobotIds = Read-Host '请输入机器人尾号（最后一段，例如 .43 或 .43,.21）' }
         $selectionArguments = @('--ip-prefix', $IpPrefix, '--robot-ids', $RobotIds)
     }
     $selectionJson = & $python.Source $backend '--select-only' @selectionArguments
