@@ -1,3 +1,4 @@
+#include "utils/team_network.h"
 #include "brain.h"
 #include "brain_communication.h"
 
@@ -144,9 +145,10 @@ void BrainCommunication::initTeamCommunication()
         if (bind(_team_socket, reinterpret_cast<sockaddr *>(&receiveAddr), sizeof(receiveAddr)) < 0)
             throw std::runtime_error(format("bind failed: %s (port=%d)", strerror(errno), _team_udp_port));
 
-        _team_broadcast_addr.sin_family = AF_INET;
-        _team_broadcast_addr.sin_addr.s_addr = INADDR_BROADCAST;
-        _team_broadcast_addr.sin_port = htons(_team_udp_port);
+        _team_broadcast_addrs = team_network::broadcastTargets(_team_udp_port,
+            brain->get_parameter("strategy.cooperation.broadcast_address").as_string());
+        for (const auto &target : _team_broadcast_addrs)
+            cout << "Team broadcast target: " << inet_ntoa(target.sin_addr) << endl;
         cout << GREEN_CODE << format("Team communication broadcast/listen on UDP port %d", _team_udp_port)
              << RESET_CODE << endl;
 
@@ -188,7 +190,8 @@ void BrainCommunication::broadcastTeamCommunication()
             wire.session = _team_session;
             wire.canControl = brain->data->tmImAlive &&
                 brain->tree->getEntry<int>("control_state") == 3 ? 1 : 0;
-            const bool ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
+            const bool localBallKnown = brain->tree->getEntry<bool>("ball_location_known");
+            const bool ballLocationKnown = localBallKnown || brain->data->tm_ball_pos_reliable;
             msg.validation = VALIDATION_COMMUNICATION_OWNERSHIP;
             msg.communicationId = _team_communication_msg_id++;
             msg.teamId = brain->config->teamId;
@@ -197,7 +200,7 @@ void BrainCommunication::broadcastTeamCommunication()
             msg.isAlive = brain->data->tmImAlive;
             msg.isLead = brain->data->tmImLead;
             msg.isInVisualKick = brain->data->tmImInVisualKick;
-            msg.ballDetected = ballLocationKnown && brain->data->ballDetected;
+            msg.ballDetected = localBallKnown && brain->data->ballDetected;
             msg.ballLocationKnown = ballLocationKnown;
             msg.ballConfidence = ballLocationKnown ? brain->data->ball.confidence : 0.0;
             msg.ballRange = ballLocationKnown ? brain->data->ball.range : 0.0;
@@ -212,9 +215,12 @@ void BrainCommunication::broadcastTeamCommunication()
         log(format("ImAlive: %d, ImLead: %d, myCost: %.1f, myCmdId: %d, myCmd: %d",
                     msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
 
-        const int ret = sendto(_team_socket, &wire, sizeof(wire), 0,
-                               reinterpret_cast<sockaddr *>(&_team_broadcast_addr),
-                               sizeof(_team_broadcast_addr));
+        int ret = -1;
+        for (const auto &target : _team_broadcast_addrs) {
+            const int sent = sendto(_team_socket, &wire, sizeof(wire), 0,
+                reinterpret_cast<const sockaddr *>(&target), sizeof(target));
+            if (sent >= 0) ret = sent;
+        }
         if (ret < 0)
             cout << RED_CODE << format("team broadcast failed: %s", strerror(errno)) << RESET_CODE << endl;
         else
@@ -265,6 +271,10 @@ void BrainCommunication::spinTeamCommunicationReceiver()
         brain->data->tmIP = inet_ntoa(addr.sin_addr);
         if (msg.playerId == brain->config->playerId)
         {
+            if (wire.session != 0 && wire.session != _team_session)
+                RCLCPP_ERROR_THROTTLE(brain->get_logger(), *brain->get_clock(), 5000,
+                    "Duplicate team player_id %d from %s; assign unique IDs to robots",
+                    msg.playerId, inet_ntoa(addr.sin_addr));
             brain->data->sendId = msg.communicationId;
             brain->data->sendTime = brain->get_clock()->now();
             continue;

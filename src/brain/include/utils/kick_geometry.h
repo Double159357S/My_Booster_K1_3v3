@@ -18,6 +18,30 @@ inline double angleDistance(double lhs, double rhs)
     return std::abs(normalizeAngle(lhs - rhs));
 }
 
+// Both the approach line and body heading must agree with the intended shot.
+inline bool readyToKick(double direction, double approach, double heading,
+                        double tolerance)
+{
+    return std::isfinite(direction) && std::isfinite(approach) &&
+        std::isfinite(heading) && std::isfinite(tolerance) && tolerance > 0.0 &&
+        angleDistance(direction, approach) <= tolerance &&
+        angleDistance(direction, heading) <= tolerance;
+}
+
+inline double interceptLateralSpeed(double error, double gain, double maxSpeed,
+                                    double arrivalSeconds, double reactionSeconds)
+{
+    if (!std::isfinite(error) || !std::isfinite(gain) ||
+        !std::isfinite(maxSpeed) || maxSpeed <= 0.0) return 0.0;
+    double speed = std::max(0.0, gain) * error;
+    if (std::isfinite(arrivalSeconds) && arrivalSeconds > 0.0 &&
+        std::isfinite(reactionSeconds)) {
+        const double available = std::max(0.05, arrivalSeconds - std::max(0.0, reactionSeconds));
+        if (std::abs(error / available) > std::abs(speed)) speed = error / available;
+    }
+    return std::clamp(speed, -maxSpeed, maxSpeed);
+}
+
 inline double minorArcWidth(double edgeA, double edgeB)
 {
     return angleDistance(edgeA, edgeB);

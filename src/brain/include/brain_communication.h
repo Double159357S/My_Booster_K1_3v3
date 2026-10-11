@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <vector>
 
 
 #include "RoboCupGameControlData.h"
@@ -66,6 +67,6 @@ private:
     std::thread _team_receive_thread;
     int _team_socket = -1;
     int _team_udp_port = 0;
-    sockaddr_in _team_broadcast_addr{};
+    std::vector<sockaddr_in> _team_broadcast_addrs;
     static constexpr int TEAM_COMMUNICATION_INTERVAL_MS = 100;
 };

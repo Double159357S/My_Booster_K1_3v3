@@ -49,8 +49,9 @@ brain_node:
       enable_directional_kick: false 
       goalie_visual_kick_cooldown_ms: 600.0
       goalie_visual_kick_max_ball_range: 5.0
-      goalie_visual_kick_max_direction_error: 1.2 # 守门员启动视觉踢球前，球方向与解围方向的最大误差(rad)
+      goalie_visual_kick_max_direction_error: 0.35 # 守门员启动视觉踢球前，球方向与解围方向的最大误差(rad)
       goalie_simple_x_kp: 0.9
+      goalie_simple_reaction_seconds: 0.15 # latency reserved before ball reaches blocking plane
       goalie_simple_y_kp: 2.2
       goalie_simple_threat_vxf: -0.03
       goalie_simple_predict_min_vxf: 0.06
@@ -79,14 +80,14 @@ brain_node:
       auto_visual_kick_enable_dist_min: 0.05 # 避免将本体的部分识别为球
       auto_visual_kick_enable_dist_max: 5.0
       auto_visual_kick_enable_angle: 1.5
-      auto_visual_kick_max_direction_error: 1.8 # 未对准期望踢球方向时继续 Adjust，不直接进入 VisualKick
+      auto_visual_kick_max_direction_error: 0.2 # 未对准期望踢球方向时继续 Adjust，不直接进入 VisualKick
       auto_visual_kick:
         real_ball_hold_ms: 1000.0
-        current_real_ball_max_age_ms: 650.0
+        current_real_ball_max_age_ms: 250.0
         near_ball_memory_reject_range: 0.45
-        allow_predicted_kick_msg: true
-        allow_memory_kick_msg: true
-        kick_msg_real_ball_max_age_ms: 650.0
+        allow_predicted_kick_msg: false
+        allow_memory_kick_msg: false
+        kick_msg_real_ball_max_age_ms: 250.0
         no_detection_kick_msg_reject_range: 0.45
         startup_decelerate_ms: 80.0
         exit_decelerate_ms: 140.0
@@ -98,6 +99,7 @@ brain_node:
         max_total_ms: 14000.0
         max_extra_rounds: 1
       cooperation:
+        broadcast_address: "" # auto: broadcast on each active IPv4 interface
         enable_role_switch: true 
         ball_control_cost_threshold: 5.0 # 旧参数；控球交接使用以下独立门槛
         comm_fresh_ms: 800.0
