@@ -14,6 +14,7 @@
 #include "RoboCupGameControlData.h"
 #include "buffer.h"
 #include "utils/team_ball.h"
+#include "utils/ready_formation.h"
 
 using namespace std;
 
@@ -165,6 +166,7 @@ public:
     bool kickoffStrikerGroupLatched = false;
     int kickoffBallHalf = 0; // 开球阶段球所在半区: -1 己方, 1 对方, 0 尚未确定.
     int myStrikerIDRank = 0; // 我的 ID 在前锋中的排名, 用于多机配合. 
+    ready_formation::Assignment readyFormation; // READY 独立、按 ID 固定的站位分工
     bool tmImInVisualKick = false; // 自己是否处于 visual kick 模式
     bool shouldExitRLVisionKick = false; // 是否需要主动退出 visual kick 模式
     string goalieVisualKickSubState = "none"; // none | block_kick | intercept_kick

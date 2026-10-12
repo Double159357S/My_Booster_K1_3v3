@@ -757,6 +757,8 @@ void Brain::handleCooperation() {
     int selfId = config->playerId;
     int selfIdx = selfId - 1;
     int numOfPlayers = std::clamp(config->numOfPlayers, 1, HL_MAX_NUM_PLAYERS);
+    const bool inReady = tree->getEntry<string>("gc_game_state") == "READY";
+    data->readyFormation.update(inReady, data->goalkeeperPlayerId, numOfPlayers);
 
     vector<int> aliveTmIdxs = {}; 
 
@@ -860,6 +862,14 @@ void Brain::handleCooperation() {
     get_parameter("strategy.cooperation.enable_role_switch", switchRole);
     static int directedGoalieId = 0;
     static rclcpp::Time directedGoalieUntil;
+    if (inReady) {
+        // 开球准备期间不能沿用上一轮清球的守门交接指令。
+        directedGoalieId = 0;
+        if (data->tmMyCmd > 10 && data->tmMyCmd < 20) {
+            data->tmMyCmd = 0;
+            data->tmMyCmdId = ++data->tmCmdId;
+        }
+    }
     bool teamVisualKickActive = data->tmImInVisualKick;
     for (int tmIdx : aliveTmIdxs) {
         teamVisualKickActive = teamVisualKickActive || data->tmStatus[tmIdx].isInVisualKick;
@@ -879,8 +889,8 @@ void Brain::handleCooperation() {
     bool goalieCommHealthy = false;
     bool goalieStable = false;
     bool goalieFallback = true;
-    int selectedGoalieId = selectGoaliePlayerId(
-        &goalieCommHealthy, &goalieStable, &goalieFallback);
+    int selectedGoalieId = inReady ? data->readyFormation.goalkeeper()
+        : selectGoaliePlayerId(&goalieCommHealthy, &goalieStable, &goalieFallback);
     if (directedGoalieId > 0 && directedGoalieId <= numOfPlayers &&
         data->penalty[directedGoalieId - 1] == PENALTY_NONE) {
         selectedGoalieId = directedGoalieId;
@@ -889,7 +899,7 @@ void Brain::handleCooperation() {
 
     if (tree->getEntry<string>("gc_game_state") == "INITIAL" || !switchRole) {
         tree->setEntry<string>("player_role", config->playerRole);
-    } else if (data->tmImAlive && selectedGoalieId > 0) {
+    } else if ((inReady || data->tmImAlive) && selectedGoalieId > 0) {
         tree->setEntry<string>("player_role",
             selectedGoalieId == selfId ? "goal_keeper" : "striker");
     }
@@ -1076,7 +1086,7 @@ void Brain::handleCooperation() {
     const bool goalieAttackHandoffEnabled = get_parameter(
         "strategy.cooperation.goalie_attack_handoff").as_bool();
     if (
-        goalieAttackHandoffEnabled &&
+        goalieAttackHandoffEnabled && tree->getEntry<string>("gc_game_state") == "PLAY" &&
         data->tmImAlive 
         && tree->getEntry<string>("player_role") == "goal_keeper"
         && data->ballDetected
@@ -1127,7 +1137,7 @@ void Brain::handleCooperation() {
             data->tmImLead = false;
             tree->setEntry<bool>("is_lead", false);
             log_("teammate wants to take lead, i'll assist");
-        } else if (cmd > 10 && cmd < 20) { 
+        } else if (cmd > 10 && cmd < 20 && !inReady) {
             log_("goalie wants to attack");
             int newGoalieId = cmd - 10;
             directedGoalieId = newGoalieId;

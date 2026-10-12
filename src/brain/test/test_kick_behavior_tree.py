@@ -31,6 +31,18 @@ def selected_actions(node, variable, value, action_types):
 
 
 class MatchMotionRouting(unittest.TestCase):
+    def test_ready_routes_to_formation_with_tight_arrival_tolerance(self):
+        root = ET.parse(TREES.parent / "game.xml").getroot()
+        ready = root.find(".//ReactiveSequence[@_while=\"gc_game_state=='READY'\"]")
+        self.assertIsNotNone(ready)
+        motion = {"GoToReadyPosition", "YieldBallSpace", "SetVelocity"}
+        self.assertEqual(selected_actions(ready, "gc_game_state", "READY", motion),
+                         ["GoToReadyPosition"])
+        self.assertEqual(selected_actions(ready, "gc_game_state", "PLAY", motion), [])
+        node = ready.find("GoToReadyPosition")
+        self.assertLessEqual(float(node.get("dist_tolerance")), 0.25)
+        self.assertEqual(ready.find("SubTree").get("ID"), "Locate")
+
     def test_yield_preempts_both_roles(self):
         root = ET.parse(TREES.parent / "game.xml").getroot()
         match = root.find(".//ReactiveSequence[@name='比赛']")

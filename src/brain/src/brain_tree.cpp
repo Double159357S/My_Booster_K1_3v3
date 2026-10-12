@@ -4365,21 +4365,24 @@ NodeStatus GoToReadyPosition::tick()
     if (gameState != "READY") {
         _positionLocked = false;
         _lockedTargetValid = false;
+    } else {
+        // 旧 0.6m 容差允许两台站得过近；READY 收紧到位范围，保留停止锁存。
+        distTolerance = std::clamp(distTolerance, 0.05, 0.25);
     }
 
     if (role == "striker") {
         int strikerRank = brain->data->myStrikerIDRank;
         if (gameState == "READY") {
-            strikerRank = 0;
-            const int goalieId = brain->data->activeGoaliePlayerId > 0
-                ? brain->data->activeGoaliePlayerId
-                : brain->data->goalkeeperPlayerId;
-            for (int id = 1; id < brain->config->playerId; ++id) {
-                if (id != goalieId && id <= brain->config->numOfPlayers) ++strikerRank;
+            strikerRank = brain->data->readyFormation.strikerRank(brain->config->playerId);
+            if (strikerRank < 0) {
+                // 名单和角色配置冲突时停止，避免占用另一位前锋的目标。
+                brain->client->setVelocity(0, 0, 0);
+                return NodeStatus::SUCCESS;
             }
-            strikerRank = std::clamp(strikerRank, 0, 3);
-        }
-        if (strikerRank == 0) {
+            const auto target = ready_formation::strikerTarget(strikerRank, isKickoff, fd);
+            tx = target.x;
+            ty = target.y;
+        } else if (strikerRank == 0) {
             tx = isKickoff ? - fd.circleRadius : - fd.circleRadius * 2;
             ty = 0.0;
         } else if (strikerRank == 1) {
@@ -4407,6 +4410,54 @@ NodeStatus GoToReadyPosition::tick()
     const double targetDistance = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
     const double targetThetaError = fabs(toPInPI(targetPose.theta - robotPose.theta));
 
+    // 若去站位的路径相遇，大编号前锋先侧移让开小编号；小编号继续
+    // 去中圈。复用队友避碰规划，防止两台被速度限幅同时停在半路。
+    if (gameState == "READY" && role == "striker" && brain->config->enableCom &&
+        brain->tree->getEntry<bool>("odom_calibrated")) {
+        const double nowMs = team_cooperation::steadyNowMs();
+        const double freshMs = std::clamp(brain->get_parameter(
+            "strategy.cooperation.comm_fresh_ms").as_double(), 200.0, 2000.0);
+        const double stopDist = std::clamp(brain->get_parameter(
+            "strategy.cooperation.teammate_stop_distance").as_double(), 0.4, 1.5);
+        const double slowDist = std::max(stopDist + 0.1, brain->get_parameter(
+            "strategy.cooperation.teammate_slow_distance").as_double());
+        std::vector<team_cooperation::Position> teammates;
+        int priorityId = 0;
+        Pose2D priorityPose{}, priorityTarget{};
+        for (int i = 0; i < brain->config->numOfPlayers && i < HL_MAX_NUM_PLAYERS; ++i) {
+            const auto &tm = brain->data->tmStatus[i];
+            const double age = nowMs - tm.teamReceivedMs;
+            if (i + 1 == brain->config->playerId || !tm.isAlive || age < 0 || age > freshMs ||
+                !std::isfinite(tm.robotPoseToField.x) || !std::isfinite(tm.robotPoseToField.y)) continue;
+            const auto peerPose = tm.robotPoseToField;
+            teammates.push_back({peerPose.x - robotPose.x, peerPose.y - robotPose.y});
+            const int peerRank = brain->data->readyFormation.strikerRank(i + 1);
+            if (i + 1 >= brain->config->playerId || peerRank < 0 || priorityId > 0) continue;
+            const auto peerTarget = ready_formation::strikerTarget(peerRank, isKickoff, fd);
+            if (norm(peerPose.x - robotPose.x, peerPose.y - robotPose.y) < stopDist + 0.3 &&
+                norm(peerTarget.x - peerPose.x, peerTarget.y - peerPose.y) > distTolerance + 0.15) {
+                priorityId = i + 1;
+                priorityPose = peerPose;
+                priorityTarget = peerTarget;
+            }
+        }
+        if (priorityId > 0) {
+            const auto velocity = team_cooperation::yieldVelocity(
+                {robotPose.x, robotPose.y}, {priorityPose.x, priorityPose.y},
+                {priorityTarget.x, priorityTarget.y}, teammates, fd.length, fd.width,
+                stopDist, slowDist, 0.4, ty < 0 ? -1 : 1);
+            const double directionRb = toPInPI(atan2(velocity.y, velocity.x) - robotPose.theta);
+            if (norm(velocity.x, velocity.y) > 0.05 &&
+                brain->distToObstacle(directionRb) >= brain->config->safeDistance) {
+                _positionLocked = false;
+                const double c = cos(robotPose.theta), s = sin(robotPose.theta);
+                brain->client->setVelocity(c * velocity.x + s * velocity.y,
+                    -s * velocity.x + c * velocity.y, 0, false, false, false);
+                return NodeStatus::SUCCESS;
+            }
+        }
+    }
+
     // 站位目标可能因角色/开球方变化而改变，目标改变时必须解除旧锁存。
     if (!_lockedTargetValid
         || norm(targetPose.x - _lockedTargetPose.x, targetPose.y - _lockedTargetPose.y) > 0.05
@@ -4414,6 +4465,10 @@ NodeStatus GoToReadyPosition::tick()
         _lockedTargetPose = targetPose;
         _lockedTargetValid = true;
         _positionLocked = false;
+        if (gameState == "READY") {
+            RCLCPP_INFO(brain->get_logger(), "[Ready] player=%d role=%s goalie=%d target=(%.2f,%.2f)",
+                brain->config->playerId, role.c_str(), brain->data->readyFormation.goalkeeper(), tx, ty);
+        }
     }
 
     const double unlockDistance = std::max(distTolerance + 0.25, distTolerance * 1.5);

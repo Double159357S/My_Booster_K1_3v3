@@ -7,6 +7,7 @@
 #include "utils/team_ball.h"
 #include "utils/kick_strategy.h"
 #include "utils/goalie_strategy.h"
+#include "utils/ready_formation.h"
 
 using namespace team_cooperation;
 
@@ -343,6 +344,69 @@ void goalieRoleTests() {
     check(goalie_strategy::select({}, 0.15) == 0, "empty goalkeeper list selected a player");
 }
 
+void readyFormationTests() {
+    // 每台只凭相同裁判机名单计算，通信中断、距离排名变化不能抢同一站位。
+    for (int goalkeeper = 1; goalkeeper <= 3; ++goalkeeper) {
+        std::array<ready_formation::Assignment, 3> robots;
+        for (auto &robot : robots) robot.update(true, goalkeeper, 3);
+        int expectedRank = 0;
+        for (int player = 1; player <= 3; ++player) {
+            for (auto &robot : robots) {
+                check(robot.goalkeeper() == goalkeeper, "READY goalkeeper differs between robots");
+                check(robot.strikerRank(player) == (player == goalkeeper ? -1 : expectedRank),
+                      "READY striker slots do not follow player ID");
+            }
+            if (player != goalkeeper) ++expectedRank;
+        }
+        // 同一轮不受后来的名单/动态角色输入扰动；下一轮允许使用新名单。
+        const int changedGoalkeeper = goalkeeper % 3 + 1;
+        robots[0].update(true, changedGoalkeeper, 2);
+        check(robots[0].goalkeeper() == goalkeeper, "READY changed slots mid-cycle");
+        robots[0].update(false, changedGoalkeeper, 3);
+        check(!robots[0].active() && robots[0].strikerRank(2) == -1,
+              "leaving READY kept its assignment active");
+        robots[0].update(true, changedGoalkeeper, 3);
+        check(robots[0].goalkeeper() == changedGoalkeeper, "new READY did not reset assignment");
+    }
+    ready_formation::Assignment fallback;
+    fallback.update(true, 0, 3);
+    check(fallback.goalkeeper() == 1 && fallback.strikerRank(2) == 0 &&
+          fallback.strikerRank(3) == 1, "unknown GC goalkeeper has inconsistent fallback");
+    check(fallback.strikerRank(0) == -1 && fallback.strikerRank(4) == -1,
+          "invalid player ID was allocated a READY slot");
+
+    struct Field { double length, width, circleRadius; };
+    for (const auto field : {Field{9, 6, 0.75}, Field{14.16, 9.22, 1.54}}) {
+        for (bool ourKickoff : {true, false}) {
+            const auto front = ready_formation::strikerTarget(0, ourKickoff, field);
+            const auto support = ready_formation::strikerTarget(1, ourKickoff, field);
+            check(front.x < 0 && front.y == 0 && support.x < front.x && support.y < 0,
+                  "READY center/support layout is wrong");
+            // 两台都在 0.5m 解锁容差的最靠近侧时，仍超过默认 0.8m 停止距离。
+            check(std::hypot(front.x - support.x, front.y - support.y) - 2 * 0.5 > 0.8,
+                  "READY arrival windows overlap teammate stop distance");
+            check(std::abs(support.y) + 0.5 < field.width / 2 &&
+                  support.x - 0.5 > -field.length / 2 && front.x + 0.5 < 0,
+                  "READY tolerance permits crossing field boundaries/middle line");
+            if (!ourKickoff) {
+                check(-front.x - 0.5 - 0.25 > field.circleRadius,
+                      "defending READY tolerance enters center circle");
+            }
+        }
+    }
+    const auto front = ready_formation::strikerTarget(0, true, Field{9, 6, 0.75});
+    near(front.x, -1.15, "kid-size center READY target wrong");
+    const auto support = ready_formation::strikerTarget(1, true, Field{9, 6, 0.75});
+    near(support.x, -2.15, "kid-size support READY depth wrong");
+    near(support.y, -1.8, "kid-size support READY side wrong");
+    const Position lower{-2.0, -0.1}, higher{-2.0, -0.85};
+    const auto escape = yieldVelocity(higher, lower, {front.x, front.y},
+        {{lower.x - higher.x, lower.y - higher.y}}, 9.0, 6.0, 0.8, 1.3, 0.4, -1);
+    check(std::hypot(escape.x, escape.y) > 0.05 &&
+          std::hypot(higher.x + escape.x - lower.x, higher.y + escape.y - lower.y) > 0.75,
+          "higher-ID striker cannot yield at READY route conflict");
+}
+
 void geometryTests() {
     near(segmentDistance({-1, 0}, {1, 0}, {0, -1}, {0, 1}), 0, "crossing routes missed");
     near(segmentDistance({0, 0}, {1, 0}, {2, 0}, {3, 0}), 1, "collinear gap wrong");
@@ -448,9 +512,10 @@ int main() {
         packetTests();
         sharedBallTests();
         goalieRoleTests();
+        readyFormationTests();
         geometryTests();
         clearanceLivenessTests();
-        std::cout << "Team cooperation: arbitration, shared ball, goalie roles, packet decoding and geometry passed\n";
+        std::cout << "Team cooperation: arbitration, shared ball, goalie roles, READY formation, packet decoding and geometry passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

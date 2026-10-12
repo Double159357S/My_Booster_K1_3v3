@@ -63,7 +63,7 @@
 
                         <ReactiveSequence _while="gc_game_state=='READY'" name="走到场内自己的起始位置">
                             <MoveHead pitch="0.35" yaw="0.0" />
-                            <GoToReadyPosition  vx_limit="0.7" dist_tolerance="0.6" theta_tolerance="0.2" />
+                            <GoToReadyPosition  vx_limit="0.7" dist_tolerance="0.25" theta_tolerance="0.2" />
                             <SubTree ID="Locate" _autoremap="true" />
                             <!-- <WaveHand _while="we_just_scored" action="start" /> -->
                         </ReactiveSequence>
