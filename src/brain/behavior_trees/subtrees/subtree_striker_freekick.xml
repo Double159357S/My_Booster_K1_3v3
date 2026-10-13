@@ -15,7 +15,7 @@
             <CamFindBall
                _while="gc_opponent_set_play_search_direction != 0 &amp;&amp; !ball_location_known" />
             <MoveToFarSetPlaySearchArea
-               _while="gc_opponent_set_play_search_direction != 0" />
+               _while="gc_opponent_set_play_search_direction != 0 &amp;&amp; !(ball_location_known || tm_ball_pos_reliable)" />
             <CalcKickDir />
             <SubTree ID="FindBall" _while="!(ball_location_known || tm_ball_pos_reliable)" _autoremap="true" />
             <GoToFreekickPosition _while="ball_location_known || tm_ball_pos_reliable" side="defense" />

@@ -32,9 +32,12 @@ std::string BuildRLSkillKickParams(double kick_speed, double kick_dir, bool canc
 void RobotClient::init()
 {
     publisher = brain->create_publisher<booster_msgs::msg::RpcReqMsg>("LocoApiTopicReq", 10);
+    visualKickResponseSubscription_ = brain->create_subscription<booster_msgs::msg::RpcRespMsg>(
+        "LocoApiTopicResp", rclcpp::QoS(10).reliable(),
+        [this](const booster_msgs::msg::RpcRespMsg &msg) { visualKickResponse(msg); });
 }
 
-int RobotClient::call(booster_interface::msg::BoosterApiReqMsg msg)
+int RobotClient::call(booster_interface::msg::BoosterApiReqMsg msg, bool expectResponse)
 {
     std::string uuid = gen_uuid();
     auto message = booster_msgs::msg::RpcReqMsg();
@@ -42,10 +45,38 @@ int RobotClient::call(booster_interface::msg::BoosterApiReqMsg msg)
 
     nlohmann::json req_header;
     req_header["api_id"] = msg.api_id;
+    if (expectResponse) req_header["expect_response"] = true;
     message.header = req_header.dump();
     message.body = msg.body;
+    if (msg.api_id == kApiIdEnableVisualKickMode) {
+        std::lock_guard<std::mutex> lock(visualKickRequestMutex_);
+        if (expectResponse) visualKickRequest_.begin(uuid, team_cooperation::steadyNowMs());
+        else visualKickRequest_.cancel();
+    }
     publisher->publish(message);
     return 0;
+}
+
+double RobotClient::visualKickAckTimeoutMs() const {
+    return std::clamp(brain->get_parameter("strategy.auto_visual_kick.start_ack_timeout_ms").as_double(),
+        100.0, 5000.0);
+}
+
+kick_strategy::StartState RobotClient::visualKickStartState() {
+    std::lock_guard<std::mutex> lock(visualKickRequestMutex_);
+    return visualKickRequest_.state(team_cooperation::steadyNowMs(), visualKickAckTimeoutMs());
+}
+
+void RobotClient::visualKickResponse(const booster_msgs::msg::RpcRespMsg &msg) {
+    // Missing/malformed status is a failure, never an implicit acknowledgement.
+    const auto header = nlohmann::json::parse(msg.header, nullptr, false);
+    int status = -1;
+    if (header.is_object() && header.contains("status") &&
+        header["status"].is_number_integer() && header["status"] == 0) {
+        status = 0;
+    }
+    std::lock_guard<std::mutex> lock(visualKickRequestMutex_);
+    visualKickRequest_.complete(msg.uuid, status, team_cooperation::steadyNowMs(), visualKickAckTimeoutMs());
 }
 
 int RobotClient::moveHead(double pitch, double yaw)
@@ -145,7 +176,7 @@ int RobotClient::RLVisionKick(bool start)
     body["version"] = visualKickVersion;
     msg.body = body.dump();
     std::cout << "RobotClient::RLVisionKick called with start=" << (start ? "true" : "false") << std::endl;
-    return call(msg);
+    return call(msg, start);
 }
 
 int RobotClient::robocupWalk()

@@ -156,6 +156,7 @@ public:
     NodeStatus tick() override;
 private:
     Brain *brain;
+    rclcpp::Time lastHeadCommandTime;
 };
 
 class CamFindBall : public SyncActionNode
@@ -369,6 +370,7 @@ public:
     void onHalted() override;
 
     static rclcpp::Time getLastExitTime() { return _lastExitTime; }
+    static rclcpp::Time getLastStartFailureTime() { return _lastStartFailureTime; }
 
     static bool isMinIntervalSatisfied(double minIntervalMsec);
 
@@ -377,13 +379,10 @@ private:
     rclcpp::Time _startTime;
     rclcpp::Time _sessionStartTime;
     rclcpp::Time _lastProgressTime;
-    rclcpp::Time _headScanStartTime;
-    // 前锋 VisualKick 接管头部；守门员持续由 CamTrackBall 跟踪近球。
-    rclcpp::Time _lastHeadCommandTime;
-    bool _headCommandSent = false;
 
     bool _isDecelerating = false;
     bool _visionKickStarted = false;
+    bool _visionKickRequested = false;
     bool _pendingRobocupWalk = false;
     rclcpp::Time _decelStartTime;
     double _decelDurationMs = 500.0;
@@ -398,6 +397,7 @@ private:
     string _pendingExitReason;
 
     static rclcpp::Time _lastExitTime;
+    static rclcpp::Time _lastStartFailureTime;
 
     void recordExitTime();
     void startDecelerate(double durationMs = 500.0);
@@ -784,6 +784,8 @@ private:
     double _vyLimit = 0.4;
     bool _arrived = false;
     bool _moveTimedOut = false;
+    bool _searchFinished = false;
+    std::uint64_t _finishedEpoch = 0;
     int _direction = 0;
 };
 

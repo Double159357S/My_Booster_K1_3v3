@@ -2,11 +2,14 @@
 
 #include <iostream>
 #include <string>
+#include <mutex>
 #include <rerun.hpp>
 
 #include "booster_interface/srv/rpc_service.hpp"
 #include "booster_interface/msg/booster_api_req_msg.hpp"
 #include "booster_msgs/msg/rpc_req_msg.hpp"
+#include "booster_msgs/msg/rpc_resp_msg.hpp"
+#include "utils/visual_kick_request.h"
 #include "booster_internal/robot/b1/b1_loco_internal_api.hpp"
 
 using namespace std;
@@ -122,6 +125,7 @@ public:
      * @brief 切换到rl结合视觉的踢球
      */
     int RLVisionKick(bool start = true);
+    kick_strategy::StartState visualKickStartState();
 
     /**
      * @brief 切换到robocup步态
@@ -145,10 +149,15 @@ public:
     bool isStandingStill(double timeBuffer = 1000);
 
 private:
-    int call(booster_interface::msg::BoosterApiReqMsg msg);
+    int call(booster_interface::msg::BoosterApiReqMsg msg, bool expectResponse = false);
+    void visualKickResponse(const booster_msgs::msg::RpcRespMsg &msg);
+    double visualKickAckTimeoutMs() const;
+    std::mutex visualKickRequestMutex_;
+    kick_strategy::VisualKickRequest visualKickRequest_;
+    rclcpp::Subscription<booster_msgs::msg::RpcRespMsg>::SharedPtr visualKickResponseSubscription_;
     rclcpp::Publisher<booster_msgs::msg::RpcReqMsg>::SharedPtr publisher;
     Brain *brain;
-    double _vx, _vy, _vtheta;
+    double _vx = 0.0, _vy = 0.0, _vtheta = 0.0;
     rclcpp::Time _lastCmdTime;
     rclcpp::Time _lastNonZeroCmdTime;
 };

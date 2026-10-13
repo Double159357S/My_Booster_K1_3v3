@@ -8,9 +8,11 @@
 - 需要调整时，平移和转向指令补到步态可响应的最低幅度 0.3，再按行为树速度上限和队友距离限制。接近路线进入踢球允许误差后停止绕球，只完成身体转向；距离误差在 0.04 米内停止进退。
 - 前锋进入 SDK 后不逐帧重复启动对准判断；仍由 SDK 节点检查失球、队友距离、失去控球权、无进展和超时。机器人短暂转身或调整脚位不会被直接切回 `Adjust`。
 - 守门员选人先确定最近距离，再在允许误差内选择最小球员号；不同机器人先处理自己的顺序不会改变同一组候选人的选择结果。
-- 前锋启动前减速 160 毫秒，守门员默认 80 毫秒（`goalie_visual_kick_startup_decelerate_ms`）。守门员持续凝视已确认的球，不再先扫头 300 毫秒。只有 SDK 真正启动后退出才记录冷却；已对准但尚在冷却或队友挡路时用 `clear_wait` 站定，不反复绕球。
+- 前锋启动前减速 160 毫秒，守门员默认 80 毫秒（`goalie_visual_kick_startup_decelerate_ms`）。两种角色均持续跟球，视觉踢球期间头部指令间隔至少 100 毫秒，不再强制抬头和 yaw 归零。已对准但尚在冷却、启动失败退避或队友挡路时，前锋用 `kick_wait`、守门员用 `clear_wait` 站定。
+- 视觉踢球按 UUID 等待运控启动响应，成功响应后才记录已启动。默认响应超时 1200 毫秒，拒绝或超时后取消请求，并等待 1000 毫秒重试；响应订阅不依赖日志开关。只有确认启动的会话退出才记录正常冷却。
 - 最近真实球默认保持 650 毫秒，漏检一两帧时按当前位姿投影后继续供给踢球目标；超过该时间后，0.8 米内的旧记忆或预测不能继续踢球。共享坐标仍不能替代本机视觉启动 SDK。
 - 启动、续踢和 `/kick_ball` 发布共用球源选择。普通趟踢沿用自己的方向和避障检查，`safe_shoot` 决策也有对应执行节点。
+- 普通趟踢保留运行会话，650 毫秒内的最近真实球仍可更新方向和加速；过期、失去球权、球越过身体、避障中止及截止时间仍会结束动作。门球/角球搜索发现本机或可靠共享球位后立即交回正常流程，到达和超时不再阻塞后续决策。
 
 主要代码在 `src/brain.cpp`、`src/brain_tree.cpp`、`include/utils/kick_strategy.h` 和前锋、守门员行为树中；参数位于 `config/config.yaml` 的 `strategy` 部分。`setup/config.yaml.example` 同步更新。控球权交接协议和队友避碰仍沿用协作版本。
 
@@ -24,7 +26,7 @@ colcon test --packages-select brain --ctest-args -R 'test_(team_cooperation|kick
 colcon test-result --verbose
 ```
 
-`test_team_cooperation` 覆盖清球角色保持及六种选人顺序的一致性。`test_kick_strategy` 覆盖 SDK 会话保持、允许误差内停止绕球、清球区域、冷却等待、漏检及过期停止。`test_kick_behavior_tree` 检查各决策能进入对应动作。最新修改尚未重新编译或实机测试；由使用者手动编译并复测。
+`python scripts/test_local.py` 在本地编译策略与实际动作函数，覆盖球权、运动、漏检、搜索抢占、头部跟踪和 RPC 启动响应。完整 ROS/Booster SDK 节点及实机行为尚未验证。
 
 ## 场上复测
 
@@ -32,6 +34,6 @@ colcon test-result --verbose
 2. 前锋：在相同球位、身体初始朝向和目标位置下，旧版和新版各踢 10 次，分别记录进球次数、左右偏差和准备时间。再测试身体偏转约 30° 时是否先对准后出脚。
 3. 协作：门前清球时确认前锋让位；清球后确认仍只有一个主攻，另一个接应。
 
-若球到脚边后停住，查看 `brain.log` 中的 `[Striker]`、`[Goalie]` 和 `[RLVisionKick]`：`lead=0` 表示没有控球授权，`source=none` 表示没有可用球源，`cooldown_ms` 是剩余冷却，`teammate_distance` 可判断是否在队友制动区。`started goalie=1 startup_ms=80` 表示 SDK 已接管清球；`start deferred` 会说明尚未启动的原因。
+若球到脚边后停住，查看 `brain.log` 中的 `[Striker]`、`[Goalie]` 和 `[RLVisionKick]`：`lead=0` 表示没有控球授权，`source=none` 表示没有可用球源，`teammate_distance` 可判断是否在队友制动区。`start requested` 表示请求已经发送；`start accepted by SDK` 表示收到运控成功响应。`waiting` 会报告队友挡路、冷却和启动重试状态；`SDK start rejected` 或 `SDK start acknowledgement timeout` 会报告启动失败。`owner` 是分配结果，`lead=1` 才表示本机授权条件全部成立；`awaiting_echo` 时查看队友确认数。
 
 本地回归通过后，清球速度和射门准确率是否提升仍以实测为准；若完成对准后仍固定向同一侧偏，需要继续检查该机器人的定位朝向和相机标定。

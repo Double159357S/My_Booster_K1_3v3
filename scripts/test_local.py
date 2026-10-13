@@ -30,6 +30,8 @@ def main():
     subprocess.run([sys.executable, str(root / "src/brain/test/test_kick_behavior_tree.py")], check=True)
     subprocess.run([sys.executable, str(root / "src/brain/test/test_kick_runtime.py"),
                     "--compiler", compiler], check=True)
+    subprocess.run([sys.executable, str(root / "src/brain/test/test_soccer_flow_runtime.py"),
+                    "--compiler", compiler], check=True)
     print("All offline strategy checks passed. No robot connections were made.")
 
 

@@ -94,6 +94,9 @@ brain_node:
       auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
       auto_visual_kick_max_body_error: 0.25 # 身体朝向的最大误差，弧度
       auto_visual_kick:
+        cooldown_ms: 600.0
+        start_ack_timeout_ms: 1200.0 # 运控启动响应超时，毫秒
+        start_retry_ms: 1000.0 # 启动拒绝/超时后的重试间隔，毫秒
         real_ball_hold_ms: 1000.0 # 近期真实球检测保持时间，毫秒
         current_real_ball_max_age_ms: 650.0 # 允许真实球短暂漏检，毫秒
         near_ball_memory_reject_range: 0.8 # 超过真实球宽限期后，拒绝近距离旧记忆，米

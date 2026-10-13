@@ -43,6 +43,7 @@ struct FakeData {
     FakeBall ball;
     struct { double x = 0.0; } robotPoseToField;
     bool tmImLead = true, ballDetected = true;
+    bool tmImInDribbleKick = false;
     bool isFreekickKickingOff = false, isKickingOff = false;
 };
 struct FakeConfig {
@@ -119,6 +120,7 @@ int main() {
     try {
         Brain normal; Kick kick(&normal);
         check(kick.onStart() == NodeStatus::RUNNING, "valid dribble did not start");
+        check(normal.data->tmImInDribbleKick, "dribble session was not registered");
         // A small angle must stay small instead of boosting lateral speed.
         const auto &c = normal.client->command;
         check(abs(c.y / c.x - tan(0.05) / 0.9) < 1e-9, "crabWalk changed the kicking direction");
@@ -126,6 +128,19 @@ int main() {
         check(normal.client->command.x < 0.3, "dribble immediately jumps to full speed");
         normal.data->tmImLead = false;
         check(kick.onRunning() == NodeStatus::SUCCESS && stopped(normal), "revoked owner keeps walking");
+        check(!normal.data->tmImInDribbleKick, "aborted dribble retained its session");
+
+        Brain missed; Kick continued(&missed); continued.onStart();
+        missed.data->ballDetected = false;
+        missed.source = kick_strategy::BallSource::recentReal;
+        tick(missed, 100);
+        check(continued.onRunning() == NodeStatus::RUNNING && missed.data->tmImInDribbleKick,
+              "one missed frame cancelled the dribble session");
+        check(missed.client->history.size() == 2 && missed.client->command.x > 0.3,
+              "recent-real dribble stopped refreshing motion/ramp");
+        missed.source = kick_strategy::BallSource::none;
+        check(continued.onRunning() == NodeStatus::SUCCESS && stopped(missed),
+              "expired dribble source did not stop");
 
         for (int cause = 0; cause < 5; ++cause) {
             Brain b; Kick action(&b); action.onStart(); tick(b, 10);
@@ -138,6 +153,7 @@ int main() {
         }
         Brain halt; Kick halted(&halt); halted.onStart(); halted.onHalted();
         check(stopped(halt), "tree halt left dribble velocity active");
+        check(!halt.data->tmImInDribbleKick, "halt retained dribble session");
 
         Brain kickoff; kickoff.data->isFreekickKickingOff = true; Kick soft(&kickoff);
         soft.onStart();

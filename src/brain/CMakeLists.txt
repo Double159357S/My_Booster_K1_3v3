@@ -110,6 +110,8 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_kick_behavior_tree.py)
   add_test(NAME test_kick_runtime COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_kick_runtime.py --compiler ${CMAKE_CXX_COMPILER})
+  add_test(NAME test_soccer_flow_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_soccer_flow_runtime.py --compiler ${CMAKE_CXX_COMPILER})
   add_executable(test_team_cooperation test/test_team_cooperation.cpp)
   target_include_directories(test_team_cooperation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)

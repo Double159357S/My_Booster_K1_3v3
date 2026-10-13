@@ -14,7 +14,7 @@
          </ReactiveSequence>
          <ReactiveSequence _while="!wait_for_opponent_kickoff" name="/正常比赛, 即已方开球或对方已经开球">
             <ReactiveSequence
-               _while="gc_opponent_set_play_search_direction != 0"
+               _while="gc_opponent_set_play_search_direction != 0 &amp;&amp; !(ball_location_known || tm_ball_pos_reliable)"
                name="我方门球或角球的远距离找球">
                <CamFindBall />
                <MoveToFarSetPlaySearchArea />
@@ -44,6 +44,7 @@
                         <!-- <Chase3   _while="decision == 'chase'"  vx_limit="1.5"  vy_limit="0.3"  vtheta_limit="1.5"  dist="0.4" safe_dist="0.6" /> -->
                         <Chase   _while="decision == 'chase'"  vx_limit="1.6"  vy_limit="0.8"  vtheta_limit="1.5"  dist="0.1" safe_dist="0.5" />
                         <RLVisionKick _while="decision == 'auto_visual_kick'" min_msec_kick="1500" max_msec_kick="7000" range="6.0"/>
+                        <!-- 冷却、启动失败退避或队友挡路时明确停步，仍由上游相机跟球。 -->
                         <SetVelocity _while="decision == 'kick_wait'" />
                         <!-- <Adjust  _while="decision == 'adjust'"  turn_threshold="0.2" range="0.4" vx_limit="0.4" vy_limit="0.4" vtheta_limit="1.0" /> -->
                         <!-- <Adjust2  _while="decision == 'adjust'"  range="0.4" vx_limit="0.4" vy_limit="0.4" vtheta_limit="1.5" /> -->

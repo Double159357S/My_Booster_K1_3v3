@@ -15,6 +15,12 @@
 | `brain_tree.cpp`：视觉踢球切换 | 踢球退出后可以立即重复启动；丢球时普通找球节点可能同时发头部命令。 | 前锋退出后等待配置的 600 ms 冷却；会话标志由踢球节点管理；普通找球在前锋视觉踢球会话中让出头部控制。 |
 | `vision`：`DataSyncer`、`VisionNode` | 缓冲区预填默认姿态；过期姿态只输出警告仍继续投影；逆序搜索遇到较差样本就提前退出，可能漏掉更接近的乱序样本。头部订阅的 reliable QoS 也可能与传感器 best-effort 发布端不匹配。 | 缓冲区从空开始；选择有效最近样本；图像与头部姿态差超过 120 ms 时丢弃该帧；头部订阅使用传感器 QoS，并移除重复的检测图像订阅。 |
 | `brain.cpp`：`imageCallback`、检测与球记忆 | 图像尺寸更新依赖日志开关；缺失投影坐标会越界；检测断流时旧的 `ballDetected` 标志可能一直保留。 | 关掉日志也更新真实图像尺寸；拒绝无效投影、过期和乱序帧；在 tick 中使断流球失效。 |
+| `MoveToFarSetPlaySearchArea`、前锋树 | 已有球位仍被预设半场搜索抢占；到达或超时仍返回 `RUNNING`。 | 本机/可靠共享球位立即让出流程；到达、超时结束本轮搜索，同一定位球不反复重启，新定位球可以重新搜索。 |
+| `StrikerDecide`、`RLVisionKick::onStart` | 决策选择视觉踢球后才检查队友挡路；拒绝启动没有明确停步。 | 决策层将挡路、冷却和失败退避统一路由到 `kick_wait`；执行层保留复查并明确停步。 |
+| `RobotClient`、`RLVisionKick` | 发出 RPC 请求就设置已启动，没有确认运控响应。 | 请求携带 `expect_response=true`；按 UUID 接受整数 `status=0` 响应后才标记启动成功。1200 ms 响应超时或拒绝时取消请求，等待 1000 ms 后重试；迟到、重复及旧 UUID 响应不能复活请求。响应订阅独立于诊断日志开关。 |
+| `Kick`、`StrikerDecide` | 普通趟踢单帧漏检后会重新决策、停步并重置加速。 | 在现有 650 ms 最近真实球有效期内保留运行会话、更新方向和加速；退出和抢占清除会话，过期球源仍停止。 |
+| `CamTrackBall`、`RLVisionKick` | 前锋 SDK 会话停止普通跟球，固定抬头并强制 yaw=0，可能把脚边球移出视野。 | 前锋和守门员会话均持续跟球，视觉踢球期间头部指令最多每 100 ms 更新一次；SDK 节点不再强制扫头。 |
+| `handleCooperation` | 旧 `cmd=100` 在统一仲裁之后单方面清除控球授权。 | 开启队友通信时由统一仲裁处理交接，旧命令不再覆盖结果。 |
 
 涉及实现：[brain.cpp](../src/brain/src/brain.cpp)、[brain_tree.cpp](../src/brain/src/brain_tree.cpp)、[robot_client.cpp](../src/brain/src/robot_client.cpp)、[前锋行为树](../src/brain/behavior_trees/subtrees/subtree_striker_play.xml)、[视觉同步](../src/vision/src/base/data_syncer.cpp)、[视觉节点](../src/vision/src/vision_node.cpp)。
 
@@ -31,8 +37,9 @@ python scripts/test_local.py
 已通过：
 
 - 5 个 C++ 测试程序：踢球几何、对准策略、三机协作、运动与观测坐标、裁判机 v20 协议。
-- 5 项行为树检查：READY、让行、前锋和守门员动作路由，以及运行中的踢球不能跳过决策。
+- 6 项行为树检查：READY、让行、前锋和守门员动作路由、运行中的踢球不能跳过决策，以及已有球位时不进入远距离搜索。
 - 踢球运行测试：直接提取当前源码中的 `Kick` 和 `crabWalk` 函数，以本地模拟的 ROS/SDK 边界执行，验证趟球方向、加速、软开球、球权撤销、失球、球越过身体、避障中止、抢占停步和固定截止时间。
+- 开球流程运行测试：提取实际节点声明、搜索/决策/跟球/视觉踢球函数、RPC 请求与响应处理，使用项目随带的 JSON 库运行。覆盖搜索交回与超时、等待后恢复、短暂漏检、持续头部跟踪、SDK 请求接受/拒绝/格式错误/响应超时、重复及迟到响应、取消与球权撤销。ROS 和消息传输边界由离线模拟替代。
 - 视觉同步测试：在本地 WSL 中编译实际 `data_syncer.cpp`，检查启动无姿态、单样本、乱序、过期/未来姿态和缓存长度。测试源码副本与工程文件的 SHA256 一致。
 
 视觉同步测试也可在具备 ROS 2、OpenCV 和 yaml-cpp 的本地 Linux/WSL 中重跑。先加载本地 ROS 2 环境，再执行：
@@ -44,3 +51,5 @@ ctest --test-dir build/local_vision_sync --output-on-failure
 ```
 
 这些测试验证了策略、动作函数和同步组件，不覆盖完整 `brain_node` 的 ROS/Booster SDK 编译、视觉模型质量、相机实际标定及机器人步态。整机编译和实机效果尚未验证。本次未修改三台机器人的身份、网络设置或相机外参，也未执行远程部署。
+
+视觉踢球启动确认沿用工程已有的 RPC 响应格式：`LocoApiTopicResp`、匹配 UUID、响应头中的整数 `status`。收到成功响应只表示请求被运控接受，不表示已经踢中球。机器人端对此请求的响应兼容性仍需实机确认；若响应缺失，日志会明确显示 `SDK start acknowledgement timeout`，不会继续声称已经启动。

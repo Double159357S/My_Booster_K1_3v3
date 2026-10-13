@@ -83,6 +83,13 @@ inline bool keepVisualKickSession(bool active, bool previousDecisionIsKick,
     return active && previousDecisionIsKick && authorized && !ballOut;
 }
 
+inline bool keepDribbleKickSession(bool active, bool previousDecisionIsKick,
+                                   bool authorized, bool recentRealBall,
+                                   double ballX, bool ballOut) {
+    return active && previousDecisionIsKick && authorized && recentRealBall &&
+        std::isfinite(ballX) && ballX > 0.0 && !ballOut;
+}
+
 // 软开球限速在整个趟球动作中保持，加速按实际时间计算，不依赖 tick 频率。
 inline double dribbleSpeedLimit(double requested, bool softKickoff,
                                bool kickingOff, double kickoffLimit) {

@@ -41,6 +41,8 @@ public:
     int liveCount = 0; // 已方存活机器人数量
     int oppoLiveCount = 0; // 对方存活机器人数量
     string realGameSubState; // 记录当前处于任意球, 门球等特殊状态. 因为 bb 上的 gc_game_sub_type 做了简化处理, 都看到任意球处理, 所以此处单独记录一下, 以便需要知道具体状态时使用.
+    std::uint64_t setPlaySearchEpoch = 0;
+    bool tmImInDribbleKick = false; // 普通趟踢动作仍在运行，由 Kick 管理生命周期。
 
     /* ------------------------------------ 数据记录 ------------------------------------ */
     

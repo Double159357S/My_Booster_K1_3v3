@@ -156,6 +156,8 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.auto_visual_kick_max_body_error", 0.25);
     declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
     declare_parameter<double>("strategy.auto_visual_kick.cooldown_ms", 600.0);
+    declare_parameter<double>("strategy.auto_visual_kick.start_ack_timeout_ms", 1200.0);
+    declare_parameter<double>("strategy.auto_visual_kick.start_retry_ms", 1000.0);
     declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
     declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.8);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
@@ -1135,9 +1137,12 @@ void Brain::handleCooperation() {
     if (cmd != 0) {
         log_(format("received cmd %d from teammate", cmd));
         if (cmd == 100) { // 队友要控球
-            data->tmImLead = false;
-            tree->setEntry<bool>("is_lead", false);
-            log_("teammate wants to take lead, i'll assist");
+            // 分布式球权已经统一决定；旧命令不能在仲裁之后单方面撤销授权。
+            if (!config->enableCom) {
+                data->tmImLead = false;
+                tree->setEntry<bool>("is_lead", false);
+            }
+            log_("legacy take-lead command received; shared arbitration owns the grant");
         } else if (cmd > 10 && cmd < 20 && !inReady) {
             log_("goalie wants to attack");
             int newGoalieId = cmd - 10;
@@ -2185,6 +2190,10 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
 
     data->timeLastGamecontrolMsg = get_clock()->now();
     communication->setGameControllerProtocolVersion(msg.version);
+    if (tree->getEntry<int>("gc_set_play") != static_cast<int>(msg.set_play) ||
+        (msg.set_play != 0 && msg.stopped && !tree->getEntry<bool>("gc_play_stopped"))) {
+        ++data->setPlaySearchEpoch;
+    }
     tree->setEntry<bool>("gc_play_stopped", msg.stopped);
     tree->setEntry<int>("gc_set_play", static_cast<int>(msg.set_play));
     tree->setEntry<int>("gc_protocol_version", static_cast<int>(msg.version));

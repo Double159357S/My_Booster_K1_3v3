@@ -21,9 +21,6 @@ namespace
 constexpr double kVisionKickBadPoseBackX = -0.10;
 constexpr double kVisionKickBadPoseYawLimit = 1.75;
 constexpr int kVisionKickBadPoseMaxTicks = 3;
-constexpr double kVisionKickHeadScanPitch = 0.4;
-constexpr double kVisionKickHeadDownPitch = 0.7;
-constexpr double kVisionKickHeadCommandIntervalMs = 100.0;
 
 double visualKickDecelerateMs(Brain *brain, bool startup, bool goalieKick = false)
 {
@@ -49,6 +46,12 @@ bool visualKickNearRealBall(Brain *brain, double maxRange = 1.0)
 {
     return visualKickCurrentRealBallFresh(brain) &&
         brain->data->ball.range <= maxRange;
+}
+
+bool visualKickRetryReady(Brain *brain) {
+    const auto failed = RLVisionKick::getLastStartFailureTime();
+    return failed.nanoseconds() == 0 || brain->msecsSince(failed) >= std::clamp(
+        brain->get_parameter("strategy.auto_visual_kick.start_retry_ms").as_double(), 100.0, 5000.0);
 }
 
 bool strikerVisualKickAligned(Brain *brain, bool afterDeceleration = false)
@@ -305,9 +308,7 @@ NodeStatus StepOnSpot::tick()
 
 NodeStatus CamTrackBall::tick()
 {
-    // 前锋 SDK 会话自行控制头部；守门员继续凝视已确认的球，不重新扫头。
-    if (brain->data->tmImInVisualKick &&
-        !brain->tree->getEntry<bool>("goalie_block_kick_active")) return NodeStatus::SUCCESS;
+    // 前锋和守门员都持续跟球，VisualKick 不再强制抬头和归零 yaw。
     double pitch, yaw, ballX, ballY, deltaX, deltaY;
     const double pixToleranceX = brain->config->camPixX * 3 / 10.; // 球距离视野中心的像素差小于这个容差, 则认为在视野中心了.
     const double pixToleranceY = brain->config->camPixY * 3 / 10.;
@@ -375,7 +376,11 @@ NodeStatus CamTrackBall::tick()
         logTrackingBox(0xFF0000FF, label);
     }
 
+    if (brain->data->tmImInVisualKick && lastHeadCommandTime.nanoseconds() > 0 &&
+        brain->msecsSince(lastHeadCommandTime) >= 0.0 &&
+        brain->msecsSince(lastHeadCommandTime) < 100.0) return NodeStatus::SUCCESS;
     brain->client->moveHead(pitch, yaw);
+    lastHeadCommandTime = brain->get_clock()->now();
 
     // 新添加逻辑：检查计算后的 yaw 是否超过阈值，调整身体转动
     // const double maxHeadYaw = 0.8;  // 头部 yaw 最大值
@@ -655,6 +660,14 @@ NodeStatus MoveToFarSetPlaySearchArea::onStart()
         return NodeStatus::SUCCESS;
     }
 
+    if (brain->tree->getEntry<bool>("ball_location_known") ||
+        brain->tree->getEntry<bool>("tm_ball_pos_reliable") ||
+        !brain->tree->getEntry<bool>("odom_calibrated") ||
+        (_searchFinished && _finishedEpoch == brain->data->setPlaySearchEpoch)) {
+        return NodeStatus::SUCCESS;
+    }
+    _searchFinished = false;
+
     _direction = searchDirection > 0 ? 1 : -1;
     const double triggerX =
         brain->get_parameter("strategy.far_set_play_search.trigger_x").as_double();
@@ -744,16 +757,9 @@ NodeStatus MoveToFarSetPlaySearchArea::onRunning()
         return NodeStatus::SUCCESS;
     }
 
-    const double triggerX =
-        brain->get_parameter("strategy.far_set_play_search.trigger_x").as_double();
-    const double robotX = brain->data->robotPoseToField.x;
-    const bool isOnExpectedHalf =
-        (_direction > 0 && robotX >= triggerX) ||
-        (_direction < 0 && robotX <= -triggerX);
-    if (isOnExpectedHalf && ballKnown)
+    if (ballKnown)
     {
-        // 队友给出的球坐标只能在机器人进入正确半场后结束远距离移动。
-        // 这样既不会在错误半场提前停下，到达后也能立即交回正常找球/站位逻辑。
+        // 可用球位比预设半场优先，立即交回追球/开球流程。
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
@@ -762,7 +768,7 @@ NodeStatus MoveToFarSetPlaySearchArea::onRunning()
     {
         // 场地坐标不可靠时不做长距离盲走，保持扫描并等待定位恢复。
         brain->client->setVelocity(0, 0, 0);
-        return NodeStatus::RUNNING;
+        return NodeStatus::SUCCESS;
     }
 
     const double elapsedSecs =
@@ -778,7 +784,9 @@ NodeStatus MoveToFarSetPlaySearchArea::onRunning()
             _moveTimedOut = true;
         }
         brain->client->setVelocity(0, 0, 0);
-        return NodeStatus::RUNNING;
+        _searchFinished = true;
+        _finishedEpoch = brain->data->setPlaySearchEpoch;
+        return NodeStatus::SUCCESS;
     }
 
     const auto robotPose = brain->data->robotPoseToField;
@@ -796,7 +804,9 @@ NodeStatus MoveToFarSetPlaySearchArea::onRunning()
             _arrived = true;
         }
         brain->client->setVelocity(0, 0, 0);
-        return NodeStatus::RUNNING;
+        _searchFinished = true;
+        _finishedEpoch = brain->data->setPlaySearchEpoch;
+        return NodeStatus::SUCCESS;
     }
 
     brain->client->moveToPoseOnField3(
@@ -1592,6 +1602,16 @@ NodeStatus StrikerDecide::tick() {
         return NodeStatus::SUCCESS;
     }
 
+    const bool wasDribbling = lastDecision == "kick" || lastDecision == "safe_shoot" ||
+        lastDecision == "power_kick" || lastDecision == "cross";
+    if (kick_strategy::keepDribbleKickSession(brain->data->tmImInDribbleKick,
+            wasDribbling, brain->data->tmImLead, visualKickCurrentRealBallFresh(brain),
+            brain->data->ball.posToRobot.x, brain->tree->getEntry<bool>("ball_out"))) {
+        // Kick 自己检查距离、移动、避障和截止时间；短暂漏检不重置加速。
+        setOutput("decision_out", lastDecision);
+        return NodeStatus::SUCCESS;
+    }
+
     bool enableAutoVisualKick = false;
     brain->get_parameter("strategy.enable_auto_visual_kick", enableAutoVisualKick);
     double autoVisualKickEnableDistMin = 0.05;
@@ -1685,6 +1705,10 @@ NodeStatus StrikerDecide::tick() {
     const bool visualKickCooldownReady = RLVisionKick::getLastExitTime().nanoseconds() == 0 ||
         brain->msecsSince(RLVisionKick::getLastExitTime()) >=
             brain->get_parameter("strategy.auto_visual_kick.cooldown_ms").as_double();
+    const bool visualKickSpaceBlocked = brain->teammateBlocksKick();
+    const bool visualKickRetryIsReady = visualKickRetryReady(brain);
+    const bool visualKickStartReady = visualKickCooldownReady && visualKickRetryIsReady &&
+        !visualKickSpaceBlocked;
     log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, deltaDir: %.2f, visualDirReady: %d, angleGoodForKick: %d, angleGoodForShoot: %d, shootPossible: %d, powerShootPossible: %d",
         ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, deltaDir,
         visualKickDirectionReady, angleGoodForKick, angleGoodForShoot,
@@ -1730,7 +1754,7 @@ NodeStatus StrikerDecide::tick() {
     else if (nearBallVisualKick)
     {
         // Near-ball urgency never bypasses the shared ownership grant.
-        newDecision = visualKickCooldownReady ? "auto_visual_kick" : "kick_wait";
+        newDecision = visualKickStartReady ? "auto_visual_kick" : "kick_wait";
         color = 0xFF00FFFF;
         log(format("near-ball visual kick: range=%.2f", ballRange));
     }
@@ -1759,7 +1783,7 @@ NodeStatus StrikerDecide::tick() {
         brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
         fabs(brain->data->robotPoseToField.y) < 5.0
     ) {
-        newDecision = visualKickCooldownReady ? "auto_visual_kick" : "kick_wait";
+        newDecision = visualKickStartReady ? "auto_visual_kick" : "kick_wait";
         color = 0xFF00FFFF;
     }
     else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
@@ -1773,7 +1797,6 @@ NodeStatus StrikerDecide::tick() {
             || reachedKickDir
         )
         && !avoidKick
-        && brain->data->ballDetected
         && visualKickCurrentRealBallFresh(brain)
         && fabs(brain->data->ball.yawToRobot) < KICK_THETA_RANGE
         && ball.range < KICK_RANGE
@@ -1799,6 +1822,11 @@ NodeStatus StrikerDecide::tick() {
     // 真正的会话标志由 RLVisionKick::onStart/onRunning/onHalted 管理。
 
     setOutput("decision_out", newDecision);
+    if (newDecision == "kick_wait") {
+        RCLCPP_INFO_THROTTLE(brain->get_logger(), *brain->get_clock(), 1000,
+            "[Striker] waiting: teammate_blocked=%d cooldown_ready=%d start_retry_ready=%d",
+            visualKickSpaceBlocked, visualKickCooldownReady, visualKickRetryIsReady);
+    }
     if (newDecision != lastReportedDecision ||
         (ballRange <= 0.8 &&
          (timeLastDecisionLog.nanoseconds() == 0 || brain->msecsSince(timeLastDecisionLog) >= 1000.0))) {
@@ -1957,8 +1985,8 @@ NodeStatus Analyze2::tick()
         fd.penaltyAreaWidth, areaMargin);
     maxRange = std::clamp(maxRange, 0.5, claimRange);
     maxDirectionError = std::clamp(maxDirectionError, 0.2, M_PI);
-    const bool cooldownOk = RLVisionKick::getLastExitTime().nanoseconds() == 0 ||
-        brain->msecsSince(RLVisionKick::getLastExitTime()) >= cooldownMs;
+    const bool cooldownOk = visualKickRetryReady(brain) && (RLVisionKick::getLastExitTime().nanoseconds() == 0 ||
+        brain->msecsSince(RLVisionKick::getLastExitTime()) >= cooldownMs);
     const double cooldownRemaining = RLVisionKick::getLastExitTime().nanoseconds() == 0
         ? 0.0 : std::max(0.0, cooldownMs - brain->msecsSince(RLVisionKick::getLastExitTime()));
     const double teammateDistance = brain->teammateDistance();
@@ -2154,6 +2182,7 @@ tuple<double, double, double> Kick::_calcSpeed() {
 
 NodeStatus Kick::onStart()
 {
+    brain->data->tmImInDribbleKick = false;
     const bool autonomous = brain->tree->getEntry<int>("control_state") == 3 &&
         !brain->tree->getEntry<bool>("assist_kick");
     if ((autonomous && !brain->data->tmImLead) ||
@@ -2206,6 +2235,7 @@ NodeStatus Kick::onStart()
         brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
     }
     // 返回运行中状态，表示节点将继续处理。
+    brain->data->tmImInDribbleKick = true;
     return NodeStatus::RUNNING;
 }
 
@@ -2216,6 +2246,7 @@ NodeStatus Kick::onRunning()
         brain->log->log("debug/Kick", rerun::TextLog(msg));
     };
     const auto stop = [&]() {
+        brain->data->tmImInDribbleKick = false;
         brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
         return NodeStatus::SUCCESS;
     };
@@ -2280,12 +2311,11 @@ NodeStatus Kick::onRunning()
             return stop();
         }
         // else
-        if (brain->data->ballDetected) { // 如果还能看见球, 则修正方向
-            _speed = kick_strategy::rampDribbleSpeed(
-                _speed, _speedLimit, brain->msecsSince(_lastSpeedUpdate));
-            _lastSpeedUpdate = brain->get_clock()->now();
-            brain->client->crabWalk(brain->data->ball.yawToRobot, _speed);
-        }
+        // 已通过最近真实球检查，短暂漏检时也按当前姿态重投影后的球位续踢。
+        _speed = kick_strategy::rampDribbleSpeed(
+            _speed, _speedLimit, brain->msecsSince(_lastSpeedUpdate));
+        _lastSpeedUpdate = brain->get_clock()->now();
+        brain->client->crabWalk(brain->data->ball.yawToRobot, _speed);
 
         return NodeStatus::RUNNING;
     }
@@ -2297,12 +2327,14 @@ NodeStatus Kick::onRunning()
 
 void Kick::onHalted()
 {
+    brain->data->tmImInDribbleKick = false;
     brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
     _startTime -= rclcpp::Duration(100, 0);
 }
 
 
 rclcpp::Time RLVisionKick::_lastExitTime = rclcpp::Time(0, 0, RCL_ROS_TIME);
+rclcpp::Time RLVisionKick::_lastStartFailureTime = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
 NodeStatus RLVisionKick::onStart()
 {
@@ -2313,10 +2345,9 @@ NodeStatus RLVisionKick::onStart()
     _startTime = brain->get_clock()->now();
     _sessionStartTime = _startTime;
     _lastProgressTime = _startTime;
-    _lastHeadCommandTime = rclcpp::Time(0, 0, RCL_ROS_TIME);
-    _headCommandSent = false;
     _isDecelerating = false;
     _visionKickStarted = false;
+    _visionKickRequested = false;
     _pendingRobocupWalk = false;
     _pendingExitReason.clear();
     _extraRoundsUsed = 0;
@@ -2333,7 +2364,7 @@ NodeStatus RLVisionKick::onStart()
         _progressKickDir = brain->data->kickDir;
     }
 
-    if (!brain->data->tmImLead || brain->teammateBlocksKick() ||
+    if (!brain->data->tmImLead || !visualKickRetryReady(brain) || brain->teammateBlocksKick() ||
         !visualKickBallUsable(brain, goalieKick) ||
         (!goalieKick && !strikerVisualKickAligned(brain))) {
         RCLCPP_INFO_THROTTLE(brain->get_logger(), *brain->get_clock(), 1000,
@@ -2344,6 +2375,7 @@ NodeStatus RLVisionKick::onStart()
         brain->tree->setEntry<bool>("goalie_block_kick_active", false);
         brain->data->goalieVisualKickSubState = "none";
         brain->data->goalieVisualKickTargetValid = false;
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
         recordExitTime();
         return NodeStatus::SUCCESS;
     }
@@ -2373,6 +2405,8 @@ NodeStatus RLVisionKick::onRunning()
         brain->data->goalieVisualKickSubState = "none";
         brain->data->goalieVisualKickTargetValid = false;
         brain->data->goalieVisualKickTargetField = {0.0, 0.0, 0.0};
+        _visionKickRequested = false;
+        _visionKickStarted = false;
     };
     auto beginExit = [&](const string &reason) -> NodeStatus {
         if (!_pendingRobocupWalk) {
@@ -2390,9 +2424,9 @@ NodeStatus RLVisionKick::onRunning()
         logExit("exit visual kick immediately: recovery requested");
         brain->data->shouldExitRLVisionKick = false;
         brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
-        if (_visionKickStarted) brain->client->robocupWalk();
-        clearState();
+        if (_visionKickRequested) brain->client->robocupWalk();
         recordExitTime();
+        clearState();
         _isDecelerating = false;
         _pendingRobocupWalk = false;
         return NodeStatus::SUCCESS;
@@ -2417,7 +2451,7 @@ NodeStatus RLVisionKick::onRunning()
 
         if (!_isDecelerating) {
             if (_pendingRobocupWalk) {
-                if (_visionKickStarted) brain->client->robocupWalk();
+                if (_visionKickRequested) brain->client->robocupWalk();
                 _pendingRobocupWalk = false;
                 clearState();
                 return NodeStatus::SUCCESS;
@@ -2430,34 +2464,34 @@ NodeStatus RLVisionKick::onRunning()
                     return NodeStatus::SUCCESS;
                 }
                 brain->client->RLVisionKick(true);
-                std::cout << "[RLVisionKick] started goalie=" << goalieKick
+                _visionKickRequested = true;
+                std::cout << "[RLVisionKick] start requested goalie=" << goalieKick
                           << " startup_ms=" << _decelDurationMs
                           << " ball_range=" << brain->data->ball.range << std::endl;
-                _headScanStartTime = brain->get_clock()->now();
-                _visionKickStarted = true;
             }
         }
         return NodeStatus::RUNNING;
     }
 
-    if (_visionKickStarted && !goalieKick) {
-        double headMsec = brain->msecsSince(_headScanStartTime);
-        // 前锋沿用 SDK 的两段头部动作。守门员由上游 CamTrackBall 持续跟球，
-        // 已确认的近球不再经历 300ms 抬头扫描及强制 yaw=0 导致的漏检。
-        const double targetPitch = headMsec < 300.0
-            ? kVisionKickHeadScanPitch
-            : kVisionKickHeadDownPitch;
-        const bool commandDue = !_headCommandSent ||
-            brain->msecsSince(_lastHeadCommandTime) >= kVisionKickHeadCommandIntervalMs;
-        if (commandDue) {
-            brain->client->moveHead(targetPitch, 0.0);
-            _lastHeadCommandTime = brain->get_clock()->now();
-            _headCommandSent = true;
-        }
-    }
-
     if (!visualKickBallUsable(brain, goalieKick)) {
         return beginExit("no usable/fresh ball source");
+    }
+
+    if (!_visionKickStarted) {
+        const auto startState = brain->client->visualKickStartState();
+        if (startState == kick_strategy::StartState::pending) {
+            brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+            return NodeStatus::RUNNING;
+        }
+        if (startState != kick_strategy::StartState::accepted) {
+            _lastStartFailureTime = brain->get_clock()->now();
+            return beginExit(startState == kick_strategy::StartState::timedOut
+                ? "SDK start acknowledgement timeout" : "SDK start rejected");
+        }
+        _visionKickStarted = true;
+        _startTime = brain->get_clock()->now();
+        _lastProgressTime = _startTime;
+        logExit("start accepted by SDK");
     }
 
     double elapsed = brain->msecsSince(_startTime);
@@ -2584,13 +2618,12 @@ void RLVisionKick::onHalted()
     brain->data->goalieVisualKickSubState = "none";
     brain->data->goalieVisualKickTargetValid = false;
     brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
-    if (_visionKickStarted) brain->client->robocupWalk();
+    if (_visionKickRequested) brain->client->robocupWalk();
     recordExitTime();
 
     _isDecelerating = false;
     _visionKickStarted = false;
-    _headCommandSent = false;
-    _lastHeadCommandTime = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    _visionKickRequested = false;
     _pendingRobocupWalk = false;
     _pendingExitReason.clear();
 }

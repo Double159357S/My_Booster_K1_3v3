@@ -31,6 +31,19 @@ def selected_actions(node, variable, value, action_types):
 
 
 class MatchMotionRouting(unittest.TestCase):
+    def test_search_does_not_preempt_a_known_ball(self):
+        for filename in ("subtree_striker_play.xml", "subtree_striker_freekick.xml"):
+            root = ET.parse(TREES / filename).getroot()
+            parents = {child: node for node in root.iter() for child in node}
+            search = root.find(".//MoveToFarSetPlaySearchArea")
+            condition = search.get("_while") or parents[search].get("_while")
+            for local, shared in ((True, False), (False, True), (True, True), (False, False)):
+                with self.subTest(filename=filename, local=local, shared=shared):
+                    self.assertEqual(condition_matches(condition, {
+                        "gc_opponent_set_play_search_direction": 1,
+                        "ball_location_known": local, "tm_ball_pos_reliable": shared}),
+                        not (local or shared))
+
     def test_ready_routes_to_formation_with_tight_arrival_tolerance(self):
         root = ET.parse(TREES.parent / "game.xml").getroot()
         ready = root.find(".//ReactiveSequence[@_while=\"gc_game_state=='READY'\"]")
