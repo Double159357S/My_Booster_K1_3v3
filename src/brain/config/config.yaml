@@ -170,7 +170,7 @@ brain_node:
 
     rerunLog:
       enable_tcp: false # 是否通过网络传输 log
-      server_ip: "192.168.10.110:9876" # 开启了 rerun Viewer 的机器地址
+      server_ip: "192.168.133.210:9876" # 开启了 rerun Viewer 的机器地址
       enable_file: true # 是否将 log 写入本地,加入默认扫场
       log_dir: "/home/booster/Workspace/rrlog" # 本地 log 存储路径, 会在此路径下生成以时间为开头的文件
       max_log_file_mins: 5.0 # 本地 log 最长多少分钟就分片存储. 太大的文件会导致读的时候死机.

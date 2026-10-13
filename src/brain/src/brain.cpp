@@ -1948,11 +1948,13 @@ void Brain::calibrateOdom(double x, double y, double theta, bool alignToVisionTi
     for (int i = 0; i < goalposts.size(); i++) {
         updateFieldPos(goalposts[i]);
     }
+    data->setGoalposts(goalposts);
     
     // markers
     for (int i = 0; i < markings.size(); i++) {
         updateFieldPos(markings[i]);
     }
+    data->setMarkings(markings);
 
     log->setTimeNow();
     log->log(

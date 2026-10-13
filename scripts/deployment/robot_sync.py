@@ -216,17 +216,9 @@ def merge_brain(local_text, remote_text):
         raise ValueError('Invalid brain configuration')
     if not isinstance(remote.get('game', {}).get('player_id'), int):
         raise ValueError('Missing robot player_id; refusing to copy another robot identity')
-    paths = [('game', 'player_id'), ('game', 'player_role'), ('game', 'player_start_pos'),
-             ('game_control_ip',), ('rerunLog', 'server_ip'), ('rerunLog', 'log_dir')]
-
-    def leaves(value, prefix):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                yield from leaves(child, prefix + (key,))
-        else:
-            yield prefix
-    for block in ('robot', 'vision'):
-        paths.extend(leaves(remote.get(block, {}), (block,)))
+    # Keep the whole robot-specific game block, including future/remote-only
+    # fields. All other settings come from local except these two log locations.
+    log_locations = ('server_ip', 'log_dir')
     root_node = yaml.compose(local_text)
 
     def lookup(mapping, path):
@@ -243,21 +235,81 @@ def merge_brain(local_text, remote_text):
             node = found[0]
         return node
 
-    replacements, kept = [], []
-    for path in paths:
-        try:
+    def render(node, value):
+        if isinstance(node, yaml.MappingNode) and not node.flow_style:
+            # Keep block YAML so setup/set_up.py can still edit individual keys.
+            lines = yaml.safe_dump(value, default_flow_style=False, sort_keys=False,
+                                   allow_unicode=True, width=100000).rstrip('\n').splitlines()
+            indent = ' ' * node.start_mark.column
+            text = ('\n' + indent).join(lines) + '\n'
+            return text
+        return yaml.safe_dump(value, default_flow_style=True, sort_keys=False,
+                              allow_unicode=True, width=100000).strip().removesuffix('\n...')
+
+    def replace_value(node, value):
+        end = node.end_mark.index
+        if isinstance(node, yaml.MappingNode) and not node.flow_style and end < len(local_text):
+            # A block mapping's end mark points past the next key's indent.
+            # Leave that indent outside the edit, including when adding a block.
+            end -= node.end_mark.column
+        return node.start_mark.index, end, render(node, value)
+
+    def leaves(value, prefix):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield from leaves(child, prefix + (key,))
+        else:
+            yield '.'.join(prefix)
+
+    replacements = []
+    kept = list(leaves(remote['game'], ('game',)))
+    game_node = node_at(('game',))
+    if not isinstance(local.get('game'), dict):
+        raise ValueError('Invalid local game configuration')
+    if local['game'] != remote['game']:
+        replacements.append(replace_value(game_node, remote['game']))
+
+    local_log, remote_log = local.get('rerunLog', {}), remote.get('rerunLog', {})
+    if not isinstance(local_log, dict) or not isinstance(remote_log, dict):
+        raise ValueError('Invalid rerunLog configuration')
+    kept.extend('rerunLog.' + name for name in log_locations if name in remote_log)
+    if 'rerunLog' not in local and any(name in remote_log for name in log_locations):
+        # The local template may remove logging settings; retained locations
+        # still belong to the robot, so append them without copying other keys.
+        params = node_at(())
+        indent = ' ' * params.value[0][0].start_mark.column
+        retained = {name: remote_log[name] for name in log_locations if name in remote_log}
+        text = yaml.safe_dump({'rerunLog': retained}, sort_keys=False, allow_unicode=True)
+        text = ''.join(indent + line for line in text.splitlines(keepends=True))
+        index = params.end_mark.index
+        if index < len(local_text):
+            index -= params.end_mark.column
+        if index and not local_text[:index].endswith('\n'):
+            text = '\n' + text
+        replacements.append((index, index, text))
+    elif any((name in local_log) != (name in remote_log) for name in log_locations):
+        # Preserve absence as well as values: never introduce a local log IP or
+        # directory that the robot did not have, and keep remote-only locations.
+        merged_log = dict(local_log)
+        for name in log_locations:
+            if name in remote_log:
+                merged_log[name] = remote_log[name]
+            else:
+                merged_log.pop(name, None)
+        node = node_at(('rerunLog',))
+        replacements.append(replace_value(node, merged_log))
+    else:
+        for name in log_locations:
+            if name not in remote_log:
+                continue
+            path = ('rerunLog', name)
             value, original = lookup(remote, path), lookup(local, path)
             node = node_at(path)
-        except KeyError:
-            continue
-        if not isinstance(node, yaml.ScalarNode):
-            raise ValueError('Protected brain parameter must be scalar: ' + '.'.join(path))
-        kept.append('.'.join(path))
-        if type(value) is type(original) and value == original:
-            continue
-        serialized = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True,
-                                    width=100000).strip().removesuffix('\n...')
-        replacements.append((node.start_mark.index, node.end_mark.index, serialized))
+            if not isinstance(node, yaml.ScalarNode):
+                raise ValueError('Protected brain parameter must be scalar: ' + '.'.join(path))
+            if type(value) is type(original) and value == original:
+                continue
+            replacements.append(replace_value(node, value))
     for start, end, value in sorted(replacements, reverse=True):
         local_text = local_text[:start] + value + local_text[end:]
     yaml.safe_load(local_text)  # The edited text must still be valid YAML.

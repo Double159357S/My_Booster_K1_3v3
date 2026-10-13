@@ -32,9 +32,13 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\sync_robots.ps1"
 - 排除 `build`、`install`、日志、缓存、压缩包和本地编译产物；保留源码随附的 `.so`、`.a` 依赖库。
 - 保留机器人独有文件，不删除本地没有的文件。
 - 保留相机/场地标定 YAML、Fast DDS 配置和 `*_local.yaml`。
-- 合并 brain 配置：更新本地策略参数，同时保留机器人的球员号、角色、初始侧、机器人校准、相机参数、裁判机和日志服务器地址。
+- 合并 `src/brain/config/config.yaml`：保留机器人 `game` 下的全部参数，以及 `rerunLog.server_ip`、`rerunLog.log_dir`；其余参数全部按本地更新，包括 `robot`、`vision` 和 `game_control_ip`。
 - 保留 GameController 接收节点中的 IP 白名单设置。
 - Linux 文本转为 LF 换行；Shell 脚本补齐执行权限。
+
+`game` 整块保留机器人配置，包括 `team_id`、`player_id`、`field_type`、`player_role`、`player_start_pos`、`treat_person_as_robot`、`number_of_players` 及机器人自有的其他字段。本地新增的 `game` 字段也不会被加入。日志服务器和存储目录同样保留原值；其他日志选项仍更新。
+
+以上规则只针对 brain 的 `config.yaml` 参数合并。单独的视觉标定 YAML、`*_local.yaml` 和 `configs/fastdds.xml` 仍按原规则保留。若机器人有 `config_local.yaml`，它的同名参数仍可能覆盖更新后的 `config.yaml`。
 
 覆盖前备份到机器人目录下的 `.robot-sync-backups/<备份编号>`，覆盖后校验哈希。单台复制失败时恢复已经覆盖的文件；多台并非一起提交，失败详情查看报告。报告位于本地工程的 `.robot-sync/<运行编号>/result.json`。
 

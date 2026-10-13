@@ -214,7 +214,7 @@ class RobotSyncTests(unittest.TestCase):
         self.assertEqual(sync.source_bytes(binary), b'\x00\xff\r\n')
         self.assertEqual(len(request['skipped']), 2)
 
-    def test_brain_merge_keeps_identity_and_calibration_but_updates_strategy(self):
+    def test_brain_merge_keeps_entire_game_and_log_locations_and_updates_other_settings(self):
         import yaml
         local = '''brain_node:
   ros__parameters:
@@ -223,11 +223,21 @@ class RobotSyncTests(unittest.TestCase):
       player_id: 3 # identity comment
       player_role: striker
       player_start_pos: left
+      field_type: kid_size
+      treat_person_as_robot: true
+      number_of_players: 3
+      local_only: do_not_sync
     robot:
       odom_factor: 1.0
+      vx_limit: 1.6
     vision:
       cam_pixel_width: 1280
     game_control_ip: 172.169.133.210
+    rerunLog:
+      server_ip: local-log-server
+      log_dir: /local/logs
+      enable_file: false
+      img_interval: 2
     strategy:
       cooperation:
         owner_hold_ms: 1500.0 # new strategy comment
@@ -239,27 +249,107 @@ class RobotSyncTests(unittest.TestCase):
       player_id: 1
       player_role: goal_keeper
       player_start_pos: right
+      field_type: adult_size
+      treat_person_as_robot: false
+      number_of_players: 5
+      remote_only:
+        formation: preserved
     robot:
       odom_factor: 0.9
+      vx_limit: 0.6
     vision:
       cam_pixel_width: 544
     game_control_ip: 192.168.133.210
+    rerunLog:
+      server_ip: robot-log-server
+      log_dir: /robot/logs
+      enable_file: true
+      img_interval: 5
     strategy:
       cooperation:
         owner_hold_ms: 50.0
 '''
         merged, kept = sync.merge_brain(local, remote)
         parsed = yaml.safe_load(merged)['brain_node']['ros__parameters']
-        self.assertEqual(parsed['game'], {'team_id': 70, 'player_id': 1,
-                                         'player_role': 'goal_keeper', 'player_start_pos': 'right'})
-        self.assertEqual(parsed['robot']['odom_factor'], 0.9)
-        self.assertEqual(parsed['vision']['cam_pixel_width'], 544)
-        self.assertEqual(parsed['game_control_ip'], '192.168.133.210')
+        self.assertEqual(parsed['game'], yaml.safe_load(remote)['brain_node']['ros__parameters']['game'])
+        self.assertEqual(parsed['robot'], {'odom_factor': 1.0, 'vx_limit': 1.6})
+        self.assertEqual(parsed['vision']['cam_pixel_width'], 1280)
+        self.assertEqual(parsed['game_control_ip'], '172.169.133.210')
+        self.assertEqual(parsed['rerunLog'], {'server_ip': 'robot-log-server', 'log_dir': '/robot/logs',
+                                             'enable_file': False, 'img_interval': 2})
         self.assertEqual(parsed['strategy']['cooperation']['owner_hold_ms'], 1500.0)
         self.assertIn(b'# new strategy comment', merged)
-        self.assertIn(b'# identity comment', merged)
         self.assertIn('game.player_id', kept)
+        self.assertIn('game.team_id', kept)
+        self.assertIn('game.remote_only.formation', kept)
+        self.assertIn('rerunLog.server_ip', kept)
+        self.assertNotIn('robot.odom_factor', kept)
+        self.assertNotIn('game_control_ip', kept)
         self.assertEqual(sync.merge_brain(merged.decode(), merged.decode())[0], merged)
+
+    def test_brain_merge_preserves_missing_and_remote_only_log_locations(self):
+        import yaml
+        for local_log, remote_log in (
+                ({'server_ip': 'local', 'log_dir': '/local', 'enable_file': False}, {'enable_file': True}),
+                ({'enable_file': False}, {'server_ip': 'robot', 'log_dir': '/robot', 'enable_file': True}),
+                ({'server_ip': 'local', 'enable_file': False}, {'log_dir': '/robot'})):
+            with self.subTest(local=local_log, remote=remote_log):
+                local = yaml.safe_dump({'brain_node': {'ros__parameters': {
+                    'game': {'player_id': 3}, 'rerunLog': local_log, 'enable_com': True}}}, sort_keys=False)
+                remote = yaml.safe_dump({'brain_node': {'ros__parameters': {
+                    'game': {'player_id': 1}, 'rerunLog': remote_log}}}, sort_keys=False)
+                merged, _ = sync.merge_brain(local, remote)
+                params = yaml.safe_load(merged)['brain_node']['ros__parameters']
+                expected = {'enable_file': False}
+                expected.update({key: remote_log[key] for key in ('server_ip', 'log_dir') if key in remote_log})
+                self.assertEqual(params['rerunLog'], expected)
+                self.assertTrue(params['enable_com'])
+                self.assertEqual(sync.merge_brain(merged.decode(), remote)[0], merged)
+
+    def test_brain_merge_retains_log_locations_when_local_log_block_is_absent(self):
+        import yaml
+        for ending in ('', '\n', '\n  use_sim_time: false\n'):
+            with self.subTest(ending=ending):
+                local = 'brain_node:\n  ros__parameters:\n    game:\n      player_id: 3' + ending
+                remote = '''brain_node:
+  ros__parameters:
+    game:
+      player_id: 1
+    rerunLog:
+      server_ip: robot
+      log_dir: /robot
+      enable_file: true
+'''
+                merged, _ = sync.merge_brain(local, remote)
+                params = yaml.safe_load(merged)['brain_node']['ros__parameters']
+                self.assertEqual(params['game'], {'player_id': 1})
+                self.assertEqual(params['rerunLog'], {'server_ip': 'robot', 'log_dir': '/robot'})
+                if ending.endswith('false\n'):
+                    self.assertFalse(yaml.safe_load(merged)['brain_node']['use_sim_time'])
+
+    def test_shipped_brain_config_updates_everything_except_game_and_log_locations(self):
+        import copy
+        import yaml
+        config_path = Path(__file__).resolve().parents[2] / sync.BRAIN_CONFIG
+        local = config_path.read_text(encoding='utf-8')
+        local_params = yaml.safe_load(local)['brain_node']['ros__parameters']
+        remote_params = copy.deepcopy(local_params)
+        for key, value in local_params.items():
+            if key not in ('game', 'rerunLog'):
+                remote_params[key] = {'old_robot_only_value': 123} if isinstance(value, dict) else not value
+        remote_params['game'].update(team_id=99, player_id=1, field_type='adult_size',
+            player_role='goal_keeper', player_start_pos='right', treat_person_as_robot=False, number_of_players=5)
+        remote_params['game']['remote_only'] = 'keep'
+        remote_params['rerunLog'].update(server_ip='robot-server', log_dir='/robot/logs',
+            enable_file=False, enable_tcp=True, img_interval=99)
+        remote = yaml.safe_dump({'brain_node': {'ros__parameters': remote_params}}, sort_keys=False)
+        merged, _ = sync.merge_brain(local, remote)
+        expected = copy.deepcopy(local_params)
+        expected['game'] = remote_params['game']
+        for key in ('server_ip', 'log_dir'):
+            expected['rerunLog'][key] = remote_params['rerunLog'][key]
+        self.assertEqual(yaml.safe_load(merged)['brain_node']['ros__parameters'], expected)
+        self.assertEqual(sync.merge_brain(merged.decode(), remote)[0], merged)
 
     def test_gc_launch_keeps_network_constants_and_other_local_changes(self):
         local = "# 中文注释\nsettings={'enable_ip_white_list': False, 'ip_white_list': ['bad-ip'], 'new': 123}\n"
@@ -837,7 +927,7 @@ class DriverIntegrationTests(unittest.TestCase):
         config = yaml.safe_load((self.robot / sync.BRAIN_CONFIG).read_text())['brain_node']['ros__parameters']
         self.assertEqual(config['game']['player_id'], 1)
         self.assertEqual(config['game']['player_role'], 'goal_keeper')
-        self.assertEqual(config['game_control_ip'], '192.168.133.210')
+        self.assertEqual(config['game_control_ip'], 'bad-ip')
         self.assertEqual(config['strategy']['cooperation']['owner_hold_ms'], 1500.0)
         self.assertIn("'ip_white_list': ['192.168.133.210']", (self.robot / sync.GC_LAUNCH).read_text())
         self.assertEqual(self.run_driver()['robots']['192.168.133.43']['result']['changed'], 0)

@@ -54,6 +54,7 @@ class Brain;
 class RobotClient {
 public:
     Brain *brain;
+    explicit RobotClient(Brain *b) : brain(b) {}
     struct Command { double x, y, yaw; } command{};
     vector<Command> history;
     int setVelocity(double x, double y, double yaw, bool minX = true, bool minY = true, bool minYaw = true) {

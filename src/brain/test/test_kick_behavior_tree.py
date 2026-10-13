@@ -69,7 +69,7 @@ class MatchMotionRouting(unittest.TestCase):
         tree = ET.parse(TREES / "subtree_striker_play.xml").getroot()
         parents = {child: node for node in tree.iter() for child in node}
         decision_node = tree.find(".//StrikerDecide")
-        tree = parents[parents[decision_node]]
+        tree = parents[decision_node]
         expected = {
             "find": "RobotFindBall", "assist": "Assist", "kickoff_hold": "KickoffStand",
             "chase": "Chase", "adjust": "Adjust", "auto_visual_kick": "RLVisionKick",
@@ -91,6 +91,9 @@ class MatchMotionRouting(unittest.TestCase):
             while decision not in ancestor.iter():
                 ancestor = parents[ancestor]
             self.assertEqual(ancestor.tag, "ReactiveSequence")
+            # All async motions are dispatched through one direct child so
+            # ReactiveSequence versions that enforce this rule stay compatible.
+            self.assertEqual([child.tag for child in ancestor], ["StrikerDecide", "Sequence"])
 
     def test_goalie_modes_have_one_action(self):
         root = ET.parse(TREES / "subtree_goal_keeper_play.xml").getroot()
