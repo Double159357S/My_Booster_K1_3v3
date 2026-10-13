@@ -15,6 +15,10 @@ add_executable(game_controller_node src/main.cpp src/game_controller_node.cpp)
 
 ament_target_dependencies(game_controller_node game_controller_interface rclcpp)
 
+# Explicitly link the library that provides GameControlData's C++ typesupport.
+target_link_libraries(game_controller_node
+  game_controller_interface::game_controller_interface__rosidl_typesupport_cpp)
+
 target_include_directories(game_controller_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
