@@ -83,6 +83,23 @@ inline bool keepVisualKickSession(bool active, bool previousDecisionIsKick,
     return active && previousDecisionIsKick && authorized && !ballOut;
 }
 
+// 软开球限速在整个趟球动作中保持，加速按实际时间计算，不依赖 tick 频率。
+inline double dribbleSpeedLimit(double requested, bool softKickoff,
+                               bool kickingOff, double kickoffLimit) {
+    if (!std::isfinite(requested) || requested <= 0.0) return 0.0;
+    if (softKickoff && kickingOff) {
+        if (!std::isfinite(kickoffLimit) || kickoffLimit <= 0.0) return 0.0;
+        return std::min(requested, kickoffLimit);
+    }
+    return requested;
+}
+
+inline double rampDribbleSpeed(double current, double limit, double elapsedMs) {
+    if (!std::isfinite(limit) || limit <= 0.0) return 0.0;
+    const double dt = std::clamp(elapsedMs, 0.0, 100.0) / 1000.0;
+    return std::min(limit, std::max(0.0, current) + 0.8 * dt);
+}
+
 inline bool inGoalieClearanceArea(double ballX, double ballY, double fieldLength,
                                   double penaltyLength, double penaltyWidth,
                                   double margin) {
@@ -124,6 +141,21 @@ inline double adjustmentHeadingError(double bearing, double approachError,
 inline double effectiveAdjustmentSpeed(double speed, double minimum = 0.3) {
     if (!std::isfinite(speed) || std::abs(speed) <= 1e-5) return 0.0;
     return std::copysign(std::max(std::abs(speed), minimum), speed);
+}
+
+struct ChaseVelocity { double x = 0.0, yaw = 0.0; };
+
+// 对目标点减速，目标在侧后方时先转身。缩小前向分量后不能再次抬到最低步速。
+inline ChaseVelocity chaseVelocity(double targetX, double targetY,
+                                   double maxSpeed, double maxYaw,
+                                   double stopDistance = 0.08) {
+    const double distance = std::hypot(targetX, targetY);
+    if (!std::isfinite(distance) || distance <= stopDistance) return {};
+    const double bearing = std::atan2(targetY, targetX);
+    const double turn = std::abs(bearing) < 0.03 ? 0.0 :
+        std::clamp(effectiveAdjustmentSpeed(bearing), -maxYaw, maxYaw);
+    const double speed = std::min(maxSpeed, effectiveAdjustmentSpeed(distance - stopDistance));
+    return {speed * std::max(0.0, std::cos(bearing)), turn};
 }
 
 inline double adjustmentTurnVelocity(double bearing, double approachError,

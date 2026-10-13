@@ -85,6 +85,7 @@ brain_node:
       auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
       auto_visual_kick_max_body_error: 0.25 # 身体朝向也必须对准，不能只检查球所在方向
       auto_visual_kick:
+        cooldown_ms: 600.0 # 退出后短暂稳步，避免无进展时每帧重新启动 SDK
         real_ball_hold_ms: 1000.0
         current_real_ball_max_age_ms: 650.0 # 允许脚边真实球短暂漏检，不要求每帧都有检测
         near_ball_memory_reject_range: 0.8

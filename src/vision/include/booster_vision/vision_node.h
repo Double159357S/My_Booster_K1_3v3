@@ -73,6 +73,7 @@ private:
     bool save_data_ = false;
     bool save_depth_ = false;
     bool offline_mode_ = false;
+    double max_pose_sync_diff_ms_ = 120.0;
     std::string detection_model_path;
     std::string segmentation_model_path;
 

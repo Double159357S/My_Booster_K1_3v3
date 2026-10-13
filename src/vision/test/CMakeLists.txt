@@ -1,5 +1,9 @@
 enable_testing()
 
+add_executable(test_data_syncer base/test_data_syncer.cpp)
+target_link_libraries(test_data_syncer booster_vision_base)
+add_test(NAME utest_data_syncer COMMAND test_data_syncer)
+
 add_executable(test_yolov8 model/test_yolov8.cpp)
 target_link_libraries(test_yolov8 yolov8_model pthread
                                   gtest

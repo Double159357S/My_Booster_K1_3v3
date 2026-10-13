@@ -93,4 +93,5 @@ calibration:
     calibration_time: 2026-04-11-09-47-23
     reprojection_error: 2.5350552245663476
 misc:
+  max_pose_sync_diff_ms: 120.0 # 运动中不能用过期头部姿态投影球和场地线
   save_data_nonstationary: true

@@ -331,6 +331,8 @@ private:
     int _msecKick = 1000;
     double _speed = 0.0;
     double _minRange = 0.0;
+    double _speedLimit = 0.0;
+    rclcpp::Time _lastSpeedUpdate;
     tuple<double, double, double> _calcSpeed();
 };
 

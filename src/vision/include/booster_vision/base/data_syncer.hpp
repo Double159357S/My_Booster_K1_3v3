@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -49,14 +50,18 @@ struct SyncedDataBlock {
     ColorDataBlock color_data;
     DepthDataBlock depth_data;
     PoseDataBlock pose_data;
+
+    bool poseMatchesImage(double maxDiffMs) const {
+        return std::isfinite(color_data.timestamp) && color_data.timestamp > 0.0 &&
+            std::isfinite(pose_data.timestamp) && pose_data.timestamp > 0.0 &&
+            std::abs(color_data.timestamp - pose_data.timestamp) * 1000.0 <= maxDiffMs;
+    }
 };
 
 template <int MaxLength, typename T, typename Allocator = std::allocator<T>>
 class DataBuffer : public std::deque<T, Allocator> {
 public:
-    DataBuffer() :
-        std::deque<T, Allocator>(MaxLength) {
-    }
+    DataBuffer() = default;
     void push_back(const T &value) {
         if (this->size() == MaxLength) {
             this->pop_front();

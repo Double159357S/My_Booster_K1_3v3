@@ -275,6 +275,8 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
 
     // init data_syncer
     use_depth_ = as_or<bool>(node["use_depth"], false);
+    max_pose_sync_diff_ms_ = std::clamp(
+        as_or<double>(node["misc"]["max_pose_sync_diff_ms"], 120.0), 20.0, 500.0);
     data_syncer_ = std::make_shared<DataSyncer>(use_depth_);
     bool save_data_nonstationary = as_or<bool>(node["misc"]["save_data_nonstationary"], true);
     std::string log_root = std::string(std::getenv("HOME")) + "/Workspace/vision_log/" + getTimeString();
@@ -374,14 +376,6 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
     if (use_depth_) {
         depth_sub_ = it_->subscribe(depth_topic, 1, &VisionNode::DepthCallback, this, nullptr, sub_opt_3);
     }
-    if (camera_type_.find("compressed") != std::string::npos) {
-        color_sub_ = it_->subscribe(color_topic, 2, &VisionNode::ColorCallback, this, &hints, sub_opt_1);
-    } else {
-        color_sub_ = it_->subscribe(color_topic, 2, &VisionNode::ColorCallback, this, nullptr, sub_opt_1);
-    } 
-    if (use_depth_) {
-        depth_sub_ = it_->subscribe(depth_topic, 2, &VisionNode::DepthCallback, this, nullptr, sub_opt_3);
-    }
 
     if (!offline_mode_) {
         const auto camera_info_qos = rclcpp::SensorDataQoS();
@@ -423,7 +417,7 @@ void VisionNode::Init(const std::string &cfg_template_path, const std::string &c
     if (offline_mode_) {
         pose_tf_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>("/booster_vision/t_head2base", 10, std::bind(&VisionNode::PoseTFCallBack, this, std::placeholders::_1));
     } else {
-        pose_sub_ = this->create_subscription<geometry_msgs::msg::Pose>("/head_pose", 10, std::bind(&VisionNode::PoseCallBack, this, std::placeholders::_1), sub_opt_4);
+        pose_sub_ = this->create_subscription<geometry_msgs::msg::Pose>("/head_pose", rclcpp::SensorDataQoS(), std::bind(&VisionNode::PoseCallBack, this, std::placeholders::_1), sub_opt_4);
         calParam_sub_ = this->create_subscription<vision_interface::msg::CalParam>("/booster_vision/cal_param", 10, std::bind(&VisionNode::CalParamCallback, this, std::placeholders::_1));
         pose_tf_pub_ = this->create_publisher<geometry_msgs::msg::TransformStamped>("/booster_vision/t_head2base", rclcpp::QoS(10));
     }
@@ -654,6 +648,11 @@ void VisionNode::CameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPt
 }
 
 void VisionNode::ProcessData(SyncedDataBlock &synced_data, vision_interface::msg::Detections &detection_msg) {
+    if (!synced_data.poseMatchesImage(max_pose_sync_diff_ms_)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "dropping detection frame: no head pose within %.0f ms of image", max_pose_sync_diff_ms_);
+        return;
+    }
     std::shared_lock<std::shared_mutex> intrinsics_lock(intrinsics_mutex_);
     double timestamp = synced_data.color_data.timestamp;
     double depth_time_diff = (timestamp - synced_data.depth_data.timestamp) * 1000;
@@ -921,6 +920,11 @@ void VisionNode::ColorCallback(const sensor_msgs::msg::Image::ConstSharedPtr &ms
 }
 
 void VisionNode::ProcessSegmentationData(SyncedDataBlock &synced_data, vision_interface::msg::LineSegments &field_line_segs_msg) {
+    if (!synced_data.poseMatchesImage(max_pose_sync_diff_ms_)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "dropping field-line frame: no head pose within %.0f ms of image", max_pose_sync_diff_ms_);
+        return;
+    }
     std::shared_lock<std::shared_mutex> intrinsics_lock(intrinsics_mutex_);
     double timestamp = synced_data.color_data.timestamp;
     cv::Mat color = synced_data.color_data.data;

@@ -91,6 +91,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 
   enable_testing()
+  add_executable(test_motion_commands test/test_motion_commands.cpp)
+  target_include_directories(test_motion_commands PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(test_motion_commands PRIVATE cxx_std_17)
+  add_test(NAME test_motion_commands COMMAND test_motion_commands)
   add_executable(test_kick_geometry test/test_kick_geometry.cpp)
   target_include_directories(test_kick_geometry PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -104,6 +108,8 @@ if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME test_kick_behavior_tree COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_kick_behavior_tree.py)
+  add_test(NAME test_kick_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_kick_runtime.py --compiler ${CMAKE_CXX_COMPILER})
   add_executable(test_team_cooperation test/test_team_cooperation.cpp)
   target_include_directories(test_team_cooperation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)

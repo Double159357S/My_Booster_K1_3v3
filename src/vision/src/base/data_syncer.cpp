@@ -109,27 +109,25 @@ SyncedDataBlock DataSyncer::getSyncedDataBlock(const ColorDataBlock &color_data)
     double color_timestamp = color_data.timestamp;
     if (enable_depth_) {
         double smallest_depth_timestamp_diff = DBL_MAX;
-        for (DepthBuffer::reverse_iterator it = depth_buffer_cp.rbegin(); it != depth_buffer_cp.rbegin() + kDepthBufferLength; ++it) {
+        for (auto it = depth_buffer_cp.rbegin(); it != depth_buffer_cp.rend(); ++it) {
+            if (!std::isfinite(it->timestamp) || it->timestamp <= 0.0) continue;
             double diff = std::abs(it->timestamp - color_timestamp);
             if (diff < smallest_depth_timestamp_diff) {
                 smallest_depth_timestamp_diff = diff;
                 synced_data.depth_data = *it;
                 synced_data.depth_data.timestamp = it->timestamp;
                 it->data.copyTo(synced_data.depth_data.data);
-            } else {
-                break;
             }
         }
     }
 
     double smallest_pose_timestamp_diff = DBL_MAX;
-    for (PoseBuffer::reverse_iterator it = pose_buffer_cp.rbegin(); it != pose_buffer_cp.rbegin() + kPoseBufferLength; ++it) {
+    for (auto it = pose_buffer_cp.rbegin(); it != pose_buffer_cp.rend(); ++it) {
+        if (!std::isfinite(it->timestamp) || it->timestamp <= 0.0) continue;
         double diff = std::abs(it->timestamp - color_timestamp);
         if (diff < smallest_pose_timestamp_diff) {
             smallest_pose_timestamp_diff = diff;
             synced_data.pose_data = *it;
-        } else {
-            break;
         }
     }
     return synced_data;

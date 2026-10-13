@@ -441,6 +441,8 @@ CamFindBall::CamFindBall(const string &name, const NodeConfig &config, Brain *_b
 
 NodeStatus CamFindBall::tick()
 {
+    if (brain->data->tmImInVisualKick &&
+        !brain->tree->getEntry<bool>("goalie_block_kick_active")) return NodeStatus::SUCCESS;
     // 踢球时短暂漏检不能触发大范围扫头，否则会把脚边球移出视野。
     if (brain->data->tmImInVisualKick) return NodeStatus::SUCCESS;
     if (brain->data->ballDetected)
@@ -545,8 +547,10 @@ NodeStatus Chase::tick()
         // 共享球用于接近和转向重识别；场地坐标不能替代本机脚边视觉。
         const double yaw = brain->data->ball.yawToRobot;
         const double speed = team_ball::approachSpeed(brain->data->ball.range, vxLimit);
-        brain->client->setVelocity(speed * sigmoid(fabs(yaw), 1, 3), 0.0,
-            cap(yaw, vthetaLimit, -vthetaLimit));
+        const auto command = kick_strategy::chaseVelocity(
+            brain->data->ball.posToRobot.x, brain->data->ball.posToRobot.y,
+            speed, vthetaLimit, 0.0);
+        brain->client->setVelocity(command.x, 0.0, command.yaw, false, false, false);
         return NodeStatus::SUCCESS;
     }
 
@@ -590,18 +594,18 @@ NodeStatus Chase::tick()
         vy = speed * sin(avoidDir);
         vtheta = ballYaw;
     } else {
-        vx = min(vxLimit, ballRange);
+        const auto command = kick_strategy::chaseVelocity(
+            target_r.x, target_r.y, vxLimit, vthetaLimit);
+        vx = command.x;
         vy = 0;
-        vtheta = targetDir;
-        if (fabs(targetDir) < 0.1 && ballRange > 2.0) vtheta = 0.0;
-        vx *= sigmoid(fabs(vtheta), 1, 3);
+        vtheta = command.yaw;
     }
 
     vx = cap(vx, vxLimit, -vxLimit);
     vy = cap(vy, vyLimit, -vyLimit);
     vtheta = cap(vtheta, vthetaLimit, -vthetaLimit);
 
-    brain->client->setVelocity(vx, vy, vtheta);
+    brain->client->setVelocity(vx, vy, vtheta, false, false, false);
     return NodeStatus::SUCCESS;
 }
 
@@ -1678,6 +1682,9 @@ NodeStatus StrikerDecide::tick() {
     // 判断是否穿过了 KickDir
     double deltaDir = toPInPI(kickDir - dir_rb_f);
     const bool visualKickDirectionReady = strikerVisualKickAligned(brain);
+    const bool visualKickCooldownReady = RLVisionKick::getLastExitTime().nanoseconds() == 0 ||
+        brain->msecsSince(RLVisionKick::getLastExitTime()) >=
+            brain->get_parameter("strategy.auto_visual_kick.cooldown_ms").as_double();
     log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, deltaDir: %.2f, visualDirReady: %d, angleGoodForKick: %d, angleGoodForShoot: %d, shootPossible: %d, powerShootPossible: %d",
         ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, deltaDir,
         visualKickDirectionReady, angleGoodForKick, angleGoodForShoot,
@@ -1723,8 +1730,7 @@ NodeStatus StrikerDecide::tick() {
     else if (nearBallVisualKick)
     {
         // Near-ball urgency never bypasses the shared ownership grant.
-        newDecision = "auto_visual_kick";
-        brain->data->tmImInVisualKick = true;
+        newDecision = visualKickCooldownReady ? "auto_visual_kick" : "kick_wait";
         color = 0xFF00FFFF;
         log(format("near-ball visual kick: range=%.2f", ballRange));
     }
@@ -1753,8 +1759,7 @@ NodeStatus StrikerDecide::tick() {
         brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
         fabs(brain->data->robotPoseToField.y) < 5.0
     ) {
-        newDecision = "auto_visual_kick";
-        brain->data->tmImInVisualKick = true;
+        newDecision = visualKickCooldownReady ? "auto_visual_kick" : "kick_wait";
         color = 0xFF00FFFF;
     }
     else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
@@ -1783,7 +1788,7 @@ NodeStatus StrikerDecide::tick() {
             else newDecision = "kick";
         }        
         color = 0x00FF00FF;
-        brain->data->isFreekickKickingOff = false; // 只要进一次 kick, 就不算是 kickoff 阶段了.
+        // 趟球启动时仍需知道这是定位球，否则 soft_kickoff 限速会在出脚前失效。
     }
     else
     {
@@ -1791,9 +1796,7 @@ NodeStatus StrikerDecide::tick() {
         color = 0xFFFF00FF;
     }
 
-    if (newDecision != "auto_visual_kick") {
-        brain->data->tmImInVisualKick = false;
-    }
+    // 真正的会话标志由 RLVisionKick::onStart/onRunning/onHalted 管理。
 
     setOutput("decision_out", newDecision);
     if (newDecision != lastReportedDecision ||
@@ -2151,8 +2154,27 @@ tuple<double, double, double> Kick::_calcSpeed() {
 
 NodeStatus Kick::onStart()
 {
+    const bool autonomous = brain->tree->getEntry<int>("control_state") == 3 &&
+        !brain->tree->getEntry<bool>("assist_kick");
+    if ((autonomous && !brain->data->tmImLead) ||
+        !kick_strategy::isRecentReal(brain->getKickBallSource()) ||
+        brain->data->ball.posToRobot.x <= 0.0) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
     _minRange = brain->data->ball.range;
-    _speed = 0.1;
+    bool softKickoff = true;
+    double softKickoffSpeed = 0.3;
+    brain->get_parameter("strategy.soft_kickoff", softKickoff);
+    brain->get_parameter("strategy.soft_kickoff_speed", softKickoffSpeed);
+    _speedLimit = kick_strategy::dribbleSpeedLimit(
+        getInput<double>("speed_limit").value(), softKickoff,
+        brain->data->isFreekickKickingOff || brain->data->isKickingOff, softKickoffSpeed);
+    if (_speedLimit <= 0.0) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
+    _speed = std::min(0.3, _speedLimit);
     bool avoidPushing;
     double kickAoSafeDist;
     brain->get_parameter("obstacle_avoidance.avoid_during_kick", avoidPushing);
@@ -2164,30 +2186,24 @@ NodeStatus Kick::onStart()
         && brain->data->robotPoseToField.x < brain->config->fieldDimensions.length / 2 - brain->config->fieldDimensions.goalAreaLength
         && brain->distToObstacle(brain->data->ball.yawToRobot) < kickAoSafeDist
     ) {
-        brain->client->setVelocity(-0.1, 0, 0);
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
         return NodeStatus::SUCCESS;
     }
 
     // 初始化 Node
     _startTime = brain->get_clock()->now();
+    _lastSpeedUpdate = _startTime;
+    // 使用启动时距离确定截止时间，不能随着球的位置变化不断延长。
+    _msecKick = static_cast<int>(getInput<double>("min_msec_kick").value() +
+        _minRange / _speedLimit * 1000.0);
     if (brain->config->enableStableKick && brain->threatLevel() < 0.5) _state = "stablize"; // false  开启后, 在 kick 时, 如风险较低, 则稳定一下再出脚.
     else _state = "kick";
      
     // 发布运动指令
     if (_state == "kick") {
-        double angle = brain->data->ball.yawToRobot;
-        double speed = getInput<double>("speed_limit").value();
-        bool softKickoff = true;
-        double softKickoffSpeed = 0.3;
-        brain->get_parameter("strategy.soft_kickoff", softKickoff);
-        brain->get_parameter("strategy.soft_kickoff_speed", softKickoffSpeed);
-        if (
-            softKickoff
-            && (brain->data->isFreekickKickingOff || brain->data->isKickingOff)
-            ) speed = softKickoffSpeed;
-        brain->client->crabWalk(angle, speed);
+        brain->client->crabWalk(brain->data->ball.yawToRobot, _speed);
     } else if (_state == "stablize") {
-        brain->client->setVelocity(-0.05, 0, 0, true, false, false);
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
     }
     // 返回运行中状态，表示节点将继续处理。
     return NodeStatus::RUNNING;
@@ -2199,6 +2215,19 @@ NodeStatus Kick::onRunning()
         brain->log->setTimeNow();
         brain->log->log("debug/Kick", rerun::TextLog(msg));
     };
+    const auto stop = [&]() {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    };
+    const bool autonomous = brain->tree->getEntry<int>("control_state") == 3 &&
+        !brain->tree->getEntry<bool>("assist_kick");
+    if ((autonomous && !brain->data->tmImLead) ||
+        !kick_strategy::isRecentReal(brain->getKickBallSource()) ||
+        brain->data->ball.posToRobot.x <= 0.0 ||
+        brain->tree->getEntry<bool>("ball_out")) {
+        log("ownership, ball source or ball pose no longer permits dribbling");
+        return stop();
+    }
     bool enableAbort;
     brain->get_parameter("strategy.abort_kick_when_ball_moved", enableAbort);
     auto ballRange = brain->data->ball.range;
@@ -2210,7 +2239,7 @@ NodeStatus Kick::onRunning()
     const double BALL_LOST_THRESHOLD = 1000;  // ms
     if (ballRange > KICK_RANGE){
         log("ball too far, abort kick");
-        return NodeStatus::SUCCESS;
+        return stop();
     }
     if (
         enableAbort 
@@ -2220,7 +2249,7 @@ NodeStatus Kick::onRunning()
         )
     ) {
         log("ball moved, abort kick");
-        return NodeStatus::SUCCESS;
+        return stop();
     }
     log(format("ballrange: %.1f, minRange: %.1f", ballRange, _minRange));
     if (ballRange < _minRange) _minRange = ballRange;    
@@ -2234,8 +2263,7 @@ NodeStatus Kick::onRunning()
         && brain->data->robotPoseToField.x < brain->config->fieldDimensions.length / 2 - brain->config->fieldDimensions.goalAreaLength
         && brain->distToObstacle(brain->data->ball.yawToRobot) < kickAoSafeDist
     ) {
-        brain->client->setVelocity(-0.1, 0, 0);
-        return NodeStatus::SUCCESS;
+        return stop();
     }
 
     if (_state == "stablize") {
@@ -2243,34 +2271,20 @@ NodeStatus Kick::onRunning()
         if (brain->msecsSince(_startTime) > msecs) {
             _state = "kick";
             _startTime = brain->get_clock()->now();
-            double angle = brain->data->ball.yawToRobot;
-            double speed = getInput<double>("speed_limit").value();
-            bool softKickoff = true;
-            double softKickoffSpeed = 0.3;
-            brain->get_parameter("strategy.soft_kickoff", softKickoff);
-            brain->get_parameter("strategy.soft_kickoff_speed", softKickoffSpeed);
-            if (
-                softKickoff
-                && (brain->data->isFreekickKickingOff || brain->data->isKickingOff)
-                ) speed = softKickoffSpeed;
-                brain->client->crabWalk(angle, speed);
-            }
+            _lastSpeedUpdate = _startTime;
+            brain->client->crabWalk(brain->data->ball.yawToRobot, _speed);
+        }
         return NodeStatus::RUNNING;
     } else if (_state == "kick") {
-        double msecs = getInput<double>("min_msec_kick").value();
-        double speed = getInput<double>("speed_limit").value();
-        msecs = msecs + brain->data->ball.range / speed * 1000;
-        if (brain->msecsSince(_startTime) > msecs) { // 完成踢球动作
-            brain->client->setVelocity(0, 0, 0);
-            return NodeStatus::SUCCESS;
+        if (brain->msecsSince(_startTime) >= _msecKick) {
+            return stop();
         }
         // else
         if (brain->data->ballDetected) { // 如果还能看见球, 则修正方向
-            double angle = brain->data->ball.yawToRobot;
-            double speed = getInput<double>("speed_limit").value();
-            _speed += 0.08;
-            speed = min(speed, _speed);
-            brain->client->crabWalk(angle, speed);
+            _speed = kick_strategy::rampDribbleSpeed(
+                _speed, _speedLimit, brain->msecsSince(_lastSpeedUpdate));
+            _lastSpeedUpdate = brain->get_clock()->now();
+            brain->client->crabWalk(brain->data->ball.yawToRobot, _speed);
         }
 
         return NodeStatus::RUNNING;
@@ -2278,11 +2292,12 @@ NodeStatus Kick::onRunning()
 
     // should not reach here
     prtErr("Kick: Reached impossible condition");
-    return NodeStatus::SUCCESS;
+    return stop();
 }
 
 void Kick::onHalted()
 {
+    brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
     _startTime -= rclcpp::Duration(100, 0);
 }
 
@@ -2375,6 +2390,7 @@ NodeStatus RLVisionKick::onRunning()
         logExit("exit visual kick immediately: recovery requested");
         brain->data->shouldExitRLVisionKick = false;
         brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        if (_visionKickStarted) brain->client->robocupWalk();
         clearState();
         recordExitTime();
         _isDecelerating = false;

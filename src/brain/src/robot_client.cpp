@@ -306,7 +306,9 @@ int RobotClient::crabWalk(double angle, double speed) {
         vy = vyLimit * fabs(vy) / vy;
     }
 
-    return setVelocity(vx, vy, 0);
+    // 分量分别抬到最低步速会改变方向，例如 vy=0.02 被放大成 0.3。
+    // 趟球的加速由 Kick 处理，这里保留向量方向。
+    return setVelocity(vx, vy, 0, false, false, false);
 }
 
 

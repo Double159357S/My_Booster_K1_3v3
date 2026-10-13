@@ -67,14 +67,30 @@ class MatchMotionRouting(unittest.TestCase):
 
     def test_striker_decisions_have_one_action(self):
         tree = ET.parse(TREES / "subtree_striker_play.xml").getroot()
+        parents = {child: node for node in tree.iter() for child in node}
+        decision_node = tree.find(".//StrikerDecide")
+        tree = parents[parents[decision_node]]
         expected = {
             "find": "RobotFindBall", "assist": "Assist", "kickoff_hold": "KickoffStand",
             "chase": "Chase", "adjust": "Adjust", "auto_visual_kick": "RLVisionKick",
             "power_kick": "Kick", "kick": "Kick", "cross": "Kick", "safe_shoot": "Kick",
+            "kick_wait": "SetVelocity",
         }
         for decision, action in expected.items():
             with self.subTest(decision=decision):
                 self.assertEqual(selected_actions(tree, "decision", decision, set(expected.values())), [action])
+
+    def test_running_kick_does_not_skip_new_decisions(self):
+        root = ET.parse(TREES / "subtree_striker_play.xml").getroot()
+        parents = {child: node for node in root.iter() for child in node}
+        decision = root.find(".//StrikerDecide")
+        for action in root.iter():
+            if action.tag not in ("Kick", "RLVisionKick"):
+                continue
+            ancestor = parents[action]
+            while decision not in ancestor.iter():
+                ancestor = parents[ancestor]
+            self.assertEqual(ancestor.tag, "ReactiveSequence")
 
     def test_goalie_modes_have_one_action(self):
         root = ET.parse(TREES / "subtree_goal_keeper_play.xml").getroot()

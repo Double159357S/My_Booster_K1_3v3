@@ -70,6 +70,8 @@ struct GameObject
 
     // --- 在 processDetectedObject 函数中计算获得 ---
     Point posToField;                                 // 物体在物体场坐标系的的位置, 位置为 2D, 忽略 z 值. x 向前, y 向左.
+    Point posToOdom;                                  // 拍摄时的观测固定在 odom 中，定位校正时不能重复使用旧相对坐标。
+    bool odomPositionValid = false;
     double range = 0.0;                               // 物体距离机器人中心在物体场平面上的投影点的直线距离
     double pitchToRobot = 0.0, yawToRobot = 0.0;      // 物体相对于机器人正前方的 pitch 和 yaw, 单位 rad, 向下和向左为正
     rclcpp::Time timePoint;                           // 物体被检测到的时间

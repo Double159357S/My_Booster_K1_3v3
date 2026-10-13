@@ -15,6 +15,7 @@
 #include "brain.h"
 #include "utils/kick_geometry.h"
 #include "utils/kick_strategy.h"
+#include "utils/observation_geometry.h"
 #include "utils/goalie_strategy.h"
 #include "utils/print.h"
 #include "utils/math.h"
@@ -154,6 +155,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.25);
     declare_parameter<double>("strategy.auto_visual_kick_max_body_error", 0.25);
     declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
+    declare_parameter<double>("strategy.auto_visual_kick.cooldown_ms", 600.0);
     declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
     declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.8);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
@@ -341,10 +343,9 @@ void Brain::init()
     headPoseSubscription = create_subscription<geometry_msgs::msg::Pose>("/head_pose", latestSensorQos, bind(&Brain::headPoseCallback, this, _1));
     recoveryStateSubscription = create_subscription<booster_interface::msg::RawBytesMsg>("fall_down_recovery_state", latestReliableQos, bind(&Brain::recoveryStateCallback, this, _1));
 
-    if (config->rerunLogEnableFile || config->rerunLogEnableTCP) {
-        string imageTopic = get_parameter("vision.image_topic").as_string();
-        imageSubscription = create_subscription<sensor_msgs::msg::Image>(imageTopic, SUB_STATE_QUEUE_SIZE, bind(&Brain::imageCallback, this, _1));
-    }
+    // 图像尺寸用于追球，即使关掉日志也要接收；best-effort 可匹配传感器发布端。
+    string imageTopic = get_parameter("vision.image_topic").as_string();
+    imageSubscription = create_subscription<sensor_msgs::msg::Image>(imageTopic, latestSensorQos, bind(&Brain::imageCallback, this, _1));
     string depthTopic = get_parameter("vision.depth_image_topic").as_string();
     depthImageSubscription = create_subscription<sensor_msgs::msg::Image>(depthTopic, SUB_STATE_QUEUE_SIZE, bind(&Brain::depthImageCallback, this, _1));
     
@@ -1203,6 +1204,11 @@ void Brain::updateBallMemory()
 {
 
     double secs = msecsSince(data->ball.timePoint) / 1000;
+    // 摄像头/检测节点断流时也必须失效，不能等下一次空检测回调才清标志。
+    if (secs < 0.0 || secs * 1000.0 > get_parameter("strategy.ball_lost_msecs").as_double()) {
+        data->ballDetected = false;
+        data->lose_ball = true;
+    }
     
     double ballMemTimeout;
     get_parameter("strategy.ball_memory_timeout", ballMemTimeout);
@@ -1217,6 +1223,7 @@ void Brain::updateBallMemory()
         tree->getEntry<bool>("ball_location_known") ||
         tree->getEntry<bool>("tm_ball_pos_reliable");
     if (ballLocationKnown) {
+        if (!data->ballFromTeammate && data->ball.odomPositionValid) updateFieldPos(data->ball);
         updateRelativePos(data->ball);
         data->robotBallAngleToField = atan2(
             data->ball.posToField.y - data->robotPoseToField.y,
@@ -1272,7 +1279,8 @@ void Brain::updateBallMemory()
 void Brain::updateBallPrediction()
 {
     const auto now = data->ball.timePoint;
-    const Point current = data->ball.posToField;
+    // 在连续的 odom 坐标中估计速度，避免定位校正被误认为球突然滚动。
+    const Point current = data->ball.posToOdom;
 
     const double stepSec = std::max(0.001,
         get_parameter("ball_predictor.step_interval").as_double() / 1000.0);
@@ -1287,8 +1295,14 @@ void Brain::updateBallPrediction()
     ballStateEstimator->setMinSpeedThreshold(0.1);
     ballStateEstimator->update(current.x, current.y, now, 0.05);
 
-    const auto estimatePosition = ballStateEstimator->getEstimatedPosition();
-    auto estimateVelocity = ballStateEstimator->getEstimatedVelocity();
+    const auto odomPosition = ballStateEstimator->getEstimatedPosition();
+    const auto odomVelocity = ballStateEstimator->getEstimatedVelocity();
+    const auto fieldPosition = observation_geometry::toParent(
+        {odomPosition.x, odomPosition.y, 0.0}, data->odomToField);
+    const auto fieldVelocity = observation_geometry::toParent(
+        {odomVelocity.x, odomVelocity.y, 0.0}, {0.0, 0.0, data->odomToField.theta});
+    const ball_state_estimator::Vec2 estimatePosition{fieldPosition.x, fieldPosition.y};
+    ball_state_estimator::Vec2 estimateVelocity{fieldVelocity.x, fieldVelocity.y};
     ball_state_estimator::BallPhysics::clampVelocity(estimateVelocity.x, estimateVelocity.y);
     data->ballEstVelX = estimateVelocity.x;
     data->ballEstVelY = estimateVelocity.y;
@@ -1709,6 +1723,14 @@ void Brain::updateFallLocalizationHoldState(bool holdActive)
         fallLocalizationHoldActive_ = true;
         fallLocalizationHoldPose_ = data->robotPoseToField;
         fallLocalizationHoldOdomToField_ = data->odomToField;
+        // 起身可能重置 odom；旧观测不能继续锚定在重置前的坐标中。
+        data->ball.odomPositionValid = false;
+        data->ballDetected = false;
+        data->lose_ball = true;
+        tree->setEntry<bool>("ball_location_known", false);
+        data->predictedBallPos.clear();
+        data->reliableBallPredict = false;
+        ballStateEstimator->reset();
         RCLCPP_WARN(
             get_logger(),
             "Freezing field localization during fall recovery at (%.3f, %.3f, %.3f)",
@@ -1825,6 +1847,7 @@ bool Brain::lookupRobotPoseToOdomAt(
 void Brain::calibrateOdom(double x, double y, double theta, bool alignToVisionTime)
 {
     std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
+    const Pose2D previousOdomToField = data->odomToField;
 
     updateFallLocalizationHoldState(isTrueFallRecoveryState(data->recoveryState));
     if (isFallLocalizationHoldActive()) {
@@ -1873,13 +1896,45 @@ void Brain::calibrateOdom(double x, double y, double theta, bool alignToVisionTi
         data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta);
 
 
-    double placeHolder;
+    // 场地校正后，尚未收到下一帧视觉的预测轨迹也要使用新的场地坐标。
+    if (!data->predictedBallPos.empty()) {
+        const auto remap = [&](double px, double py) {
+            return observation_geometry::toParent(observation_geometry::toLocal(
+                {px, py, 0.0}, previousOdomToField), data->odomToField);
+        };
+        for (auto &p : data->predictedBallPos) {
+            const auto mapped = remap(p[0], p[1]);
+            p = {mapped.x, mapped.y};
+        }
+        const auto end = remap(data->ballEstEndPos.x, data->ballEstEndPos.y);
+        data->ballEstEndPos = {end.x, end.y};
+        const auto intercept = remap(data->ballInterceptPoint.x, data->ballInterceptPoint.y);
+        data->ballInterceptPoint = {intercept.x, intercept.y};
+        const auto breach = remap(data->ballBreachPoint.x, data->ballBreachPoint.y);
+        data->ballBreachPoint = {breach.x, breach.y};
+        const auto velocity = observation_geometry::toParent(
+            {data->ballEstVelX, data->ballEstVelY, 0.0},
+            {0.0, 0.0, data->odomToField.theta - previousOdomToField.theta});
+        data->ballEstVelX = velocity.x;
+        data->ballEstVelY = velocity.y;
+        if (data->reliableBallPredict) {
+            const auto predicted = remap(data->ball.reliablePredictPosToField.x,
+                                         data->ball.reliablePredictPosToField.y);
+            data->ball.reliablePredictPosToField = predicted;
+            const auto relative = data->field2robot({predicted.x, predicted.y, 0.0});
+            data->ball.reliablePredictPosToRobot = {relative.x, relative.y, 0.0};
+        }
+        if (data->goalieVisualKickTargetValid) {
+            data->goalieVisualKickTargetField = remap(data->goalieVisualKickTargetField.x,
+                                                     data->goalieVisualKickTargetField.y);
+        }
+    }
     // ball
-    transCoord(
-        data->ball.posToRobot.x, data->ball.posToRobot.y, 0,
-        data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta,
-        data->ball.posToField.x, data->ball.posToField.y, placeHolder 
-    );
+    if (!data->ballFromTeammate && data->ball.odomPositionValid) {
+        updateFieldPos(data->ball);
+        updateRelativePos(data->ball);
+    }
+    // 队友共享球已经在场地坐标中，本机定位校正不能把它一起挪动。
 
     // robots
     auto robots = data->getRobots();
@@ -2347,6 +2402,17 @@ void Brain::detectionsCallback(const vision_interface::msg::Detections &msg)
     auto timePoint = timePointFromHeader(msg.header);
 
     auto now = get_clock()->now();
+    const double ageMs = msecsSince(timePoint);
+    if (timePoint.nanoseconds() <= 0 || ageMs < 0.0 ||
+        ageMs > get_parameter("strategy.ball_lost_msecs").as_double() ||
+        (data->timeLastDet.nanoseconds() > 0 &&
+         timePoint.get_clock_type() == data->timeLastDet.get_clock_type() &&
+         timePoint < data->timeLastDet)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "discarding invalid, stale or reordered detection frame (age=%.0f ms)", ageMs);
+        return;
+    }
+    if (isFallLocalizationHoldActive()) return;
     data->timeLastDet = timePoint; // 用于在调试中输出延迟信息
 
     auto gameObjects = getGameObjects(msg);
@@ -2623,14 +2689,18 @@ void Brain::lowStateCallback(const booster_interface::msg::LowState &msg)
 
 void Brain::imageCallback(const sensor_msgs::msg::Image &msg)
 {
-
-    static int counter = 0;
-    counter++;
-    if (counter % config->rerunLogImgInterval == 0)
+    if (msg.width == 0 || msg.height == 0) return;
     {
-        // 未防止摄像头连接不好时, 自动降低分辨率, 影响 CamTrackBall 的计算, 更新分辨率配置
+        std::lock_guard<std::recursive_mutex> stateLock(brainStateMutex_);
         config->camPixX = msg.width;
         config->camPixY = msg.height;
+    }
+    if (!config->rerunLogEnableFile && !config->rerunLogEnableTCP) return;
+    static int counter = 0;
+    counter++;
+    if (counter % std::max(1, config->rerunLogImgInterval) == 0)
+    {
+        // 未防止摄像头连接不好时, 自动降低分辨率, 影响 CamTrackBall 的计算, 更新分辨率配置
         log->log("debug/imageCallback", rerun::TextLog(format("img width: %.d, img height: %.d", msg.width, msg.height)));
 
         cv::Mat image;
@@ -3003,10 +3073,16 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
     // auto timestamp = detections.header.stamp;
     // rclcpp::Time timePoint(timestamp.sec, timestamp.nanosec);
     auto timePoint = timePointFromHeader(detections.header);
+    Pose2D observationOdom = data->robotPoseToOdom;
+    lookupRobotPoseToOdomAt(timePoint, observationOdom);
 
     for (int i = 0; i < detections.detected_objects.size(); i++)
     {
         auto obj = detections.detected_objects[i];
+        if (obj.position_projection.size() < 2 ||
+            !std::isfinite(obj.position_projection[0]) ||
+            !std::isfinite(obj.position_projection[1]) ||
+            !std::isfinite(obj.confidence)) continue;
         GameObject gObj;
 
         gObj.timePoint = timePoint;
@@ -3047,11 +3123,9 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
         gObj.pitchToRobot = pitchToGroundObject(config->robotHeight, gObj.range); // 注意这是一个近似值
 
         // 计算对象在 field 坐标系中的位置
-        transCoord(
-            gObj.posToRobot.x, gObj.posToRobot.y, 0,
-            data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta,
-            gObj.posToField.x, gObj.posToField.y, gObj.posToField.z // 注意, z 没有在其它地方使用, 这里仅为参数占位使用
-        );
+        gObj.posToOdom = observation_geometry::toParent(gObj.posToRobot, observationOdom);
+        gObj.odomPositionValid = true;
+        gObj.posToField = observation_geometry::toParent(gObj.posToOdom, data->odomToField);
 
         res.push_back(gObj);
     }
@@ -3072,7 +3146,7 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         auto oldBall = data->ball;
 
         // 防止把天上的灯识别为球
-        if (ballObj.posToRobot.x < -0.5 || ballObj.posToRobot.x > 15.0)
+        if (ballObj.range <= 0.05 || ballObj.posToRobot.x < -0.5 || ballObj.posToRobot.x > 15.0)
             continue;
 
         // 排除在场外太远的球, 注意这个功能会影响 cahse 等功能. 先不采用.
@@ -3121,6 +3195,8 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
         tree->setEntry<bool>("ball_location_known", true);
         updateBallOut();
         updateBallPrediction();
+        // 预测器使用拍摄时的球位；动作节点使用当前身体姿态下的相对坐标。
+        updateRelativePos(data->ball);
 
         lastSeenRealBallTime = now;
         data->lose_ball = false;        
@@ -3646,9 +3722,13 @@ void Brain::updateFieldPos(GameObject &obj) {
     pr.x = obj.posToRobot.x;
     pr.y = obj.posToRobot.y;
     pr.theta = 0;
-    Pose2D pf = data->robot2field(pr);
-    obj.posToField.x = pf.x;
-    obj.posToField.y = pf.y;
+    if (obj.odomPositionValid) {
+        obj.posToField = observation_geometry::toParent(obj.posToOdom, data->odomToField);
+    } else {
+        const auto pf = data->robot2field(pr);
+        obj.posToField.x = pf.x;
+        obj.posToField.y = pf.y;
+    }
     obj.range = norm(obj.posToRobot.x, obj.posToRobot.y);
     obj.yawToRobot = atan2(obj.posToRobot.y, obj.posToRobot.x);
     obj.pitchToRobot = pitchToGroundObject(config->robotHeight, obj.range);
