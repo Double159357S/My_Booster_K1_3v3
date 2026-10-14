@@ -74,7 +74,7 @@ struct GameObject
     bool odomPositionValid = false;
     double range = 0.0;                               // 物体距离机器人中心在物体场平面上的投影点的直线距离
     double pitchToRobot = 0.0, yawToRobot = 0.0;      // 物体相对于机器人正前方的 pitch 和 yaw, 单位 rad, 向下和向左为正
-    rclcpp::Time timePoint;                           // 物体被检测到的时间
+    rclcpp::Time timePoint{};                         // 物体被检测到的时间
 
     // --- 通过各类不同对象的特殊处理获得, 只有部分对象有这些值 ---
     int id = -1;    // 识别出来的 id，-1 表示尚未识别
@@ -202,7 +202,7 @@ struct TMStatus {
     double thetaRb = 0.; // 机器人到球的角度, field 坐标系
     int cmd = 0; // 最后一次发出的指令 
     int cmdId = 0; // 最后一次发出的指令 ID
-    rclcpp::Time timeLastCom; // 最后一次通讯时间
+    rclcpp::Time timeLastCom{}; // 最后一次通讯时间
     double teamReceivedMs = -std::numeric_limits<double>::infinity();
     team_cooperation::Announcement ownership;
     std::uint64_t teamSession = 0;
