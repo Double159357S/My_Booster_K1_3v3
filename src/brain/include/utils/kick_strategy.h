@@ -150,6 +150,92 @@ inline double effectiveAdjustmentSpeed(double speed, double minimum = 0.3) {
     return std::copysign(std::max(std::abs(speed), minimum), speed);
 }
 
+// Keep the direction of a two-axis command when making it large enough for
+// the walking controller. Raising each component separately distorts the
+// orbit direction, especially when one component is close to zero.
+inline AdjustmentVelocity effectiveAdjustmentVector(double x, double y,
+                                                      double minimum = 0.3) {
+    if (!std::isfinite(x) || !std::isfinite(y)) return {};
+    const double speed = std::hypot(x, y);
+    if (!std::isfinite(speed) || speed <= 1e-5) return {};
+    minimum = std::isfinite(minimum) ? std::max(0.0, minimum) : 0.3;
+    const double scale = std::max(speed, minimum) / speed;
+    return {x * scale, y * scale};
+}
+
+// Distance alone cannot determine whether the approach is finished. Keep a
+// separate coarse orbit until the route to the ball is close to the shot line.
+// Hysteresis avoids switching back and forth near the handoff angle.
+inline bool needsReposition(double range, double approachError,
+                             bool currentlyRepositioning,
+                             double enterAngle = 0.65, double exitAngle = 0.35) {
+    if (!std::isfinite(range) || range <= 0.05 ||
+        !std::isfinite(approachError)) return false;
+    enterAngle = std::isfinite(enterAngle) ?
+        std::clamp(enterAngle, 0.1, kick_geometry::kPi) : 0.65;
+    exitAngle = std::isfinite(exitAngle) ?
+        std::clamp(exitAngle, 0.05, enterAngle - 0.05) :
+        std::min(0.35, enterAngle - 0.05);
+    return std::abs(kick_geometry::normalizeAngle(approachError)) >
+        (currentlyRepositioning ? exitAngle : enterAngle);
+}
+
+struct RepositionVelocity {
+    double x = 0.0, y = 0.0, yaw = 0.0;
+    bool retreat = false;
+};
+
+// Coarse positioning keeps the ball ahead of the robot and moves around it,
+// rather than commanding a straight path to a point beyond the ball. When
+// already too close, first make room for the orbit. The caller can latch the
+// orbit direction so noise at +/-pi does not reverse the chosen route.
+inline RepositionVelocity repositionVelocity(double range, double bearing,
+                                               double approachError,
+                                               double orbitDistance,
+                                               double maxSpeed, double maxYaw,
+                                               int orbitDirection = 0) {
+    if (!std::isfinite(range) || range <= 0.05 || !std::isfinite(bearing) ||
+        !std::isfinite(approachError) || !std::isfinite(maxSpeed) ||
+        maxSpeed <= 0.0 || !std::isfinite(maxYaw) || maxYaw < 0.0) return {};
+    orbitDistance = std::isfinite(orbitDistance) ?
+        std::clamp(orbitDistance, 0.25, 1.2) : 0.55;
+    bearing = kick_geometry::normalizeAngle(bearing);
+    approachError = kick_geometry::normalizeAngle(approachError);
+    RepositionVelocity result;
+    result.yaw = std::abs(bearing) <= 0.05 ? 0.0 :
+        std::clamp(effectiveAdjustmentSpeed(1.5 * bearing), -maxYaw, maxYaw);
+    // Turn first if the ball is on the side or behind the robot; translating
+    // in that pose can obscure the ball and bypass the intended safe orbit.
+    if (std::abs(bearing) > 0.5) return result;
+
+    result.retreat = range < orbitDistance - 0.06;
+    double radial = 0.0, tangent = 0.0;
+    if (result.retreat) {
+        radial = -std::min(maxSpeed,
+            effectiveAdjustmentSpeed((orbitDistance - range) * 1.5));
+    } else {
+        radial = std::abs(range - orbitDistance) <= 0.04 ? 0.0 :
+            std::clamp((range - orbitDistance) * 1.5, -maxSpeed, maxSpeed);
+        if (std::abs(approachError) > 0.02) {
+            const int direction = orbitDirection == 0 ?
+                (approachError > 0.0 ? 1 : -1) : (orbitDirection > 0 ? 1 : -1);
+            tangent = -direction * std::min(maxSpeed,
+                std::max(0.3, maxSpeed * 0.75));
+        }
+    }
+    auto translation = effectiveAdjustmentVector(
+        radial * std::cos(bearing) - tangent * std::sin(bearing),
+        radial * std::sin(bearing) + tangent * std::cos(bearing));
+    const double speed = std::hypot(translation.x, translation.y);
+    if (speed > maxSpeed) {
+        translation.x *= maxSpeed / speed;
+        translation.y *= maxSpeed / speed;
+    }
+    result.x = translation.x;
+    result.y = translation.y;
+    return result;
+}
+
 struct ChaseVelocity { double x = 0.0, yaw = 0.0; };
 
 // 对目标点减速，目标在侧后方时先转身。缩小前向分量后不能再次抬到最低步速。
@@ -185,8 +271,8 @@ inline AdjustmentVelocity adjustmentVelocity(double range, double bearing,
         std::clamp(range - standOff, -0.3, 0.5);
     const double tangent = std::abs(directionError) <= directionTolerance ? 0.0 :
         -tangentialSpeed * std::clamp(directionError / std::max(0.05, rampAngle), -1.0, 1.0);
-    return {effectiveAdjustmentSpeed(radial * std::cos(bearing) - tangent * std::sin(bearing)),
-            effectiveAdjustmentSpeed(radial * std::sin(bearing) + tangent * std::cos(bearing))};
+    return effectiveAdjustmentVector(radial * std::cos(bearing) - tangent * std::sin(bearing),
+                                     radial * std::sin(bearing) + tangent * std::cos(bearing));
 }
 
 } // namespace kick_strategy

@@ -93,6 +93,11 @@ brain_node:
       auto_visual_kick_enable_angle: 0.35 # 允许的球方向偏角，弧度
       auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
       auto_visual_kick_max_body_error: 0.25 # 身体朝向的最大误差，弧度
+      kick_approach:
+        reposition_enter_angle: 0.65 # 近球但线路误差大于此值时先绕到球后，弧度
+        reposition_exit_angle: 0.35 # 绕球误差降到此值后交给精调；与进入门槛形成滞回
+        orbit_distance: 0.55 # 大范围绕球时保留的球距，太近时先退开，米
+        orbit_speed: 0.45 # 大范围绕球平移速度上限，米/秒
       auto_visual_kick:
         cooldown_ms: 600.0
         start_ack_timeout_ms: 1200.0 # 运控启动响应超时，毫秒

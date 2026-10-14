@@ -155,6 +155,75 @@ int main() {
     const auto outsideLine = adjustmentVelocity(0.4, 0.0, 0.7, 0.4, 0.22, 0.3, 0.55);
     ok &= check("keeper still orbits a genuinely wrong approach line", outsideLine.y < 0.0);
 
+    // A tiny component must not become a full independent walking step. The
+    // historical per-axis floor turned this almost lateral orbit into a
+    // diagonal (0.3, -0.3) command and overshot the stance repeatedly.
+    const auto acceptedLine = adjustmentVelocity(0.4, 0.1, 0.24, 0.4, 0.15, 0.5, 0.25);
+    const auto justOutsideLine = adjustmentVelocity(0.4, 0.1, 0.26, 0.4, 0.15, 0.5, 0.25);
+    ok &= check("accepted shot line has no unnecessary orbit",
+        near(acceptedLine.x, 0.0) && near(acceptedLine.y, 0.0));
+    ok &= check("minimum adjustment speed preserves vector direction",
+        near(std::hypot(justOutsideLine.x, justOutsideLine.y), 0.3) &&
+        near(justOutsideLine.x / justOutsideLine.y, -std::tan(0.1)));
+    ok &= check("tiny forward adjustment is not promoted to a full step",
+        justOutsideLine.x > 0.0 && justOutsideLine.x < 0.04 &&
+        justOutsideLine.y < -0.29);
+    const auto oppositeLine = adjustmentVelocity(0.4, -0.1, -0.26, 0.4, 0.15, 0.5, 0.25);
+    ok &= check("vector adjustment mirrors across the shot line",
+        near(oppositeLine.x, justOutsideLine.x) && near(oppositeLine.y, -justOutsideLine.y));
+    const auto fullVector = effectiveAdjustmentVector(0.4, -0.3);
+    ok &= check("already effective vector keeps magnitude and direction",
+        near(fullVector.x, 0.4) && near(fullVector.y, -0.3));
+    ok &= check("nonfinite vector is stopped", near(effectiveAdjustmentVector(
+        std::numeric_limits<double>::infinity(), 0.0).x, 0.0));
+
+    ok &= check("near ball on wrong side still needs coarse positioning",
+        needsReposition(0.352, 2.5335, false));
+    ok &= check("coarse positioning enters outside the larger threshold",
+        !needsReposition(0.4, 0.65, false) && needsReposition(0.4, 0.66, false));
+    ok &= check("coarse positioning hysteresis holds through middle band",
+        !needsReposition(0.4, 0.4, false) && needsReposition(0.4, 0.4, true));
+    ok &= check("coarse positioning exits at the smaller threshold",
+        !needsReposition(0.4, 0.35, true) && needsReposition(0.4, 0.36, true));
+    ok &= check("coarse positioning uses shortest wrapped angle",
+        needsReposition(0.4, 0.7 + 2.0 * kick_geometry::kPi, false) &&
+        needsReposition(0.4, -0.7 - 2.0 * kick_geometry::kPi, false) &&
+        !needsReposition(0.4, 0.3 + 2.0 * kick_geometry::kPi, true));
+    ok &= check("invalid ball or angle cannot request a coarse orbit",
+        !needsReposition(0.0, 2.0, false) &&
+        !needsReposition(std::numeric_limits<double>::infinity(), 2.0, false) &&
+        !needsReposition(0.4, std::numeric_limits<double>::quiet_NaN(), true));
+
+    const auto retreat = repositionVelocity(0.352, 0.298, 2.5335, 0.55, 0.45, 1.5);
+    const double retreatRadial = retreat.x * std::cos(0.298) + retreat.y * std::sin(0.298);
+    const double retreatTangent = -retreat.x * std::sin(0.298) + retreat.y * std::cos(0.298);
+    ok &= check("feet-side coarse positioning retreats before orbiting",
+        retreat.retreat && retreatRadial < -0.29 && near(retreatTangent, 0.0));
+    ok &= check("coarse retreat stays inside speed and turn limits",
+        std::hypot(retreat.x, retreat.y) <= 0.45 && std::abs(retreat.yaw) <= 1.5);
+    for (const double sign : {-1.0, 1.0}) {
+        const double bearing = sign * 0.2;
+        const auto orbit = repositionVelocity(0.55, bearing, sign * 2.5, 0.55, 0.45, 1.5);
+        const double radial = orbit.x * std::cos(bearing) + orbit.y * std::sin(bearing);
+        const double tangent = -orbit.x * std::sin(bearing) + orbit.y * std::cos(bearing);
+        ok &= check("coarse orbit maintains stand-off on either side",
+            !orbit.retreat && near(radial, 0.0) && sign * tangent < -0.3);
+        ok &= check("coarse orbit respects speed limit", std::hypot(orbit.x, orbit.y) <= 0.45);
+    }
+    const auto turnFirst = repositionVelocity(0.352, 0.8, 2.5, 0.55, 0.45, 1.5);
+    ok &= check("side ball is brought into view before translating",
+        near(turnFirst.x, 0.0) && near(turnFirst.y, 0.0) && turnFirst.yaw > 0.0);
+    const auto latchedPositive = repositionVelocity(0.55, 0.0,
+        -kick_geometry::kPi + 0.01, 0.55, 0.45, 1.5, 1);
+    const auto latchedNegative = repositionVelocity(0.55, 0.0,
+        kick_geometry::kPi - 0.01, 0.55, 0.45, 1.5, -1);
+    ok &= check("latched orbit direction survives angle wrapping",
+        latchedPositive.y < 0.0 && latchedNegative.y > 0.0);
+    const auto invalidOrbit = repositionVelocity(0.4, 0.0,
+        std::numeric_limits<double>::quiet_NaN(), 0.55, 0.45, 1.5);
+    ok &= check("invalid orbit target stops every motion axis",
+        near(invalidOrbit.x, 0.0) && near(invalidOrbit.y, 0.0) && near(invalidOrbit.yaw, 0.0));
+
     // A simple planar trajectory must settle on the shot line, rather than
     // orbit forever with a constant lateral speed after alignment.
     double x = -0.8, y = -0.5, heading = 0.4;
@@ -165,10 +234,10 @@ int main() {
         const double range = std::hypot(bx, by);
         const double bearing = std::atan2(by, bx);
         const double error = -std::atan2(-y, -x);
-        const auto command = adjustmentVelocity(range, bearing, error, 0.4, 0.15, 0.5);
+        const auto command = adjustmentVelocity(range, bearing, error, 0.4, 0.15, 0.5, 0.25);
         x += (command.x * std::cos(heading) - command.y * std::sin(heading)) * 0.01;
         y += (command.x * std::sin(heading) + command.y * std::cos(heading)) * 0.01;
-        heading += adjustmentTurnVelocity(bearing, error, -heading, 0.5, 1.5, 0.1) * 0.01;
+        heading += adjustmentTurnVelocity(bearing, error, -heading, 0.25, 1.5, 0.1) * 0.01;
         if (alignedForKick(bx, by, heading, 0.0, limits) && range < 0.5) {
             converged = true;
             break;
@@ -202,7 +271,7 @@ int main() {
         const double vx = actuator(command.x), vy = actuator(command.y);
         x += (vx * std::cos(heading) - vy * std::sin(heading)) * 0.01;
         y += (vx * std::sin(heading) + vy * std::cos(heading)) * 0.01;
-        heading += actuator(adjustmentTurnVelocity(bearing, error, -heading, 0.5, 1.5, 0.1)) * 0.01;
+        heading += actuator(adjustmentTurnVelocity(bearing, error, -heading, 0.25, 1.5, 0.1)) * 0.01;
     }
     ok &= check("feet-side adjustment overcomes actuator dead zone", converged);
     return ok ? 0 : 1;

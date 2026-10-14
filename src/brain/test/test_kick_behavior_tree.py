@@ -85,13 +85,21 @@ class MatchMotionRouting(unittest.TestCase):
         tree = parents[decision_node]
         expected = {
             "find": "RobotFindBall", "assist": "Assist", "kickoff_hold": "KickoffStand",
-            "chase": "Chase", "adjust": "Adjust", "auto_visual_kick": "RLVisionKick",
+            "chase": "Chase", "reposition": "Chase", "adjust": "Adjust", "auto_visual_kick": "RLVisionKick",
             "power_kick": "Kick", "kick": "Kick", "cross": "Kick", "safe_shoot": "Kick",
             "kick_wait": "SetVelocity",
         }
         for decision, action in expected.items():
             with self.subTest(decision=decision):
                 self.assertEqual(selected_actions(tree, "decision", decision, set(expected.values())), [action])
+
+    def test_reposition_passes_its_mode_to_the_motion_node(self):
+        root = ET.parse(TREES / "subtree_striker_play.xml").getroot()
+        chase = root.find(".//Chase")
+        self.assertEqual(chase.get("mode"), "{decision}")
+        self.assertTrue(condition_matches(chase.get("_while"), {"decision": "reposition"}))
+        self.assertGreaterEqual(float(chase.get("dist")), 0.35)
+        self.assertGreaterEqual(float(chase.get("safe_dist")), float(chase.get("dist")))
 
     def test_running_kick_does_not_skip_new_decisions(self):
         root = ET.parse(TREES / "subtree_striker_play.xml").getroot()

@@ -585,6 +585,73 @@ NodeStatus Chase::tick()
     double theta_rb = brain->data->robotBallAngleToField;
     auto ballPos = brain->data->ball.posToField;
 
+    string mode;
+    getInput("mode", mode);
+    if (mode == "reposition") {
+        if (!brain->data->tmImLead || !visualKickCurrentRealBallFresh(brain)) {
+            brain->client->setVelocity(0, 0, 0);
+            _lastRepositionTickMs = -1.0;
+            return NodeStatus::SUCCESS;
+        }
+        const double routeError = toPInPI(kickDir - theta_rb);
+        const double nowMs = team_cooperation::steadyNowMs();
+        // 同一次绕球锁定方向，避免线路误差在 ±pi 附近抖动时左右反复切换。
+        if (_lastRepositionTickMs < 0.0 || nowMs - _lastRepositionTickMs > 500.0 ||
+            norm(ballPos.x - _repositionBallX, ballPos.y - _repositionBallY) > 0.4 ||
+            fabs(toPInPI(kickDir - _repositionKickDir)) > 0.35) {
+            _dir = routeError >= 0.0 ? 1.0 : -1.0;
+            _repositionBallX = ballPos.x;
+            _repositionBallY = ballPos.y;
+            _repositionKickDir = kickDir;
+            _repositionBlockedSinceMs = -1.0;
+            _repositionTriedOtherSide = false;
+        }
+        _lastRepositionTickMs = nowMs;
+        double orbitDistance = brain->get_parameter("strategy.kick_approach.orbit_distance").as_double();
+        double orbitSpeed = brain->get_parameter("strategy.kick_approach.orbit_speed").as_double();
+        orbitDistance = std::clamp(std::isfinite(orbitDistance) ? orbitDistance : 0.55, 0.35, 1.0);
+        orbitSpeed = std::clamp(std::isfinite(orbitSpeed) ? orbitSpeed : 0.45, 0.3, 0.8);
+        const double repositionSpeed = std::min({orbitSpeed, vxLimit, vyLimit});
+        auto command = kick_strategy::repositionVelocity(ballRange, ballYaw,
+            routeError, orbitDistance, repositionSpeed,
+            vthetaLimit, static_cast<int>(_dir));
+        const auto blocked = [&](const kick_strategy::RepositionVelocity &candidate) {
+            return avoidObstacle && norm(candidate.x, candidate.y) > 1e-5 &&
+                brain->distToObstacle(atan2(candidate.y, candidate.x)) < oaSafeDist;
+        };
+        bool pathBlocked = blocked(command);
+        if (pathBlocked) {
+            if (_repositionBlockedSinceMs < 0.0) _repositionBlockedSinceMs = nowMs;
+            if (!command.retreat && !_repositionTriedOtherSide &&
+                nowMs - _repositionBlockedSinceMs >= 300.0) {
+                const auto alternate = kick_strategy::repositionVelocity(ballRange, ballYaw,
+                    routeError, orbitDistance, repositionSpeed, vthetaLimit, -static_cast<int>(_dir));
+                if (norm(alternate.x, alternate.y) > 1e-5 && !blocked(alternate)) {
+                    _dir = -_dir;
+                    _repositionTriedOtherSide = true;
+                    command = alternate;
+                    pathBlocked = false;
+                }
+            }
+        }
+        if (!pathBlocked) _repositionBlockedSinceMs = -1.0;
+        // 两侧均受阻时保持观察；同一目标最多换一次绕行侧，避免障碍抖动导致来回切。
+        const double vx = pathBlocked ? 0.0 : command.x;
+        const double vy = pathBlocked ? 0.0 : command.y;
+        brain->client->setVelocity(vx, vy, command.yaw, false, false, false);
+        const string stage = pathBlocked ? "blocked" : (command.retreat ? "retreat" : "orbit");
+        if (_state != stage || _lastRepositionLogMs < 0.0 || nowMs - _lastRepositionLogMs >= 1000.0) {
+            std::cout << "[KickApproach] stage=" << stage << " range=" << ballRange
+                      << " route_error=" << routeError << " orbit_direction=" << _dir
+                      << " path_blocked=" << pathBlocked << std::endl;
+            _lastRepositionLogMs = nowMs;
+        }
+        _state = stage;
+        return NodeStatus::SUCCESS;
+    }
+    _lastRepositionTickMs = -1.0;
+    _state.clear();
+
     double vx, vy, vtheta;
     Pose2D target_f, target_r;
     static string targetType = "direct";
@@ -1485,7 +1552,7 @@ NodeStatus Adjust::tick()
     vy = adjustment.y;
     vtheta = kick_strategy::adjustmentTurnVelocity(ballYaw, deltaDir,
         toPInPI(kickDir - brain->data->robotPoseToField.theta),
-        std::max(turnThreshold, directionTolerance),
+        directionTolerance,
         vthetaFactor, noTurnThreshold);
     if (fabs(ballYaw) > turnFirstThreshold && fabs(deltaDir) < M_PI / 4) {
         vx = 0;
@@ -1828,6 +1895,15 @@ NodeStatus StrikerDecide::tick() {
         }        
         color = 0x00FF00FF;
         // 趟球启动时仍需知道这是定位球，否则 soft_kickoff 限速会在出脚前失效。
+    }
+    else if (kick_strategy::needsReposition(ballRange, deltaDir,
+        lastDecision == "reposition",
+        brain->get_parameter("strategy.kick_approach.reposition_enter_angle").as_double(),
+        brain->get_parameter("strategy.kick_approach.reposition_exit_angle").as_double()))
+    {
+        // 球近但仍在错误一侧时先完成大范围站位；距离不能单独决定进入精调。
+        newDecision = "reposition";
+        color = 0x00AAFFFF;
     }
     else
     {

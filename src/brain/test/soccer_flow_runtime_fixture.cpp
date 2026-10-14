@@ -75,8 +75,11 @@ public:
     virtual NodeStatus onRunning() { return NodeStatus::SUCCESS; }
     virtual void onHalted() {}
     map<string, double> numbers{{"chase_threshold", 1.0}, {"min_msec_kick", 1500}, {"max_msec_kick", 7000}, {"range", 6.0},
-        {"vx_limit", 0.6}, {"vy_limit", 0.4}, {"vtheta_limit", 1.5}, {"dist", 0.8}, {"safe_dist", 1.0}};
-    map<string, string> strings{{"decision_in", ""}, {"position", "offense"}};
+        {"vx_limit", 0.6}, {"vy_limit", 0.4}, {"vtheta_limit", 1.5}, {"dist", 0.8}, {"safe_dist", 1.0},
+        {"turn_threshold", 0.5}, {"vtheta_factor", 1.5}, {"tangential_speed_far", 0.7},
+        {"tangential_speed_near", 0.15}, {"near_threshold", 0.8}, {"no_turn_threshold", 0.1},
+        {"turn_first_threshold", 0.5}};
+    map<string, string> strings{{"decision_in", ""}, {"position", "offense"}, {"mode", "chase"}};
     template<class T> optional<T> getInput(const string &key) const {
         if constexpr (is_same_v<T, string>) return strings.at(key);
         else return static_cast<T>(numbers.at(key));
@@ -172,7 +175,9 @@ public:
     FakeLog logStorage; FakeLog *log = &logStorage;
     FakeClock clock;
     FakeClient clientStorage{this}; FakeClient *client = &clientStorage;
-    bool blocked = false;
+    bool blocked = false, angleGood = true;
+    bool blockAllDirections = false;
+    int blockedOrbitSide = 0;
     kick_strategy::BallSource source = kick_strategy::BallSource::real;
     map<string, double> parameters{
         {"strategy.enable_auto_visual_kick", 1}, {"strategy.auto_visual_kick_enable_dist_min", 0.05},
@@ -185,6 +190,9 @@ public:
         {"strategy.auto_visual_kick.max_total_ms", 14000}, {"strategy.auto_visual_kick.max_parallel_count", 1},
         {"strategy.auto_visual_kick.max_extra_rounds", 1}, {"strategy.auto_visual_kick.yield_my_cost_min", 4},
         {"strategy.kick_range", 1.0}, {"strategy.kick_theta_range", 0.2}, {"strategy.shoot.threat_threshold", -2},
+        {"strategy.kick_approach.reposition_enter_angle", 0.65},
+        {"strategy.kick_approach.reposition_exit_angle", 0.35},
+        {"strategy.kick_approach.orbit_distance", 0.55}, {"strategy.kick_approach.orbit_speed", 0.45},
         {"strategy.far_set_play_search.trigger_x", 0.5}, {"strategy.far_set_play_search.field_target_x_ratio", 0.25},
         {"strategy.far_set_play_search.lane_y_ratio", 0.28}, {"strategy.far_set_play_search.max_move_secs", 30},
         {"strategy.far_set_play_search.vx_limit", 0.7}, {"strategy.far_set_play_search.vy_limit", 0.4}};
@@ -198,9 +206,11 @@ public:
     auto getKickBallSource() const { return source; }
     bool teammateBlocksKick() const { return blocked; }
     double teammateDistance() const { return blocked ? 0.4 : 100.0; }
-    bool isAngleGood(double, const string &) const { return true; }
+    bool isAngleGood(double, const string &) const { return angleGood; }
     bool isAngleGoodForDirectionalKick(double) const { return true; }
-    double distToObstacle(double) const { return 100.0; }
+    double distToObstacle(double direction) const {
+        return blockAllDirections || blockedOrbitSide * sin(direction) > 0.1 ? 0.2 : 100.0;
+    }
     bool isBallOut(double, double) const { return tree->getEntry<bool>("ball_out"); }
     double calcAvoidDir(double direction, double) const { return direction; }
     double kickValue(double) const { return 0.0; }
@@ -252,6 +262,246 @@ void sharedReport(Brain &b, double range, double bearing, bool owner, bool relia
 bool bodyStopped(const Brain &b) {
     const auto &command = b.client->command;
     return command.x == 0.0 && command.y == 0.0 && command.yaw == 0.0;
+}
+
+void localBall(Brain &b, double range, double bearing, double routeError) {
+    b.data->ballDetected = true;
+    b.data->ballFromTeammate = false;
+    b.source = kick_strategy::BallSource::real;
+    b.tree->setEntry("ball_location_known", true);
+    b.tree->setEntry("tm_ball_pos_reliable", false);
+    b.data->ball.range = range;
+    b.data->ball.yawToRobot = bearing;
+    b.data->ball.posToRobot = {range * cos(bearing), range * sin(bearing), 0.0};
+    b.data->robotBallAngleToField = toPInPI(b.data->robotPoseToField.theta + bearing);
+    b.data->ball.posToField = {
+        b.data->robotPoseToField.x + range * cos(b.data->robotBallAngleToField),
+        b.data->robotPoseToField.y + range * sin(b.data->robotBallAngleToField), 0.0};
+    b.data->kickDir = toPInPI(b.data->robotBallAngleToField + routeError);
+    b.data->ball.timePoint = b.clock.time;
+}
+
+string runDecision(Brain &b, StrikerDecide &decide, const string &previous) {
+    decide.strings["decision_in"] = previous;
+    b.tree->setEntry("decision", previous);
+    decide.tick();
+    const auto decision = decide.strings.at("decision_out");
+    b.tree->setEntry("decision", decision);
+    return decision;
+}
+
+void runChase(Brain &b, Chase &chase, const string &decision) {
+    // Model the XML blackboard bindings explicitly; NodeBase only stores ports.
+    b.tree->setEntry("decision", decision);
+    chase.strings["mode"] = decision;
+    chase.tick();
+}
+
+void approachHandoffFlow() {
+    Brain p3;
+    localBall(p3, 0.352, 0.298, 2.53);
+    StrikerDecide decide("decide", {}, &p3);
+    Chase chase("chase", {}, &p3);
+    chase.numbers["dist"] = 0.4;
+    chase.numbers["safe_dist"] = 0.55;
+    check(runDecision(p3, decide, "chase") == "reposition",
+          "close ball on the wrong side is handed to fine adjustment");
+    runChase(p3, chase, "reposition");
+    const auto retreat = p3.client->command;
+    check(retreat.x * cos(p3.data->ball.yawToRobot) +
+              retreat.y * sin(p3.data->ball.yawToRobot) < 0.0,
+          "close wrong-side ball does not first retreat to leave orbit clearance");
+    check(hypot(retreat.x, retreat.y) <= 0.45 + 1e-9 && abs(retreat.yaw) <= 1.5,
+          "coarse positioning exceeds configured speed caps");
+    localBall(p3, 0.55, 0.0, 2.53);
+    runChase(p3, chase, "reposition");
+    check(p3.client->command.y < 0.0 && abs(p3.client->command.x) < 1e-9,
+          "wrong-side position follows a direct path through the ball instead of orbiting");
+
+    Brain hysteresis;
+    StrikerDecide transition("decide", {}, &hysteresis);
+    localBall(hysteresis, 0.7, 0.3, 0.64);
+    check(runDecision(hysteresis, transition, "adjust") == "adjust",
+          "coarse orbit starts below its entry threshold");
+    localBall(hysteresis, 0.7, 0.3, 0.66);
+    check(runDecision(hysteresis, transition, "adjust") == "reposition",
+          "coarse orbit does not start above its entry threshold");
+    localBall(hysteresis, 0.7, 0.3, 0.5);
+    check(runDecision(hysteresis, transition, "reposition") == "reposition",
+          "coarse orbit exits too early inside the hysteresis band");
+    check(runDecision(hysteresis, transition, "adjust") == "adjust",
+          "fine adjustment restarts orbit inside the hysteresis band");
+    localBall(hysteresis, 0.7, 0.3, 0.36);
+    check(runDecision(hysteresis, transition, "reposition") == "reposition",
+          "coarse orbit exits above its exit threshold");
+    localBall(hysteresis, 0.7, 0.3, 0.34);
+    check(runDecision(hysteresis, transition, "reposition") == "adjust",
+          "coarse orbit cannot hand off to fine adjustment");
+    localBall(hysteresis, 1.2, 0.3, 2.5);
+    check(runDecision(hysteresis, transition, "reposition") == "chase",
+          "far ball is assigned near-ball orbit instead of approach");
+
+    hysteresis.parameters["strategy.kick_approach.reposition_enter_angle"] = 0.9;
+    hysteresis.parameters["strategy.kick_approach.reposition_exit_angle"] = 0.5;
+    localBall(hysteresis, 0.7, 0.3, 0.8);
+    check(runDecision(hysteresis, transition, "adjust") == "adjust" &&
+          runDecision(hysteresis, transition, "reposition") == "reposition",
+          "configured coarse orbit entry/exit thresholds are ignored");
+    localBall(hysteresis, 0.7, 0.3, 0.49);
+    check(runDecision(hysteresis, transition, "reposition") == "adjust",
+          "configured orbit exit threshold is ignored");
+
+    Brain rightSide;
+    localBall(rightSide, 0.4, -0.55, 0.0);
+    StrikerDecide facing("decide", {}, &rightSide);
+    Adjust fine("adjust", {}, &rightSide);
+    fine.numbers["range"] = 0.4;
+    check(runDecision(rightSide, facing, "chase") == "adjust",
+          "a correct-side ball with only body error starts another orbit");
+    fine.tick();
+    check(rightSide.client->command.x == 0.0 && rightSide.client->command.y == 0.0 &&
+          rightSide.client->command.yaw < 0.0,
+          "body-only adjustment walks away from an already aligned approach line");
+    // Outside the shot-line tolerance, face the ball while orbiting. The old
+    // 0.5-rad cutoff turned toward the shot too early and could lose the ball.
+    localBall(rightSide, 0.4, -0.1, 0.3);
+    fine.tick();
+    check(rightSide.client->command.yaw < 0.0,
+          "fine orbit rotates away from the ball before the route is aligned");
+
+    Brain ready;
+    StrikerDecide direct("decide", {}, &ready);
+    localBall(ready, 0.4, 0.0, 0.0);
+    check(runDecision(ready, direct, "reposition") == "auto_visual_kick",
+          "an aligned ball must finish an unnecessary orbit before SDK kick");
+    ready.parameters["strategy.enable_auto_visual_kick"] = 0.0;
+    check(runDecision(ready, direct, "reposition") == "kick",
+          "aligned ordinary kick is blocked by the new orbit stage");
+    localBall(ready, 0.4, 0.0, 2.0);
+    check(runDecision(ready, direct, "adjust") == "kick",
+          "existing ordinary kick eligibility is narrowed by coarse positioning");
+    ready.data->tmImLead = false;
+    check(runDecision(ready, direct, "reposition") == "assist",
+          "coarse positioning takes priority over revoked ownership");
+
+    Brain bounded;
+    bounded.parameters["strategy.kick_approach.orbit_speed"] = 0.8;
+    bounded.parameters["strategy.kick_approach.orbit_distance"] = 0.7;
+    bounded.config->limitNearBallSpeed = true;
+    bounded.config->nearBallSpeedLimit = 0.2;
+    localBall(bounded, 0.55, 0.0, 2.0);
+    Chase limits("chase", {}, &bounded);
+    limits.numbers["vx_limit"] = 0.6;
+    limits.numbers["vy_limit"] = 0.4;
+    limits.numbers["vtheta_limit"] = 0.2;
+    runChase(bounded, limits, "reposition");
+    check(bounded.client->command.x < 0.0 &&
+          hypot(bounded.client->command.x, bounded.client->command.y) <= 0.2 + 1e-9,
+          "configured stand-off or near-ball speed limit is ignored during orbit");
+    localBall(bounded, 0.7, 0.8, 2.0);
+    runChase(bounded, limits, "reposition");
+    check(bounded.client->command.x == 0.0 && bounded.client->command.y == 0.0 &&
+          bounded.client->command.yaw > 0.0 && bounded.client->command.yaw <= 0.2,
+          "sideways ball is translated toward before a bounded turn");
+
+    // Integrate a stationary ball and ideal walking velocities, exercising
+    // decision handoff and production Chase together rather than a copy of
+    // their equations. This detects wrong orbit sign and ball-crossing routes.
+    Brain orbit;
+    orbit.angleGood = false;
+    localBall(orbit, 0.352, 0.298, 2.53);
+    const auto fixedBall = orbit.data->ball.posToField;
+    const double shotDirection = orbit.data->kickDir;
+    StrikerDecide planner("decide", {}, &orbit);
+    Chase motion("chase", {}, &orbit);
+    string previous = "chase";
+    bool reachedFine = false;
+    for (int step = 0; step < 400; ++step) {
+        const string decision = runDecision(orbit, planner, previous);
+        if (decision != "reposition") {
+            check(decision == "adjust" || decision == "auto_visual_kick",
+                  "coarse orbit unexpectedly abandons its owned local ball");
+            check(abs(toPInPI(shotDirection - orbit.data->robotBallAngleToField)) <= 0.35,
+                  "coarse orbit hands off while the route is still on the wrong side");
+            reachedFine = true;
+            break;
+        }
+        runChase(orbit, motion, decision);
+        const auto command = orbit.client->command;
+        auto &pose = orbit.data->robotPoseToField;
+        const double dt = 0.05;
+        pose.x += (command.x * cos(pose.theta) - command.y * sin(pose.theta)) * dt;
+        pose.y += (command.x * sin(pose.theta) + command.y * cos(pose.theta)) * dt;
+        pose.theta = toPInPI(pose.theta + command.yaw * dt);
+        advanceClock(orbit, dt * 1000.0);
+        const double range = hypot(fixedBall.x - pose.x, fixedBall.y - pose.y);
+        const double route = atan2(fixedBall.y - pose.y, fixedBall.x - pose.x);
+        localBall(orbit, range, toPInPI(route - pose.theta), toPInPI(shotDirection - route));
+        check(range >= 0.3, "coarse positioning trajectory crosses through the ball");
+        previous = decision;
+    }
+    check(reachedFine, "coarse orbit cannot converge to the fine-adjustment handoff");
+}
+
+void approachBoundaryFlow() {
+    Brain wrap;
+    Chase route("chase", {}, &wrap);
+    localBall(wrap, 0.55, 0.0, kick_geometry::kPi - 0.02);
+    runChase(wrap, route, "reposition");
+    check(wrap.client->command.y < 0.0, "initial orbit direction is reversed");
+    advanceClock(wrap, 30);
+    localBall(wrap, 0.55, 0.0, -kick_geometry::kPi + 0.02);
+    runChase(wrap, route, "reposition");
+    check(wrap.client->command.y < 0.0, "angle wrap reverses a locked production orbit");
+    localBall(wrap, 0.55, 0.0, -1.0);
+    runChase(wrap, route, "reposition");
+    check(wrap.client->command.y > 0.0, "changed shot direction keeps an obsolete orbit plan");
+    wrap.data->robotPoseToField.x += 0.5;
+    localBall(wrap, 0.55, 0.0, 1.0);
+    runChase(wrap, route, "reposition");
+    check(wrap.client->command.y < 0.0, "moved ball keeps an obsolete orbit direction");
+    advanceClock(wrap, 600);
+    localBall(wrap, 0.55, 0.0, -1.0);
+    runChase(wrap, route, "reposition");
+    check(wrap.client->command.y > 0.0, "resumed orbit reuses a stale inactive plan");
+    wrap.data->tmImLead = false;
+    runChase(wrap, route, "reposition");
+    check(bodyStopped(wrap), "revoked owner continues coarse orbit motion");
+    wrap.data->tmImLead = true;
+    wrap.source = kick_strategy::BallSource::none;
+    runChase(wrap, route, "reposition");
+    check(bodyStopped(wrap), "expired local vision continues coarse orbit motion");
+
+    Brain obstacle;
+    obstacle.parameters["obstacle_avoidance.avoid_during_chase"] = 1.0;
+    obstacle.parameters["obstacle_avoidance.chase_ao_safe_dist"] = 1.5;
+    obstacle.blockedOrbitSide = -1;
+    localBall(obstacle, 0.55, 0.0, 1.5);
+    Chase avoiding("chase", {}, &obstacle);
+    runChase(obstacle, avoiding, "reposition");
+    check(bodyStopped(obstacle), "blocked orbit moves through the obstacle");
+    advanceClock(obstacle, 310);
+    runChase(obstacle, avoiding, "reposition");
+    check(obstacle.client->command.y > 0.0,
+          "persistent blocked orbit does not try the clear opposite side");
+    obstacle.blockedOrbitSide = 1;
+    runChase(obstacle, avoiding, "reposition");
+    for (int i = 0; i < 6; ++i) {
+        advanceClock(obstacle, 200);
+        runChase(obstacle, avoiding, "reposition");
+        check(bodyStopped(obstacle), "same target repeatedly flips orbit side under obstruction");
+    }
+
+    Brain both;
+    both.parameters["obstacle_avoidance.avoid_during_chase"] = 1.0;
+    both.parameters["obstacle_avoidance.chase_ao_safe_dist"] = 1.5;
+    both.blockAllDirections = true;
+    localBall(both, 0.55, 0.0, 1.5);
+    Chase trapped("chase", {}, &both);
+    runChase(both, trapped, "reposition");
+    advanceClock(both, 310);
+    runChase(both, trapped, "reposition");
+    check(bodyStopped(both), "two blocked orbit directions still generate translation");
 }
 
 void sharedRecoveryFlow() {
@@ -373,6 +623,8 @@ void sharedRecoveryFlow() {
 int main() {
     try {
         sharedRecoveryFlow();
+        approachBoundaryFlow();
+        approachHandoffFlow();
         Brain known; MoveToFarSetPlaySearchArea unnecessary("search", {}, &known);
         known.data->robotPoseToField.x = -1;
         check(unnecessary.onStart() == NodeStatus::SUCCESS, "known local ball is preempted by half-field search");
@@ -478,6 +730,6 @@ int main() {
         check(replaced.client->visualKickStartState() == kick_strategy::StartState::accepted,
               "replacement cannot accept its own response");
         replaced.client->robocupWalk();
-        cout << "Soccer flow: shared turn/approach/scan/release, ownership, stale target, local recovery, search release, wait/resume, missed frames, RPC acceptance/rejection/timeout/cancellation passed\n";
+        cout << "Soccer flow: shared recovery, close-ball retreat/orbit/handoff, hysteresis, speed limits, direct kick priority, ownership, search release, missed frames, RPC lifecycle passed\n";
     } catch (const exception &error) { cerr << error.what() << '\n'; return 1; }
 }

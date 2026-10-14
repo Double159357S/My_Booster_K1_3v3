@@ -200,6 +200,10 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.shared_ball_search.scan_pitch", 0.15);
     declare_parameter<double>("strategy.shared_ball_search.timeout_ms", 2500.0);
     declare_parameter<double>("strategy.shared_ball_search.target_move_distance", 0.4);
+    declare_parameter<double>("strategy.kick_approach.reposition_enter_angle", 0.65);
+    declare_parameter<double>("strategy.kick_approach.reposition_exit_angle", 0.35);
+    declare_parameter<double>("strategy.kick_approach.orbit_distance", 0.55);
+    declare_parameter<double>("strategy.kick_approach.orbit_speed", 0.45);
     declare_parameter<double>("strategy.cooperation.support_back_distance", 1.4);
     declare_parameter<double>("strategy.cooperation.support_side_distance", 1.2);
     declare_parameter<double>("strategy.cooperation.teammate_stop_distance", 0.8);

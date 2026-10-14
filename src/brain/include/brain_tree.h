@@ -265,6 +265,7 @@ public:
             InputPort<double>("vtheta_limit", 0.1, ""),
             InputPort<double>("dist", 1.0, ""),
             InputPort<double>("safe_dist", 1.0, ""),
+            InputPort<string>("mode", "chase", "chase | reposition"),
         };
     }
     NodeStatus tick() override;
@@ -272,6 +273,12 @@ private:
     Brain *brain;
     string _state;
     double _dir = 1.0;
+    double _lastRepositionTickMs = -1.0;
+    double _lastRepositionLogMs = -1.0;
+    double _repositionBallX = 0.0, _repositionBallY = 0.0;
+    double _repositionKickDir = 0.0;
+    double _repositionBlockedSinceMs = -1.0;
+    bool _repositionTriedOtherSide = false;
 };
 
 // 补充 Chase 变体定义

@@ -42,7 +42,8 @@
                         <KickoffStand _while="decision == 'kickoff_hold'" dist_tolerance="0.5" theta_tolerance="0.2" vx_limit="0.6" vy_limit="0.5" hold_vtheta_limit="0.6" />
                         <Assist _while="decision == 'assist'" vx_limit = "1.2" vy_limit="0.6" />
                         <!-- <Chase3   _while="decision == 'chase'"  vx_limit="1.5"  vy_limit="0.3"  vtheta_limit="1.5"  dist="0.4" safe_dist="0.6" /> -->
-                        <Chase   _while="decision == 'chase'"  vx_limit="1.6"  vy_limit="0.8"  vtheta_limit="1.5"  dist="0.1" safe_dist="0.5" />
+                        <Chase _while="decision == 'chase' || decision == 'reposition'" mode="{decision}"
+                           vx_limit="1.6" vy_limit="0.8" vtheta_limit="1.5" dist="0.4" safe_dist="0.55" />
                         <RLVisionKick _while="decision == 'auto_visual_kick'" min_msec_kick="1500" max_msec_kick="7000" range="6.0"/>
                         <!-- 冷却、启动失败退避或队友挡路时明确停步，仍由上游相机跟球。 -->
                         <SetVelocity _while="decision == 'kick_wait'" />

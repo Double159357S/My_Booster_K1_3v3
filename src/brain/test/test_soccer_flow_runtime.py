@@ -32,12 +32,12 @@ def main():
     client = (brain / "src/robot_client.cpp").read_text(encoding="utf-8")
     client_header = (brain / "include/robot_client.h").read_text(encoding="utf-8")
     declarations = "\n".join(block(headers, f"class {name} :") + ";" for name in
-                             ("RLVisionKick", "MoveToFarSetPlaySearchArea", "StrikerDecide", "CamTrackBall", "Chase"))
+                             ("RLVisionKick", "MoveToFarSetPlaySearchArea", "StrikerDecide", "CamTrackBall", "Chase", "Adjust"))
     methods = "\n".join(block(tree, signature) for signature in (
         "NodeStatus MoveToFarSetPlaySearchArea::onStart()",
         "NodeStatus MoveToFarSetPlaySearchArea::onRunning()",
         "void MoveToFarSetPlaySearchArea::onHalted()", "NodeStatus StrikerDecide::tick()", "NodeStatus CamTrackBall::tick()",
-        "NodeStatus Chase::tick()",
+        "NodeStatus Chase::tick()", "NodeStatus Adjust::tick()",
         "NodeStatus RLVisionKick::onStart()", "NodeStatus RLVisionKick::onRunning()",
         "void RLVisionKick::onHalted()", "void RLVisionKick::recordExitTime()",
         "void RLVisionKick::startDecelerate(", "bool RLVisionKick::stepDecelerate()"))
