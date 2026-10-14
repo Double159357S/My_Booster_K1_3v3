@@ -17,6 +17,7 @@
 #include <vector>
 #include "utils/geometry_types.h"
 #include "utils/kick_strategy.h"
+#include "utils/team_ball.h"
 #include "utils/visual_kick_request.h"
 #include "booster_interface/third_party/nlohmann_json/json.hpp"
 using namespace std;
@@ -73,7 +74,8 @@ public:
     virtual NodeStatus onStart() { return NodeStatus::SUCCESS; }
     virtual NodeStatus onRunning() { return NodeStatus::SUCCESS; }
     virtual void onHalted() {}
-    map<string, double> numbers{{"chase_threshold", 1.0}, {"min_msec_kick", 1500}, {"max_msec_kick", 7000}, {"range", 6.0}};
+    map<string, double> numbers{{"chase_threshold", 1.0}, {"min_msec_kick", 1500}, {"max_msec_kick", 7000}, {"range", 6.0},
+        {"vx_limit", 0.6}, {"vy_limit", 0.4}, {"vtheta_limit", 1.5}, {"dist", 0.8}, {"safe_dist", 1.0}};
     map<string, string> strings{{"decision_in", ""}, {"position", "offense"}};
     template<class T> optional<T> getInput(const string &key) const {
         if constexpr (is_same_v<T, string>) return strings.at(key);
@@ -127,14 +129,24 @@ struct FakeData {
     double kickDir = 0.0, robotBallAngleToField = 0.0, tmMyCost = 1.0;
     double headPitch = 0.9, headYaw = 0.0;
     FakeBall tmBall;
+    team_ball::Recovery sharedBallRecovery;
+    team_ball::RecoverySettings sharedBallRecoverySettings;
     string kickType = "shoot", realGameSubState = "CORNER_KICK", goalieVisualKickSubState = "none";
     Point goalieVisualKickTargetField;
     vector<FakePeer> tmStatus = vector<FakePeer>(5);
     uint64_t setPlaySearchEpoch = 1;
+    Pose2D field2robot(const Pose2D &pose) const {
+        const double dx = pose.x - robotPoseToField.x, dy = pose.y - robotPoseToField.y;
+        return {dx * cos(robotPoseToField.theta) + dy * sin(robotPoseToField.theta),
+                -dx * sin(robotPoseToField.theta) + dy * cos(robotPoseToField.theta),
+                toPInPI(pose.theta - robotPoseToField.theta)};
+    }
 };
 struct FakeConfig {
     int numOfPlayers = 3, playerId = 1;
     bool enableCom = true;
+    bool limitNearBallSpeed = false;
+    double nearBallRange = 1.0, nearBallSpeedLimit = 0.3;
     double camPixX = 640, camPixY = 480, camAngleX = 1.0, camAngleY = 0.8;
     string RLVisionKickVisualKickVersion = "kV2";
     struct { double length = 9, width = 6, penaltyAreaLength = 2, goalAreaLength = 1; } fieldDimensions;
@@ -189,6 +201,8 @@ public:
     bool isAngleGood(double, const string &) const { return true; }
     bool isAngleGoodForDirectionalKick(double) const { return true; }
     double distToObstacle(double) const { return 100.0; }
+    bool isBallOut(double, double) const { return tree->getEntry<bool>("ball_out"); }
+    double calcAvoidDir(double direction, double) const { return direction; }
     double kickValue(double) const { return 0.0; }
     double threatLevel() const { return 0.0; }
 };
@@ -214,8 +228,151 @@ void request(Brain &b, RLVisionKick &action) {
     check(header["api_id"] == 2038 && header["expect_response"] == true, "visual start did not request an RPC response");
 }
 
+// Feed the cooperation helper at the same boundary used by handleCooperation;
+// head, motion and routing assertions below execute the extracted shipped nodes.
+void sharedReport(Brain &b, double range, double bearing, bool owner, bool reliable = true) {
+    b.data->ballDetected = false;
+    b.data->ballFromTeammate = true;
+    b.source = kick_strategy::BallSource::memory;
+    b.tree->setEntry("ball_location_known", true);
+    b.tree->setEntry("tm_ball_pos_reliable", reliable);
+    b.data->ball.range = range;
+    b.data->ball.yawToRobot = bearing;
+    b.data->ball.posToRobot = {range * cos(bearing), range * sin(bearing), 0.0};
+    b.data->ball.posToField = {1.0, 0.0, 0.0};
+    b.data->tmBall = b.data->ball;
+    const bool eligible = b.data->sharedBallRecovery.canPursue(
+        monotonicMs, true, owner, range, 1.0, 0.0, bearing, reliable,
+        b.data->sharedBallRecoverySettings);
+    b.data->tmImLead = owner && eligible && reliable;
+    b.data->sharedBallRecovery.syncOwner(monotonicMs, b.data->tmImLead, range, bearing,
+                                       b.data->sharedBallRecoverySettings);
+}
+
+bool bodyStopped(const Brain &b) {
+    const auto &command = b.client->command;
+    return command.x == 0.0 && command.y == 0.0 && command.yaw == 0.0;
+}
+
+void sharedRecoveryFlow() {
+    Brain owner;
+    Chase chase("chase", {}, &owner);
+    StrikerDecide decide("decide", {}, &owner);
+    CamTrackBall head("head", {}, &owner);
+    sharedReport(owner, 2.0, 1.2, true);
+    decide.tick(); chase.tick(); head.tick();
+    check(decide.strings["decision_out"] == "chase", "shared ball owner is allowed to kick before real detection");
+    check(owner.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::turn &&
+          owner.client->command.x == 0.0 && owner.client->command.y == 0.0 &&
+          owner.client->command.yaw > 0.0 && owner.client->command.yaw <= 0.8,
+          "shared target at large bearing does not turn in place within yaw limit");
+    check(owner.client->heads.back().second == 1.1, "shared target head yaw exceeds hardware range");
+
+    sharedReport(owner, 2.0, -1.2, true); chase.tick();
+    check(owner.client->command.x == 0.0 && owner.client->command.yaw < 0.0 &&
+          owner.client->command.yaw >= -0.8, "right-hand shared target turns in the wrong direction");
+    chase.numbers["vtheta_limit"] = 0.3; chase.tick();
+    check(abs(owner.client->command.yaw) <= 0.3, "shared turning ignores behavior tree yaw limit");
+    chase.numbers["vtheta_limit"] = 1.5;
+
+    sharedReport(owner, 2.0, 0.1, true); chase.tick();
+    check(owner.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::approach &&
+          owner.client->command.x > 0.0 && owner.client->command.x <= 0.6 &&
+          owner.client->command.y == 0.0, "aligned shared target cannot be approached");
+    sharedReport(owner, 0.5, 0.1, true); chase.tick(); head.tick();
+    check(owner.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::scan && bodyStopped(owner),
+          "near shared target does not stop both walking and turning for reacquisition");
+    const auto initialHead = owner.client->heads.back();
+    advanceClock(owner, 650); sharedReport(owner, 0.5, 0.1, true); head.tick();
+    check(owner.client->heads.back() != initialHead, "shared target head remains fixed after scan delay");
+    check(owner.data->tmImLead, "receiving the same target prematurely releases the owner");
+    const int motionCount = owner.client->moves;
+    double minPitch = initialHead.first, maxPitch = initialHead.first;
+    double minYaw = initialHead.second, maxYaw = owner.client->heads.back().second;
+    for (int step = 0; step < 6; ++step) {
+        advanceClock(owner, 250); sharedReport(owner, 0.5, 0.1, true); head.tick();
+        const auto position = owner.client->heads.back();
+        check(position.first >= 0.0 && position.first <= 1.1 &&
+              position.second >= -1.1 && position.second <= 1.1,
+              "shared scan exceeds head motion bounds");
+        minPitch = min(minPitch, position.first); maxPitch = max(maxPitch, position.first);
+        minYaw = min(minYaw, position.second); maxYaw = max(maxYaw, position.second);
+    }
+    check(minYaw < initialHead.second && maxYaw > initialHead.second &&
+          minPitch < initialHead.first && maxPitch > initialHead.first,
+          "shared reacquisition does not scan both yaw and pitch around target");
+    check(owner.client->moves == motionCount, "head scanning overwrites body motion commands");
+    advanceClock(owner, 400); sharedReport(owner, 0.5, 0.1, true); chase.tick(); decide.tick();
+    check(!owner.data->tmImLead && owner.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::released &&
+          bodyStopped(owner) && decide.strings["decision_out"] == "assist",
+          "repeated shared reports reset timeout or retain pursuit after failed reacquisition");
+
+    Brain support;
+    sharedReport(support, 2.0, 0.1, false);
+    StrikerDecide assist("decide", {}, &support); Chase nonOwner("chase", {}, &support);
+    CamTrackBall supportHead("head", {}, &support);
+    assist.tick(); support.client->setVelocity(0.5, 0, 0.4); nonOwner.tick(); supportHead.tick();
+    check(assist.strings["decision_out"] == "assist" && bodyStopped(support) &&
+          support.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::support &&
+          !support.client->heads.empty(), "support striker pursues shared ball or cannot look toward it");
+
+    Brain tuned;
+    tuned.data->sharedBallRecoverySettings.stopDistance = 0.9;
+    tuned.data->sharedBallRecoverySettings.turnAngle = 0.4;
+    tuned.data->sharedBallRecoverySettings.yawLimit = 0.25;
+    Chase configured("chase", {}, &tuned);
+    sharedReport(tuned, 1.2, 0.5, true); configured.tick();
+    check(tuned.client->command.x == 0.0 && tuned.client->command.yaw > 0.0 &&
+          tuned.client->command.yaw <= 0.25, "configured shared turn threshold/yaw cap is ignored");
+    sharedReport(tuned, 0.8, 0.1, true); configured.tick();
+    check(tuned.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::scan && bodyStopped(tuned),
+          "configured shared stand-off distance is ignored");
+
+    Brain stale;
+    sharedReport(stale, 2.0, 0.1, true);
+    Chase expired("chase", {}, &stale); CamTrackBall staleHead("head", {}, &stale);
+    expired.tick(); staleHead.tick();
+    const auto headCount = stale.client->heads.size();
+    // A stale position may remain stored for diagnostics; reliability is decisive.
+    stale.tree->setEntry("tm_ball_pos_reliable", false);
+    expired.tick(); staleHead.tick();
+    check(bodyStopped(stale) && stale.client->heads.size() == headCount,
+          "expired shared position keeps driving body or head with ball_location_known still set");
+    stale.tree->setEntry("ball_location_known", false);
+    StrikerDecide lost("decide", {}, &stale); lost.tick();
+    check(lost.strings["decision_out"] == "find", "expired shared position cannot resume ordinary search");
+
+    Brain limits;
+    sharedReport(limits, 0.5, 0.0, true);
+    limits.data->tmBall.pitchToRobot = 1.5; limits.data->tmBall.yawToRobot = 2.0;
+    limits.data->ball.pitchToRobot = 1.5; limits.data->ball.yawToRobot = 2.0;
+    CamTrackBall limitedHead("head", {}, &limits); limitedHead.tick();
+    check(limits.client->heads.back() == pair<double, double>{1.1, 1.1}, "shared head upper limits are not enforced");
+    limits.data->tmBall.pitchToRobot = -0.3; limits.data->tmBall.yawToRobot = -2.0;
+    limits.data->ball.pitchToRobot = -0.3; limits.data->ball.yawToRobot = -2.0;
+    limitedHead.tick();
+    check(limits.client->heads.back() == pair<double, double>{0.0, -1.1}, "shared head lower limits are not enforced");
+
+    // Restore fresh local detection after release. Recovery resets and pixels,
+    // rather than stale shared geometry or scan offsets, drive the head again.
+    owner.data->ballFromTeammate = false; owner.data->ballDetected = true;
+    owner.source = kick_strategy::BallSource::real; owner.data->tmImLead = true;
+    owner.data->ball.range = 0.4; owner.data->ball.posToRobot = {0.4, 0.0, 0.0};
+    owner.data->ball.yawToRobot = 0.0;
+    owner.data->ball.boundingBox.xmin = 560; owner.data->ball.boundingBox.xmax = 600;
+    owner.data->ball.boundingBox.ymin = 410; owner.data->ball.boundingBox.ymax = 450;
+    owner.data->sharedBallRecovery.canPursue(monotonicMs, false, true, 0.4, 1.0, 0.0);
+    head.tick(); decide.tick();
+    const auto localHead = owner.client->heads.back();
+    check(owner.data->sharedBallRecovery.phase() == team_ball::RecoveryPhase::inactive &&
+          localHead.second < owner.data->headYaw && localHead.first > owner.data->headPitch &&
+          decide.strings["decision_out"] == "auto_visual_kick",
+          "fresh local detection fails to end shared search and resume real-ball tracking/kicking");
+}
+
 int main() {
     try {
+        sharedRecoveryFlow();
         Brain known; MoveToFarSetPlaySearchArea unnecessary("search", {}, &known);
         known.data->robotPoseToField.x = -1;
         check(unnecessary.onStart() == NodeStatus::SUCCESS, "known local ball is preempted by half-field search");
@@ -321,6 +478,6 @@ int main() {
         check(replaced.client->visualKickStartState() == kick_strategy::StartState::accepted,
               "replacement cannot accept its own response");
         replaced.client->robocupWalk();
-        cout << "Soccer flow: search release, wait/resume, missed frames, RPC acceptance/rejection/timeout/cancellation passed\n";
+        cout << "Soccer flow: shared turn/approach/scan/release, ownership, stale target, local recovery, search release, wait/resume, missed frames, RPC acceptance/rejection/timeout/cancellation passed\n";
     } catch (const exception &error) { cerr << error.what() << '\n'; return 1; }
 }

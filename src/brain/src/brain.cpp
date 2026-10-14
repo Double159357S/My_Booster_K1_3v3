@@ -191,6 +191,15 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.cooperation.owner_hold_ms", 1500.0);
     declare_parameter<double>("strategy.cooperation.owner_switch_margin", 0.75);
     declare_parameter<double>("strategy.cooperation.owner_confirm_ms", 500.0);
+    declare_parameter<double>("strategy.shared_ball_search.stop_distance", 0.65);
+    declare_parameter<double>("strategy.shared_ball_search.turn_angle", 0.6);
+    declare_parameter<double>("strategy.shared_ball_search.vtheta_limit", 0.8);
+    declare_parameter<double>("strategy.shared_ball_search.scan_delay_ms", 400.0);
+    declare_parameter<double>("strategy.shared_ball_search.scan_step_ms", 250.0);
+    declare_parameter<double>("strategy.shared_ball_search.scan_yaw", 0.35);
+    declare_parameter<double>("strategy.shared_ball_search.scan_pitch", 0.15);
+    declare_parameter<double>("strategy.shared_ball_search.timeout_ms", 2500.0);
+    declare_parameter<double>("strategy.shared_ball_search.target_move_distance", 0.4);
     declare_parameter<double>("strategy.cooperation.support_back_distance", 1.4);
     declare_parameter<double>("strategy.cooperation.support_side_distance", 1.2);
     declare_parameter<double>("strategy.cooperation.teammate_stop_distance", 0.8);
@@ -1005,9 +1014,29 @@ void Brain::handleCooperation() {
     const int ownerId = activeVisualKickOwner.id > 0
         ? activeVisualKickOwner.id
         : bestOwner.id;
+    auto &sharedSearch = data->sharedBallRecoverySettings;
+    sharedSearch.stopDistance = get_parameter("strategy.shared_ball_search.stop_distance").as_double();
+    sharedSearch.turnAngle = get_parameter("strategy.shared_ball_search.turn_angle").as_double();
+    sharedSearch.yawLimit = get_parameter("strategy.shared_ball_search.vtheta_limit").as_double();
+    sharedSearch.scanDelayMs = get_parameter("strategy.shared_ball_search.scan_delay_ms").as_double();
+    sharedSearch.scanStepMs = get_parameter("strategy.shared_ball_search.scan_step_ms").as_double();
+    sharedSearch.scanYaw = get_parameter("strategy.shared_ball_search.scan_yaw").as_double();
+    sharedSearch.scanPitch = get_parameter("strategy.shared_ball_search.scan_pitch").as_double();
+    sharedSearch.timeoutMs = get_parameter("strategy.shared_ball_search.timeout_ms").as_double();
+    sharedSearch.targetMoveDistance = get_parameter("strategy.shared_ball_search.target_move_distance").as_double();
+    sharedSearch = sharedSearch.sanitized();
+    // 原地等待、出界回场和手动模式只允许头部观察，不消耗主控寻球预算。
+    const bool sharedPursuitAllowed = data->tmImAlive &&
+        tree->getEntry<int>("control_state") == 3 &&
+        tree->getEntry<string>("gc_game_state") == "PLAY" &&
+        !tree->getEntry<bool>("wait_for_opponent_kickoff") &&
+        !tree->getEntry<bool>("ball_out") &&
+        !data->tmImInVisualKick && !data->tmImInDribbleKick &&
+        (selfRole == "striker" || selfGoalieClaimsBall);
     const bool canPursueBall = data->sharedBallRecovery.canPursue(teamNowMs,
-        data->ballFromTeammate, data->tmImLead, data->ball.range,
-        data->ball.posToField.x, data->ball.posToField.y);
+        data->ballFromTeammate, data->tmImLead && sharedPursuitAllowed, data->ball.range,
+        data->ball.posToField.x, data->ball.posToField.y,
+        data->ball.yawToRobot, sharedBallKnown, sharedSearch);
     const bool activeKickSource = data->tmImInVisualKick &&
         getKickBallSource() != kick_strategy::BallSource::none;
     data->tmCanControlBall = tree->getEntry<int>("control_state") == 3 &&
@@ -1043,6 +1072,10 @@ void Brain::handleCooperation() {
         data->teamOwnership = {selfId, data->tmImLead ? selfId : 0, 0, 0};
     }
     tree->setEntry<bool>("is_lead", data->tmImLead);
+    // 本帧仲裁可能刚授予/撤销球权；相机和 Chase 必须使用更新后的动作阶段。
+    data->sharedBallRecovery.syncOwner(teamNowMs,
+        data->tmImLead && sharedPursuitAllowed,
+        data->ball.range, data->ball.yawToRobot, sharedSearch);
 
     static double lastTeamConsoleMs = -std::numeric_limits<double>::infinity();
     if (teamNowMs - lastTeamConsoleMs >= 1000.0) {
@@ -1052,6 +1085,8 @@ void Brain::handleCooperation() {
                       (sharedBallKnown ? "shared" : "expired") :
                       (hasFreshLocalBall() ? "local" : "none"))
                   << " shared_from=" << data->tmBallPlayerId
+                   << " shared_search=" << data->sharedBallRecovery.phaseName()
+                   << " search_phase_ms=" << data->sharedBallRecovery.phaseElapsedMs(teamNowMs)
                   << " role=" << selfRole
                   << " control=" << tree->getEntry<int>("control_state")
                   << " ball_range=" << data->ball.range

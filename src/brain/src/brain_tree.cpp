@@ -334,8 +334,9 @@ NodeStatus CamTrackBall::tick()
 
     };
 
-    bool iSeeBall = brain->data->ballDetected;
-    bool iKnowBallPos = brain->tree->getEntry<bool>("ball_location_known");
+    bool iSeeBall = brain->data->ballDetected && !brain->data->ballFromTeammate;
+    bool iKnowBallPos = brain->tree->getEntry<bool>("ball_location_known") &&
+        !brain->data->ballFromTeammate;
     bool tmBallPosReliable = brain->tree->getEntry<bool>("tm_ball_pos_reliable");
     if (!(iKnowBallPos || tmBallPosReliable))
         return NodeStatus::SUCCESS;
@@ -348,6 +349,11 @@ NodeStatus CamTrackBall::tick()
         } else if (tmBallPosReliable) {
             pitch = brain->data->tmBall.pitchToRobot;
             yaw = brain->data->tmBall.yawToRobot;
+            const auto offset = brain->data->sharedBallRecovery.headOffset(
+                team_cooperation::steadyNowMs(), brain->data->sharedBallRecoverySettings);
+            // 偏移始终相对本帧共享目标，不能累加到上一帧头部指令。
+            pitch = std::clamp(pitch + offset.pitch, 0.0, 1.1);
+            yaw = std::clamp(yaw + offset.yaw, -1.1, 1.1);
         } else {
             log("reached impossible condition");
         }
@@ -550,11 +556,21 @@ NodeStatus Chase::tick()
 
     if (brain->data->ballFromTeammate) {
         // 共享球用于接近和转向重识别；场地坐标不能替代本机脚边视觉。
-        const double yaw = brain->data->ball.yawToRobot;
-        const double speed = team_ball::approachSpeed(brain->data->ball.range, vxLimit);
+        const auto phase = brain->data->sharedBallRecovery.phase();
+        if (!brain->tree->getEntry<bool>("tm_ball_pos_reliable") ||
+            !brain->data->tmImLead ||
+            (phase != team_ball::RecoveryPhase::turn &&
+             phase != team_ball::RecoveryPhase::approach)) {
+            // 近球扫描时稳住身体；失效、未授权或失败目标不能继续沿用旧速度。
+            brain->client->setVelocity(0, 0, 0);
+            return NodeStatus::SUCCESS;
+        }
+        const auto &search = brain->data->sharedBallRecoverySettings;
+        const double speed = phase == team_ball::RecoveryPhase::turn ? 0.0 :
+            team_ball::approachSpeed(brain->data->ball.range, vxLimit, search.stopDistance);
         const auto command = kick_strategy::chaseVelocity(
             brain->data->ball.posToRobot.x, brain->data->ball.posToRobot.y,
-            speed, vthetaLimit, 0.0);
+            speed, std::min(vthetaLimit, search.yawLimit), 0.0);
         brain->client->setVelocity(command.x, 0.0, command.yaw, false, false, false);
         return NodeStatus::SUCCESS;
     }

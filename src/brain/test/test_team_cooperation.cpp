@@ -2,6 +2,7 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <string>
 
 #include "team_communication_msg.h"
 #include "utils/team_ball.h"
@@ -274,23 +275,213 @@ void sharedBallTests() {
     near(team_ball::approachSpeed(2.0, 0.6), 0.6, "shared approach exceeded speed cap");
     team_ball::Recovery recovery;
     check(recovery.canPursue(0, true, true, 0.4, -3.2, 0.2), "initial shared pursuit denied");
-    check(recovery.canPursue(1990, true, true, 0.4, -3.2, 0.2), "shared recovery timed out early");
-    check(!recovery.canPursue(2000, true, true, 0.4, -3.2, 0.2), "blind owner held ball indefinitely");
+    check(recovery.canPursue(2490, true, true, 0.4, -3.2, 0.2), "shared recovery timed out early");
+    check(!recovery.canPursue(2500, true, true, 0.4, -3.2, 0.2), "blind owner held ball indefinitely");
     check(!recovery.canPursue(4000, true, false, 0.4, -3.15, 0.2), "blind owner reclaimed unmoved ball");
     check(recovery.canPursue(4100, true, false, 1.0, -2.7, 0.2), "moved ball did not enable recovery");
     recovery.canPursue(4200, true, true, 0.4, -2.7, 0.2);
-    check(!recovery.canPursue(6200, true, true, 0.4, -2.7, 0.2), "second recovery did not time out");
-    check(recovery.canPursue(6300, false, true, 0.4, -2.7, 0.2), "local reacquisition stayed blocked");
+    check(!recovery.canPursue(6700, true, true, 0.4, -2.7, 0.2), "second recovery did not time out");
+    check(recovery.canPursue(6800, false, true, 0.4, -2.7, 0.2), "local reacquisition stayed blocked");
 
     Network net;
     net.nodes[0].canControl = true; // 守门员通过共享球成为候选
     net.nodes[0].cost = 2.0;
     net.run(3000);
     check(net.owner() == 1, "shared-ball goalie received no majority grant");
-    net.nodes[0].canControl = false; // 近球 2 s 仍不能重识别，资格随消息发布
+    net.nodes[0].canControl = false; // 近球完成有限扫描仍不能重识别，资格随消息发布
     net.run(3000);
     check(net.owner() == 2, "blind goalie did not release to visible striker");
     // Network::run 每帧还检查同时主控和仍在退出动作的机器人总数 <= 1。
+}
+
+void sharedBallRecoveryTests() {
+    using team_ball::Recovery;
+    using team_ball::RecoveryPhase;
+    using team_ball::RecoverySettings;
+    const auto settings = RecoverySettings{}.sanitized();
+
+    // 守门员持续刷新同一球的位置；消息更新和小幅定位抖动不能续租寻球计时。
+    // 先对准目标，再完整覆盖中、左、右、上、下、中，最后释放主控资格。
+    Recovery scan;
+    for (int now = 0; now <= 2500; now += 10) {
+        const double x = 1.0 + 0.05 * std::sin(now / 100.0);
+        const double y = 0.03 * std::cos(now / 100.0);
+        const bool eligible = scan.canPursue(now, true, true, 0.4, x, y, 0.0, true, settings);
+        check(eligible == (now < 2500), "shared refresh/jitter renewed recovery timeout");
+        if (now == 2500) break;
+        check(scan.phase() == RecoveryPhase::scan, "near aligned owner did not scan");
+        const auto offset = scan.headOffset(now, settings);
+        check(std::isfinite(offset.yaw) && std::isfinite(offset.pitch) &&
+              std::abs(offset.yaw) <= settings.scanYaw &&
+              std::abs(offset.pitch) <= settings.scanPitch, "head scan exceeded configured bounds");
+        if (now == 0 || now == 400 || now == 1650 || now == 2490) {
+            near(offset.yaw, 0.0, "center scan yaw wrong");
+            near(offset.pitch, 0.0, "center scan pitch wrong");
+        } else if (now == 650) {
+            near(offset.yaw, settings.scanYaw, "left scan missing");
+            near(offset.pitch, 0.0, "left scan changed pitch");
+        } else if (now == 900) {
+            near(offset.yaw, -settings.scanYaw, "right scan missing");
+            near(offset.pitch, 0.0, "right scan changed pitch");
+        } else if (now == 1150) {
+            near(offset.yaw, 0.0, "upper scan changed yaw");
+            near(offset.pitch, -settings.scanPitch, "upper scan missing");
+        } else if (now == 1400) {
+            near(offset.yaw, 0.0, "lower scan changed yaw");
+            near(offset.pitch, settings.scanPitch, "lower scan missing");
+        }
+    }
+    check(scan.phase() == RecoveryPhase::released &&
+          std::string(scan.phaseName()) == "released", "failed recovery did not expose released phase");
+    check(!scan.canPursue(4000, true, false, 0.4, 1.04, 0.01),
+          "non-owner reclaimed the failed stationary target");
+    check(!scan.canPursue(4100, true, false, 0.4, 1.0, 0.0, 0.0, false),
+          "stale shared target remained actionable");
+    check(scan.phase() == RecoveryPhase::inactive, "stale report kept active head scanning");
+    check(!scan.canPursue(4200, true, true, 0.4, 1.0, 0.0),
+          "report outage erased failed-target latch");
+    check(scan.canPursue(4300, true, true, 0.4, 1.5, 0.0),
+          "significant ball movement did not unlock recovery");
+    check(scan.canPursue(4400, false, true, 0.4, 1.5, 0.0),
+          "local observation did not end shared recovery");
+    check(scan.phase() == RecoveryPhase::inactive, "local vision kept shared scanning active");
+    check(scan.canPursue(4500, true, true, 0.4, 1.0, 0.0),
+          "local reacquisition did not clear old failure latch");
+
+    // 大角度先转身；只有近球且对准后才消耗重识别预算。
+    Recovery movement;
+    check(movement.canPursue(0, true, true, 1.5, 1.0, 0.0, 1.0),
+          "turning toward shared ball denied pursuit");
+    check(movement.phase() == RecoveryPhase::turn, "large shared bearing did not request turn first");
+    const auto turningHead = movement.headOffset(0, settings);
+    near(turningHead.yaw, 0, "turn-first phase added head scan yaw");
+    near(turningHead.pitch, 0, "turn-first phase added head scan pitch");
+    check(movement.canPursue(10000, true, true, 1.5, 1.0, 0.0, 0.4),
+          "distant turning/approach consumed near-ball recovery budget");
+    check(movement.phase() == RecoveryPhase::approach, "aligned distant owner did not approach");
+    check(movement.canPursue(10010, true, true, 0.4, 1.0, 0.0, 0.4) &&
+          movement.phase() == RecoveryPhase::turn, "near misaligned owner started scanning too early");
+    check(movement.canPursue(10020, true, true, 0.4, 1.0, 0.0, 0.2) &&
+          movement.phase() == RecoveryPhase::scan, "aligned near owner did not enter scan");
+    check(movement.canPursue(10120, true, true, 0.70, 1.0, 0.0, 0.3) &&
+          movement.phase() == RecoveryPhase::scan, "range/bearing jitter restarted near-ball scan");
+    check(movement.canPursue(10220, true, true, 0.80, 1.0, 0.0, 0.0) &&
+          movement.phase() == RecoveryPhase::approach, "leaving scan hysteresis did not permit approach");
+    check(movement.canPursue(20000, true, true, 0.4, 1.0, 0.0) &&
+          movement.phase() == RecoveryPhase::scan, "return to near target did not resume scan");
+    check(movement.canPursue(22290, true, true, 0.4, 1.0, 0.0),
+          "approach interval consumed paused scan dwell");
+    check(!movement.canPursue(22300, true, true, 0.4, 1.0, 0.0),
+          "near/far movement repeatedly renewed fixed-target scan budget");
+
+    Recovery misaligned;
+    check(misaligned.canPursue(0, true, true, 0.4, 1.0, 0.0, 0.5) &&
+          misaligned.phase() == RecoveryPhase::turn, "near misaligned target skipped turn phase");
+    check(misaligned.canPursue(4990, true, true, 0.4, 1.0, 0.0, 0.5),
+          "near turn exceeded failure budget before its bound");
+    check(!misaligned.canPursue(5000, true, true, 0.4, 1.0, 0.0, 0.5),
+          "perpetual near-ball misalignment held ownership indefinitely");
+
+    // 仲裁完成后用本帧实际授权同步行为，接应者不消耗主控扫描预算。
+    Recovery ownership;
+    check(ownership.canPursue(0, true, false, 0.4, 1.0, 0.0) &&
+          ownership.phase() == RecoveryPhase::support, "non-owner did not stay in support phase");
+    check(ownership.canPursue(10000, true, false, 0.4, 1.0, 0.0),
+          "support robot timed out without pursuing the ball");
+    ownership.syncOwner(10000, true, 0.4, 0.0, settings);
+    check(ownership.phase() == RecoveryPhase::scan, "new current-frame owner stayed in support phase");
+    near(ownership.phaseElapsedMs(10000), 0.0, "new owner inherited support waiting time");
+    ownership.syncOwner(11000, false, 0.4, 0.0, settings);
+    check(ownership.phase() == RecoveryPhase::support, "lost ownership kept body in owner search phase");
+    check(ownership.canPursue(20000, true, false, 0.4, 1.0, 0.0),
+          "support interval consumed recovery budget");
+    ownership.syncOwner(20000, true, 0.4, 0.0, settings);
+    check(ownership.canPursue(21490, true, true, 0.4, 1.0, 0.0),
+          "ownership interruption consumed paused recovery budget");
+    check(!ownership.canPursue(21500, true, true, 0.4, 1.0, 0.0),
+          "ownership handoff erased previous fixed-target scan dwell");
+
+    Recovery syncOnly;
+    syncOnly.canPursue(0, true, true, 0.4, 1.0, 0.0);
+    syncOnly.syncOwner(3000, false, 0.4, 0.0, settings);
+    check(syncOnly.phase() == RecoveryPhase::support &&
+          syncOnly.canPursue(3000, true, false, 0.4, 1.0, 0.0),
+          "post-arbitration ownership sync expired candidate eligibility");
+    check(!syncOnly.canPursue(3100, true, true, 0.4, 1.0, 0.0),
+          "pre-arbitration recovery update did not enforce exhausted scan budget");
+
+    Recovery interrupted;
+    interrupted.canPursue(0, true, true, 0.4, 1.0, 0.0);
+    check(!interrupted.canPursue(1000, true, true, 0.4, 1.0, 0.0, 0.0, false) &&
+          interrupted.phase() == RecoveryPhase::inactive, "stale report kept recovery active");
+    check(interrupted.canPursue(10000, true, true, 0.4, 1.0, 0.0),
+          "report outage consumed recovery budget");
+    check(!interrupted.canPursue(11500, true, true, 0.4, 1.0, 0.0),
+          "fresh report after outage renewed fixed-target recovery budget");
+
+    // 配置再短也要完成一次扫描；异常配置及几何数据不能产生非法头部命令。
+    RecoverySettings shortSettings;
+    shortSettings.timeoutMs = 1.0;
+    const auto shortScan = shortSettings.sanitized();
+    check(shortScan.timeoutMs >= shortScan.scanDelayMs + 6 * shortScan.scanStepMs,
+          "configured timeout truncates complete head scan");
+    Recovery shortRecovery;
+    shortRecovery.canPursue(0, true, true, 0.4, 1.0, 0.0, 0.0, true, shortSettings);
+    check(shortRecovery.canPursue(shortScan.timeoutMs - 1, true, true, 0.4,
+              1.0, 0.0, 0.0, true, shortSettings), "short configuration aborted scan early");
+    check(!shortRecovery.canPursue(shortScan.timeoutMs, true, true, 0.4,
+              1.0, 0.0, 0.0, true, shortSettings), "short configuration prevented finite release");
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    RecoverySettings badSettings;
+    badSettings.stopDistance = nan;
+    badSettings.turnAngle = -1;
+    badSettings.yawLimit = nan;
+    badSettings.scanDelayMs = -1;
+    badSettings.scanStepMs = inf;
+    badSettings.scanYaw = nan;
+    badSettings.scanPitch = -1;
+    badSettings.timeoutMs = nan;
+    badSettings.targetMoveDistance = -1;
+    const auto safe = badSettings.sanitized();
+    check(std::isfinite(safe.stopDistance) && safe.stopDistance > 0 &&
+          std::isfinite(safe.turnAngle) && safe.turnAngle > 0 &&
+          std::isfinite(safe.yawLimit) && safe.yawLimit > 0 &&
+          std::isfinite(safe.scanDelayMs) && safe.scanDelayMs >= 0 &&
+          std::isfinite(safe.scanStepMs) && safe.scanStepMs > 0 &&
+          std::isfinite(safe.scanYaw) && safe.scanYaw >= 0 &&
+          std::isfinite(safe.scanPitch) && safe.scanPitch >= 0 &&
+          std::isfinite(safe.timeoutMs) && safe.timeoutMs >= safe.scanDelayMs + 6 * safe.scanStepMs &&
+          std::isfinite(safe.targetMoveDistance) && safe.targetMoveDistance > 0,
+          "invalid recovery configuration was not sanitized");
+    near(team_ball::approachSpeed(0.8, 0.6, 0.9), 0.0,
+          "shared approach ignored configured stop distance");
+    near(team_ball::approachSpeed(2.0, nan), 0.0, "invalid speed cap produced shared motion");
+    for (const auto input : std::vector<std::array<double, 5>>{
+            {-1, 0.4, 1, 0, 0}, {nan, 0.4, 1, 0, 0}, {0, -1, 1, 0, 0},
+            {0, inf, 1, 0, 0}, {0, 0.4, nan, 0, 0}, {0, 0.4, 1, nan, 0},
+            {0, 0.4, 1, 0, nan}}) {
+        Recovery invalid;
+        check(!invalid.canPursue(input[0], true, true, input[1], input[2], input[3], input[4]) &&
+              invalid.phase() == RecoveryPhase::inactive, "invalid geometry started shared pursuit");
+        const auto offset = invalid.headOffset(0, badSettings);
+        near(offset.yaw, 0, "invalid geometry generated head yaw");
+        near(offset.pitch, 0, "invalid geometry generated head pitch");
+    }
+
+    // 将实际恢复资格接入延迟 UDP 仲裁：盲主攻扫描失败后让给有视觉的前锋。
+    Network network;
+    network.run(3000);
+    check(network.owner() == 2, "recovery handoff fixture has no initial owner");
+    Recovery blindOwner;
+    for (int tick = 0; tick < 450; ++tick) {
+        network.nodes[1].canControl = blindOwner.canPursue(network.now, true,
+            network.nodes[1].owns, 0.4, 1.0, 0.0);
+        network.run(10);
+        blindOwner.syncOwner(network.now, network.nodes[1].owns, 0.4, 0.0, settings);
+    }
+    check(network.owner() == 3 && !network.nodes[1].canControl,
+          "failed shared search did not hand ownership to visible striker");
 }
 
 void goalieRoleTests() {
@@ -511,11 +702,12 @@ int main() {
         arbitrationTests();
         packetTests();
         sharedBallTests();
+        sharedBallRecoveryTests();
         goalieRoleTests();
         readyFormationTests();
         geometryTests();
         clearanceLivenessTests();
-        std::cout << "Team cooperation: arbitration, shared ball, goalie roles, READY formation, packet decoding and geometry passed\n";
+        std::cout << "Team cooperation: arbitration, shared ball recovery, goalie roles, READY formation, packet decoding and geometry passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

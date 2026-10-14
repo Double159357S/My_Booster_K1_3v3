@@ -121,6 +121,16 @@ brain_node:
         goalie_distance_tie_margin: 0.15 # 距己方球门距离的近似相等范围，米
         goalie_fallback_use_gc_goalie: true # 队友通信不完整时，优先采用裁判机指定的守门员编号
         goalie_attack_handoff: true # 守门员进攻时，允许将守门任务交给队友
+      shared_ball_search:
+        stop_distance: 0.65 # 接近共享球到此距离后停步，用本机视觉重新识别，米
+        turn_angle: 0.6 # 偏角大于此值时先原地转身，弧度
+        vtheta_limit: 0.8 # 共享球定向转身角速度上限，弧度/秒
+        scan_delay_ms: 400.0 # 指向目标后等待相机识别的时间，毫秒
+        scan_step_ms: 250.0 # 中央/左/右/上/下/中央各扫描点的停留时间，毫秒
+        scan_yaw: 0.35 # 相对共享球方向的左右扫描幅度，弧度
+        scan_pitch: 0.15 # 相对共享球方向的上下扫描幅度，弧度
+        timeout_ms: 2500.0 # 近球扫描失败后释放资格；至少允许完成一轮扫描，毫秒
+        target_move_distance: 0.4 # 球相对本次目标锚点移动超过此距离才重置搜索，米
       far_set_play_search:
         enable: true # 任一方门球/角球很远且看不到球时，先去球应出现的半场搜索
         trigger_x: 0.5 # 越过中线至少 0.5 m 才算进入目标半场，避免在中线附近反复切换

@@ -66,6 +66,7 @@ public:
     bool ballFromTeammate = false;  // 当前策略球来自队友，不能用它启动踢球
     int tmBallPlayerId = 0;         // 共享球的直接视觉来源，0 表示没有有效来源
     team_ball::Recovery sharedBallRecovery;
+    team_ball::RecoverySettings sharedBallRecoverySettings;
     bool tmCanControlBall = false; // 本机本帧的控球候选资格，随队内消息广播
     double robotBallAngleToField = 0.0; // 机器人到球的向量, 在球场坐标系中与 X 轴的夹角, (-PI,PI]
     bool lose_ball = false;       // 视觉丢球状态, 用于 visual kick 的退出判定

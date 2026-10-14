@@ -1,5 +1,6 @@
 """Execute production search/decision/SDK request functions with offline boundaries."""
 import argparse
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -31,11 +32,12 @@ def main():
     client = (brain / "src/robot_client.cpp").read_text(encoding="utf-8")
     client_header = (brain / "include/robot_client.h").read_text(encoding="utf-8")
     declarations = "\n".join(block(headers, f"class {name} :") + ";" for name in
-                             ("RLVisionKick", "MoveToFarSetPlaySearchArea", "StrikerDecide", "CamTrackBall"))
+                             ("RLVisionKick", "MoveToFarSetPlaySearchArea", "StrikerDecide", "CamTrackBall", "Chase"))
     methods = "\n".join(block(tree, signature) for signature in (
         "NodeStatus MoveToFarSetPlaySearchArea::onStart()",
         "NodeStatus MoveToFarSetPlaySearchArea::onRunning()",
         "void MoveToFarSetPlaySearchArea::onHalted()", "NodeStatus StrikerDecide::tick()", "NodeStatus CamTrackBall::tick()",
+        "NodeStatus Chase::tick()",
         "NodeStatus RLVisionKick::onStart()", "NodeStatus RLVisionKick::onRunning()",
         "void RLVisionKick::onHalted()", "void RLVisionKick::recordExitTime()",
         "void RLVisionKick::startDecelerate(", "bool RLVisionKick::stepDecelerate()"))
@@ -56,7 +58,11 @@ def main():
         subprocess.run([args.compiler, "-std=c++17", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable",
                         "-I", str(brain / "include"), "-I", str(vendor), str(source),
                         "-o", str(executable)], check=True)
-        subprocess.run([str(executable)], check=True)
+        environment = os.environ.copy()
+        compiler_directory = Path(args.compiler).parent
+        if compiler_directory != Path("."):
+            environment["PATH"] = str(compiler_directory.resolve()) + os.pathsep + environment.get("PATH", "")
+        subprocess.run([str(executable)], check=True, env=environment)
 
 
 if __name__ == "__main__":
