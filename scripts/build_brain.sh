@@ -1,7 +1,4 @@
 #!/bin/bash
+set -e -o pipefail
 
-cd `dirname $0`
-cd ..
-
-colcon build  --symlink-install  --parallel-workers $(nproc) --packages-select brain "$@"
-espeak "build complete" >/dev/null 2>&1 || echo "Build complete"
+exec bash "$(dirname -- "$0")/build.sh" --symlink-install --packages-select brain "$@"

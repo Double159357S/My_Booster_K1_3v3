@@ -718,12 +718,14 @@ def make_archive(root, changes, path):
                 tar.addfile(info, io.BytesIO(data))
 
 
-def prepare_symlink_build(root, run_id):
+def prepare_symlink_build(root, run_id, *, cached_only=False):
     """Back up copied ROS message modules that block a symlink build.
 
     Only touch the generated ament Python module directory, with a matching
     rosidl_generator_py module. Source, install output and robot settings stay
     outside this operation. Existing symlinks already have the desired type.
+    Manual builds without --symlink-install only prepare packages whose CMake
+    cache still enables symlink installation.
     """
     if not re.fullmatch(r'[A-Za-z0-9_-]+', run_id or ''):
         raise ValueError('Invalid backup ID')
@@ -754,6 +756,14 @@ def prepare_symlink_build(root, run_id):
             if copied.is_symlink() or not copied.is_dir():
                 continue
             checked(relative)
+            if cached_only:
+                cache = checked(f'build/{name}/CMakeCache.txt')
+                if not cache.is_file():
+                    continue
+                setting = re.search(r'^AMENT_CMAKE_SYMLINK_INSTALL:[^=\n]+=([^\n]*)$',
+                                    cache.read_text(encoding='utf-8', errors='replace'), re.MULTILINE)
+                if not setting or setting.group(1).strip().upper() not in ('1', 'ON', 'TRUE', 'YES', 'Y'):
+                    continue
             generated = checked(f'build/{name}/rosidl_generator_py/{name}')
             if not (generated / '__init__.py').is_file():
                 continue

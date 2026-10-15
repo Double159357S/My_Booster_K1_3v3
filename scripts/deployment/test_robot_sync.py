@@ -678,6 +678,109 @@ class PostSyncWorkflowTests(unittest.TestCase):
             self.assertNotIn('SHOULD_NOT_RUN', result.stdout)
 
 
+@unittest.skipUnless(os.name == 'posix', 'Shell workflow test needs Linux/WSL')
+class BuildScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'workspace with spaces'
+        scripts = self.root / 'scripts'
+        (scripts / 'deployment').mkdir(parents=True)
+        original = Path(__file__).resolve().parents[1]
+        for name in ('build.sh', 'build_brain.sh', 'build_debug.sh', 'deployment/robot_sync.py'):
+            # Windows checkouts use CRLF; the robot sync normalizes these too.
+            (scripts / name).write_text((original / name).read_text())
+        self.copied = self.root / 'build/brain/ament_cmake_python/brain/brain'
+        self.generated = self.root / 'build/brain/rosidl_generator_py/brain'
+        for path in (self.copied, self.generated):
+            path.mkdir(parents=True)
+            (path / '__init__.py').write_text('# generated\n')
+        (self.copied / 'old-message.so').write_bytes(b'old build artifact')
+        self.tools = Path(self.temp.name) / 'bin'
+        self.tools.mkdir()
+        colcon = self.tools / 'colcon'
+        colcon.write_text('''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+Path('colcon-args.json').write_text(json.dumps(sys.argv[1:]))
+if os.environ.get('TEST_COLCON_FAILURE'):
+    sys.exit(2)
+if os.environ.get('TEST_CREATE_SYMLINK'):
+    root = Path.cwd()
+    sys.exit(subprocess.run(['cmake', '-E', 'create_symlink',
+        str(root / 'build/brain/rosidl_generator_py/brain'),
+        str(root / 'build/brain/ament_cmake_python/brain/brain')]).returncode)
+''')
+        colcon.chmod(0o755)
+        espeak = self.tools / 'espeak'
+        espeak.write_text('#!/bin/bash\nexit 1\n')
+        espeak.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.tools) + os.pathsep + os.environ['PATH'])
+
+    def run_build(self, script='build.sh', *args, **env):
+        return subprocess.run(['bash', str(self.root / 'scripts' / script), *args],
+                              cwd=self.temp.name, env=dict(self.env, **env),
+                              capture_output=True, text=True, timeout=20)
+
+    def test_manual_build_repairs_conflict_with_cached_symlink_mode(self):
+        cache = self.root / 'build/brain/CMakeCache.txt'
+        cache.write_text('AMENT_CMAKE_SYMLINK_INSTALL:BOOL=1\n')
+        source = self.root / 'src/brain/config/config.yaml'
+        installed = self.root / 'install/brain/sentinel'
+        for path in (source, installed):
+            path.parent.mkdir(parents=True)
+            path.write_text('preserve me\n')
+        # Reproduce the same CMake failure before running the fixed entry point.
+        failed = subprocess.run(['cmake', '-E', 'create_symlink', str(self.generated), str(self.copied)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('Is a directory', failed.stderr)
+        result = self.run_build(TEST_CREATE_SYMLINK='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.copied.is_symlink())
+        self.assertEqual(self.copied.resolve(), self.generated)
+        saved = list((self.root / '.robot-sync-backups').glob('*/build-conflicts/build/brain/ament_cmake_python/brain/brain/old-message.so'))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b'old build artifact')
+        for path in (source, installed):
+            self.assertEqual(path.read_text(), 'preserve me\n')
+        self.assertIn('Backed up 1 build conflict(s)', result.stdout)
+        repeated = self.run_build(TEST_CREATE_SYMLINK='1')
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertNotIn('Backed up', repeated.stdout)
+
+    def test_explicit_symlink_build_repairs_conflict_and_preserves_arguments(self):
+        result = self.run_build('build.sh', '--symlink-install', '--packages-select', 'brain',
+                                TEST_CREATE_SYMLINK='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.copied.is_symlink())
+        args = sync.read_json(self.root / 'colcon-args.json')
+        self.assertEqual(args[-3:], ['--symlink-install', '--packages-select', 'brain'])
+
+    def test_copy_build_keeps_existing_module_without_backing_it_up(self):
+        (self.root / 'build/brain/CMakeCache.txt').write_text('AMENT_CMAKE_SYMLINK_INSTALL:BOOL=OFF\n')
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.copied / 'old-message.so').is_file())
+        self.assertFalse((self.root / '.robot-sync-backups').exists())
+
+    def test_all_entry_points_preserve_failure_without_reporting_success(self):
+        for script in ('build.sh', 'build_brain.sh', 'build_debug.sh'):
+            with self.subTest(script=script):
+                result = self.run_build(script, TEST_COLCON_FAILURE='1')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn('Build complete', result.stdout)
+                args = sync.read_json(self.root / 'colcon-args.json')
+                if script == 'build_brain.sh':
+                    self.assertEqual(args[-3:], ['--symlink-install', '--packages-select', 'brain'])
+                elif script == 'build_debug.sh':
+                    self.assertIn('-DCMAKE_BUILD_TYPE=Debug', args)
+                    self.assertIn('-DCMAKE_CXX_FLAGS=-g -fno-omit-frame-pointer', args)
+
+
 class BuildPreparationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -713,6 +816,19 @@ class BuildPreparationTests(unittest.TestCase):
         self.assertEqual(sync.prepare_symlink_build(self.root, 'test-build')['moved'], 0)
         self.assertTrue((copied / 'message.so').is_file())
         self.assertFalse((self.root / '.robot-sync-backups').exists())
+
+    def test_cached_only_prepares_only_packages_with_enabled_cmake_cache(self):
+        for value in (None, 'OFF', '0', '1', 'ON', 'TRUE'):
+            with self.subTest(value=value):
+                name = 'cache_' + str(value).lower()
+                copied, _ = self.module(name)
+                if value is not None:
+                    (self.root / f'build/{name}/CMakeCache.txt').write_text(
+                        f'AMENT_CMAKE_SYMLINK_INSTALL:BOOL={value}\n')
+                result = sync.prepare_symlink_build(self.root, 'cache-' + str(value), cached_only=True)
+                enabled = value in ('1', 'ON', 'TRUE')
+                self.assertEqual(result['moved'], int(enabled))
+                self.assertEqual(copied.exists(), not enabled)
 
     def test_backup_collision_is_rejected_before_any_directory_is_moved(self):
         first, _ = self.module('aaa_interface')

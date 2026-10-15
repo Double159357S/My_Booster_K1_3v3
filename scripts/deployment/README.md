@@ -81,7 +81,7 @@ cd ~/Workspace/K1_5v5_demo_1.7
 
 `4/7` 表示已有 4 个包完成，进度条按包数计算，不代表耗时完成了 4/7。并行输出中的 CMake 百分比无法准确归属某个包，因此不显示混杂的单包百分比。全部成功后显示 `OK`，失败时显示 `FAILED`。完整日志保存在 `.robot-sync/<运行编号>/<机器人IP>.build.log`，每台分别记录。多台同时编译时使用带 IP 的进度行，避免进度条互相覆盖。
 
-如果旧构建的普通目录阻碍创建符号链接（报错 `existing path cannot be removed: Is a directory`），脚本会先把对应的 ROS 消息生成目录备份到 `.robot-sync-backups/<运行编号>/build-conflicts`，再编译。无需手动删除整个 `build` 或 `install`。
+如果旧构建的普通目录阻碍创建符号链接（报错 `existing path cannot be removed: Is a directory`），脚本会先把对应的 ROS 消息生成目录备份到 `.robot-sync-backups/<运行编号>/build-conflicts`，再编译。手动运行 `build.sh`、`build_brain.sh`、`build_debug.sh` 也会执行这一检查；不带 `--symlink-install` 时，仍会处理 CMake 缓存中已开启符号链接安装的包。普通复制安装的包保持原样。无需手动删除整个 `build` 或 `install`。
 
 已明确目标时可以省略地址询问：
 
