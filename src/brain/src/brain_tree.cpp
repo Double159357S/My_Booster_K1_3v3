@@ -24,7 +24,7 @@ constexpr int kVisionKickBadPoseMaxTicks = 3;
 
 double visualKickDecelerateMs(Brain *brain, bool startup, bool goalieKick = false)
 {
-    double value = startup ? (goalieKick ? 80.0 : 160.0) : 140.0;
+    double value = startup ? 40.0 : 140.0;
     const string parameter = startup
         ? (goalieKick ? "strategy.goalie_visual_kick_startup_decelerate_ms"
                      : "strategy.auto_visual_kick.startup_decelerate_ms")
@@ -63,9 +63,9 @@ bool strikerVisualKickAligned(Brain *brain, bool afterDeceleration = false)
     brain->get_parameter("strategy.auto_visual_kick_enable_angle", limits.bearing);
     brain->get_parameter("strategy.auto_visual_kick_max_direction_error", limits.approachError);
     brain->get_parameter("strategy.auto_visual_kick_max_body_error", limits.bodyError);
-    limits.approachError = std::clamp(limits.approachError, 0.05, 0.6);
-    limits.bodyError = std::clamp(limits.bodyError, 0.05, 0.6);
-    // SDK 自己完成最后的脚位对准；球门开口不能变成几度的启动硬门槛。
+    limits.approachError = std::clamp(limits.approachError, 0.05, 1.2);
+    limits.bodyError = std::clamp(limits.bodyError, 0.05, 1.2);
+    // 优先启动 SDK 做剩余调整，允许约 45 度的粗对准误差。
     if (afterDeceleration) limits = kick_strategy::startupAlignmentLimits(limits);
     return kick_strategy::alignedForKick(brain->data->ball.posToRobot.x,
         brain->data->ball.posToRobot.y, brain->data->robotPoseToField.theta,
@@ -1543,7 +1543,7 @@ NodeStatus Adjust::tick()
     brain->get_parameter(brain->tree->getEntry<string>("player_role") == "goal_keeper"
         ? "strategy.goalie_visual_kick_max_direction_error"
         : "strategy.auto_visual_kick_max_direction_error", directionTolerance);
-    directionTolerance = std::clamp(directionTolerance, 0.02, 0.6);
+    directionTolerance = std::clamp(directionTolerance, 0.02, 1.2);
     // 路线进入允许误差后，停止绕球，只完成身体转向。继续横移会把已经
     // 对准的路线再次推偏，尤其是守门员门前清球时。
     const auto adjustment = kick_strategy::adjustmentVelocity(
@@ -1697,12 +1697,6 @@ NodeStatus StrikerDecide::tick() {
 
     bool enableAutoVisualKick = false;
     brain->get_parameter("strategy.enable_auto_visual_kick", enableAutoVisualKick);
-    double autoVisualKickEnableDistMin = 0.05;
-    double autoVisualKickEnableDistMax = 1.4;
-    double autoVisualKickEnableAngle = 0.35;
-    brain->get_parameter("strategy.auto_visual_kick_enable_dist_min", autoVisualKickEnableDistMin);
-    brain->get_parameter("strategy.auto_visual_kick_enable_dist_max", autoVisualKickEnableDistMax);
-    brain->get_parameter("strategy.auto_visual_kick_enable_angle", autoVisualKickEnableAngle);
 
     const bool kickoffPhase = kickoffTacticalPhase(brain);
     const bool kickoffBallKnown =
@@ -1818,11 +1812,10 @@ NodeStatus StrikerDecide::tick() {
 
     string newDecision;
     auto color = 0xFFFFFFFF; // for log
-    const bool nearBallVisualKick =
+    const bool priorityVisualKick =
         enableAutoVisualKick &&
         !brain->tree->getEntry<bool>("ball_out") &&
-        visualKickDirectionReady &&
-        visualKickNearRealBall(brain);
+        visualKickDirectionReady;
 
     if (!brain->data->tmImLead)
     {
@@ -1834,12 +1827,13 @@ NodeStatus StrikerDecide::tick() {
         newDecision = "chase"; // 先用共享位置找回真实球，再允许调整和踢球
         color = 0x0000FFFF;
     }
-    else if (nearBallVisualKick)
+    else if (priorityVisualKick)
     {
-        // Near-ball urgency never bypasses the shared ownership grant.
+        // 本机真球在接管范围内且粗对准后立即优先踢球；球权已在上方检查。
+        // 不再等待成本、场地区域、强力趟球选择或绕球阶段完成。
         newDecision = visualKickStartReady ? "auto_visual_kick" : "kick_wait";
         color = 0xFF00FFFF;
-        log(format("near-ball visual kick: range=%.2f", ballRange));
+        log(format("priority visual kick: range=%.2f", ballRange));
     }
     else if (kickoffHold)
     {
@@ -1849,25 +1843,6 @@ NodeStatus StrikerDecide::tick() {
         log(format(
             "kickoff stand: groupRank=%d ballHalf=%s",
             kickoffRank, ballInOpponentHalf ? "opponent" : "own"));
-    }
-    else if (
-        enableAutoVisualKick &&
-        brain->data->tmImLead &&
-        !brain->tree->getEntry<bool>("ball_out") &&
-        !brain->data->lose_ball &&
-        !powerShootPossible &&
-        brain->data->tmMyCost < 7.0 &&
-        ballRange < autoVisualKickEnableDistMax &&
-        ballRange > autoVisualKickEnableDistMin &&
-        fabs(ballYaw) < autoVisualKickEnableAngle &&
-        visualKickDirectionReady &&
-        ball.posToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
-        fabs(ball.posToField.y) < 5.0 &&
-        brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
-        fabs(brain->data->robotPoseToField.y) < 5.0
-    ) {
-        newDecision = visualKickStartReady ? "auto_visual_kick" : "kick_wait";
-        color = 0xFF00FFFF;
     }
     else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
     {
@@ -2061,7 +2036,7 @@ NodeStatus Analyze2::tick()
 
     const auto source = getGoalieBallSource(brain);
     const auto target = getGoaliePredictTarget(brain, source);
-    double cooldownMs = 600.0;
+    double cooldownMs = 200.0;
     double maxRange = 1.2;
     double maxDirectionError = 0.55;
     brain->get_parameter("strategy.goalie_visual_kick_cooldown_ms", cooldownMs);

@@ -20,28 +20,30 @@ int main() {
     AlignmentLimits limits;
     ok &= check("aligned close ball", alignedForKick(0.6, 0.0, 0.0, 0.0, limits));
     ok &= check("far ball requires chase", !alignedForKick(1.6, 0.0, 0.0, 0.0, limits));
-    ok &= check("side ball requires alignment", !alignedForKick(0.6, 0.4, 0.0, 0.0, limits));
-    ok &= check("approach line misses target", !alignedForKick(0.6, 0.2, 0.0, 0.0, limits));
+    ok &= check("moderate side offset goes directly to SDK", alignedForKick(0.6, 0.4, 0.0, 0.0, limits));
+    ok &= check("moderate approach error goes directly to SDK", alignedForKick(0.6, 0.2, 0.0, 0.0, limits));
+    ok &= check("side ball still requires turning", !alignedForKick(0.3, 0.6, 0.0, 0.0, limits));
+    ok &= check("wrong-side route still requires orbit", !alignedForKick(0.6, 0.0, 0.0, 1.2, limits));
     ok &= check("behind body", !alignedForKick(-0.6, 0.0, 0.0, 0.0, limits));
     ok &= check("body false detection", !alignedForKick(0.02, 0.0, 0.0, 0.0, limits));
     ok &= check("invalid ball", !alignedForKick(
         std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.0, limits));
     limits.bearing = 1.0;
     ok &= check("good approach alone is insufficient", !alignedForKick(
-        0.6 * std::cos(0.6), -0.6 * std::sin(0.6), 0.6, 0.0, limits));
-    limits.bearing = 0.35;
+        0.6 * std::cos(0.9), -0.6 * std::sin(0.9), 0.9, 0.0, limits));
+    limits.bearing = 0.75;
     ok &= check("heading wrap", alignedForKick(0.6, 0.0,
         kick_geometry::kPi - 0.05, -kick_geometry::kPi + 0.05, limits));
 
     ok &= check("SDK can handle remaining small aiming error",
         alignedForKick(0.4, 0.0, 0.15, 0.0, limits));
     ok &= check("entry threshold still rejects body misalignment",
-        !alignedForKick(0.4, 0.0, 0.27, 0.0, limits));
+        !alignedForKick(0.4, 0.0, 0.82, 0.0, limits));
     const auto starting = startupAlignmentLimits(limits);
     ok &= check("small settling change does not cancel SDK start",
-        alignedForKick(0.4, 0.0, 0.27, 0.0, starting));
+        alignedForKick(0.4, 0.0, 0.82, 0.0, starting));
     ok &= check("large settling change cancels SDK start",
-        !alignedForKick(0.4, 0.0, 0.6, 0.0, starting));
+        !alignedForKick(0.4, 0.0, 1.2, 0.0, starting));
 
     ok &= check("active SDK keeps its slot during foot alignment and missed frames",
         keepVisualKickSession(true, true, true, false));

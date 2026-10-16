@@ -47,8 +47,8 @@ brain_node:
       enable_bypass: false 
       enable_shoot: false 
       enable_directional_kick: false 
-      goalie_visual_kick_cooldown_ms: 600.0
-      goalie_visual_kick_startup_decelerate_ms: 80.0 # 本机确认并对准后，短暂站稳即可接管清球
+      goalie_visual_kick_cooldown_ms: 200.0
+      goalie_visual_kick_startup_decelerate_ms: 40.0 # 本机确认后尽早交给视觉踢球清球
       goalie_clearance_max_ball_range: 2.2 # 门前球在此距离内可申请控球并主动接近(m)
       goalie_clearance_area_margin: 0.3 # 清球范围为己方禁区，向前和两侧增加此余量(m)
       goalie_visual_kick_max_ball_range: 1.2 # 更远先普通追球，靠近后再启动视觉踢球
@@ -81,18 +81,18 @@ brain_node:
       enable_auto_visual_kick: true
       auto_visual_kick_enable_dist_min: 0.05 # 避免将本体的部分识别为球
       auto_visual_kick_enable_dist_max: 1.4 # 更远的球先追近，避免远距离直接接管踢球
-      auto_visual_kick_enable_angle: 0.35
-      auto_visual_kick_max_direction_error: 0.25 # 启动前先对准大方向，最后脚位由视觉踢球处理
-      auto_visual_kick_max_body_error: 0.25 # 身体朝向也必须对准，不能只检查球所在方向
+      auto_visual_kick_enable_angle: 0.75 # 球在前方约 ±43 度内即可接管
+      auto_visual_kick_max_direction_error: 0.8 # 路线只需粗对准约 ±46 度，优先启动踢球
+      auto_visual_kick_max_body_error: 0.8 # 身体剩余朝向调整交给视觉踢球
       kick_approach:
         reposition_enter_angle: 0.65 # 近球但线路误差大于此值时先绕到球后，弧度
         reposition_exit_angle: 0.35  # 绕球误差降到此值后交给精调；与进入门槛形成滞回
         orbit_distance: 0.55        # 大范围绕球时保留的球距，太近时先退开，米
         orbit_speed: 0.45           # 大范围绕球平移速度上限，米/秒
       auto_visual_kick:
-        cooldown_ms: 600.0 # 退出后短暂稳步，避免无进展时每帧重新启动 SDK
+        cooldown_ms: 200.0 # 缩短再次出脚间隔，仍避免每帧重启 SDK
         start_ack_timeout_ms: 1200.0 # 等待运控接受启动请求，超时退出并重试
-        start_retry_ms: 1000.0 # 启动拒绝/超时后的重试间隔
+        start_retry_ms: 300.0 # 启动拒绝/超时后尽快重试
         real_ball_hold_ms: 1000.0
         current_real_ball_max_age_ms: 650.0 # 允许脚边真实球短暂漏检，不要求每帧都有检测
         near_ball_memory_reject_range: 0.8
@@ -100,7 +100,7 @@ brain_node:
         allow_memory_kick_msg: true
         kick_msg_real_ball_max_age_ms: 650.0 # 与启动检查共用球源有效期
         no_detection_kick_msg_reject_range: 0.8
-        startup_decelerate_ms: 160.0
+        startup_decelerate_ms: 40.0 # 缩短决策选中踢球到发送 SDK 请求的等待
         exit_decelerate_ms: 140.0
         max_parallel_count: 1
         yield_my_cost_min: 4.0

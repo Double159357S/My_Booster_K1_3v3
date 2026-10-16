@@ -131,8 +131,8 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("strategy.enable_shoot", false);
     declare_parameter<bool>("strategy.enable_directional_kick", false);
 
-    declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 600.0);
-    declare_parameter<double>("strategy.goalie_visual_kick_startup_decelerate_ms", 80.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_cooldown_ms", 200.0);
+    declare_parameter<double>("strategy.goalie_visual_kick_startup_decelerate_ms", 40.0);
     declare_parameter<double>("strategy.goalie_clearance_max_ball_range", 2.2);
     declare_parameter<double>("strategy.goalie_clearance_area_margin", 0.3);
     declare_parameter<double>("strategy.goalie_visual_kick_max_ball_range", 1.2);
@@ -151,20 +151,20 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("strategy.enable_auto_visual_kick", false);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.05);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 1.4);
-    declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.35);
-    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.25);
-    declare_parameter<double>("strategy.auto_visual_kick_max_body_error", 0.25);
+    declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.75);
+    declare_parameter<double>("strategy.auto_visual_kick_max_direction_error", 0.8);
+    declare_parameter<double>("strategy.auto_visual_kick_max_body_error", 0.8);
     declare_parameter<double>("strategy.auto_visual_kick.real_ball_hold_ms", 1000.0);
-    declare_parameter<double>("strategy.auto_visual_kick.cooldown_ms", 600.0);
+    declare_parameter<double>("strategy.auto_visual_kick.cooldown_ms", 200.0);
     declare_parameter<double>("strategy.auto_visual_kick.start_ack_timeout_ms", 1200.0);
-    declare_parameter<double>("strategy.auto_visual_kick.start_retry_ms", 1000.0);
+    declare_parameter<double>("strategy.auto_visual_kick.start_retry_ms", 300.0);
     declare_parameter<double>("strategy.auto_visual_kick.current_real_ball_max_age_ms", 650.0);
     declare_parameter<double>("strategy.auto_visual_kick.near_ball_memory_reject_range", 0.8);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_predicted_kick_msg", true);
     declare_parameter<bool>("strategy.auto_visual_kick.allow_memory_kick_msg", true);
     declare_parameter<double>("strategy.auto_visual_kick.kick_msg_real_ball_max_age_ms", 650.0);
     declare_parameter<double>("strategy.auto_visual_kick.no_detection_kick_msg_reject_range", 0.8);
-    declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 160.0);
+    declare_parameter<double>("strategy.auto_visual_kick.startup_decelerate_ms", 40.0);
     declare_parameter<double>("strategy.auto_visual_kick.exit_decelerate_ms", 140.0);
     declare_parameter<int>("strategy.auto_visual_kick.max_parallel_count", 1);
     declare_parameter<double>("strategy.auto_visual_kick.yield_my_cost_min", 4.0);

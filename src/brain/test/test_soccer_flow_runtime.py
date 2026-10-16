@@ -1,5 +1,6 @@
 """Execute production search/decision/SDK request functions with offline boundaries."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,32 @@ def block(source, signature):
             if depth == 0:
                 return source[start:token.end()]
     raise ValueError(f"Unterminated C++ block: {signature}")
+
+
+def match_kick_parameters(config):
+    """Read numeric kick settings from the shipped, mapping-only ROS YAML."""
+    parents = []
+    parameters = {}
+    for line in config.splitlines():
+        content = line.split("#", 1)[0].strip()
+        if not content or ":" not in content:
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, value = (part.strip() for part in content.split(":", 1))
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        if not value:
+            parents.append((indent, key))
+            continue
+        path = ".".join([name for _, name in parents][2:] + [key])
+        if path != "strategy.enable_auto_visual_kick" and not path.startswith(
+                ("strategy.auto_visual_kick", "strategy.goalie_visual_kick")):
+            continue
+        parameters[path] = float({"true": "1", "false": "0"}.get(value, value))
+    if not parameters:
+        raise ValueError("No match kick settings found")
+    return ",\n".join("{" + json.dumps(key) + ", " + str(value) + "}"
+                       for key, value in parameters.items())
 
 
 def main():
@@ -50,6 +77,8 @@ def main():
     fixture = fixture.replace("// CLIENT_DECLARATION", block(client_header, "class RobotClient\n").replace("private:", "public:") + ";")
     fixture = fixture.replace("// TREE_DECLARATIONS", declarations)
     fixture = fixture.replace("// PRODUCTION_FUNCTIONS", block(tree, "namespace\n{") + "\n" + methods + "\n" + rpc)
+    fixture = fixture.replace("// MATCH_KICK_PARAMETERS", match_kick_parameters(
+        (brain / "config/config.yaml").read_text(encoding="utf-8")))
     with tempfile.TemporaryDirectory(prefix="k1-soccer-flow-") as directory:
         source = Path(directory) / "soccer_flow.cpp"
         source.write_text(fixture, encoding="utf-8")

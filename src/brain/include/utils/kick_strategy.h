@@ -10,9 +10,9 @@ namespace kick_strategy {
 struct AlignmentLimits {
     double minRange = 0.05;
     double maxRange = 1.4;
-    double bearing = 0.35;
-    double approachError = 0.25;
-    double bodyError = 0.25;
+    double bearing = 0.75;
+    double approachError = 0.8;
+    double bodyError = 0.8;
 };
 
 enum class BallSource { none, real, recentReal, predicted, memory };
@@ -54,7 +54,7 @@ inline bool isRecentReal(BallSource source) {
     return source == BallSource::real || source == BallSource::recentReal;
 }
 
-// 同时检查机器人到球的路线和身体朝向，球在侧面时不能直接启动踢球。
+// 只做粗对准检查，尽早交给视觉踢球完成剩余调整；侧后方球仍需先转身。
 inline bool alignedForKick(double ballX, double ballY, double robotHeading,
                            double kickDirection, const AlignmentLimits &limits) {
     if (!std::isfinite(ballX) || !std::isfinite(ballY) ||

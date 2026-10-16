@@ -179,6 +179,8 @@ public:
     bool blockAllDirections = false;
     int blockedOrbitSide = 0;
     kick_strategy::BallSource source = kick_strategy::BallSource::real;
+    // Explicit legacy tuning keeps the precise-alignment and fallback tests
+    // useful. fastKickFlow below exercises the actual shipped match settings.
     map<string, double> parameters{
         {"strategy.enable_auto_visual_kick", 1}, {"strategy.auto_visual_kick_enable_dist_min", 0.05},
         {"strategy.auto_visual_kick_enable_dist_max", 1.4}, {"strategy.auto_visual_kick_enable_angle", 0.35},
@@ -295,6 +297,122 @@ void runChase(Brain &b, Chase &chase, const string &decision) {
     b.tree->setEntry("decision", decision);
     chase.strings["mode"] = decision;
     chase.tick();
+}
+
+void useMatchKickParameters(Brain &b) {
+    const map<string, double> settings{
+        // MATCH_KICK_PARAMETERS
+    };
+    for (const auto &[key, value] : settings) b.parameters[key] = value;
+}
+
+void fastKickFlow() {
+    // Both bearings and route/body errors exceed the former entry thresholds.
+    // An existing orbit must yield to a kick on the very first decision tick.
+    for (double sign : {-1.0, 1.0}) {
+        Brain quick; useMatchKickParameters(quick);
+        quick.angleGood = false;
+        localBall(quick, 0.7, sign * 0.5, sign * 0.2);
+        StrikerDecide decide("decide", {}, &quick);
+        check(runDecision(quick, decide, "reposition") == "auto_visual_kick",
+              "moderate alignment error still waits for orbit/fine adjustment");
+        RLVisionKick action("visual", {}, &quick);
+        const double detectedAt = quick.clock.time.ms;
+        check(action.onStart() == NodeStatus::RUNNING, "priority decision rejected by action entry");
+        advanceClock(quick, 30); action.onRunning();
+        check(quick.client->publisher->sent.empty(), "startup skipped configured settling interval");
+        advanceClock(quick, 10); action.onRunning();
+        check(quick.client->visualKickStartState() == kick_strategy::StartState::pending &&
+              quick.clock.time.ms - detectedAt <= 40,
+              "match kick request takes longer than 40 ms after decision");
+        action.onRunning();
+        check(quick.client->publisher->sent.size() == 1, "pending start is sent repeatedly");
+        respond(quick, sentStart(quick), "{\"status\":0}"); action.onRunning();
+        action.onHalted();
+        advanceClock(quick, 199);
+        check(runDecision(quick, decide, "adjust") == "kick_wait", "cooldown is bypassed");
+        advanceClock(quick, 1);
+        check(runDecision(quick, decide, "adjust") == "auto_visual_kick",
+              "match kick still waits the old 600 ms cooldown");
+    }
+
+    Brain direction; useMatchKickParameters(direction); direction.angleGood = false;
+    localBall(direction, 0.8, 0.0, 0.75);
+    StrikerDecide direct("decide", {}, &direction);
+    check(runDecision(direction, direct, "reposition") == "auto_visual_kick",
+          "route/body tolerance is still capped below the configured fast threshold");
+    localBall(direction, 0.4, 0.2, 0.7);
+    Adjust remainingTurn("adjust", {}, &direction); remainingTurn.numbers["range"] = 0.4;
+    remainingTurn.tick();
+    check(direction.client->command.x == 0.0 && direction.client->command.y == 0.0 &&
+          direction.client->command.yaw > 0.0,
+          "accepted approach line keeps orbiting while correcting the remaining body error");
+
+    // These are valid in-field positions that the old adult-field constants
+    // rejected. Ownership already accounts for cost; do not check it again.
+    for (const Point pose : {Point{-10.0, 0.0, 0.0}, Point{0.0, 5.5, 0.0}}) {
+        Brain field; useMatchKickParameters(field);
+        field.config->fieldDimensions.length = 22;
+        field.config->fieldDimensions.width = 14;
+        field.data->robotPoseToField = {pose.x, pose.y, 0.0};
+        field.data->tmMyCost = 20;
+        localBall(field, 1.3, 0.0, 0.0);
+        StrikerDecide decide("decide", {}, &field);
+        check(runDecision(field, decide, "chase") == "auto_visual_kick",
+              "cost or field-region heuristic blocks an owned kickable ball");
+        // Configured larger power-kick box must not displace visual kick.
+        field.parameters["strategy.power_shoot.enable"] = 1;
+        field.parameters["strategy.power_shoot.xmax"] = 1.5;
+        field.parameters["strategy.power_shoot.ymin"] = -0.3;
+        field.parameters["strategy.power_shoot.ymax"] = 0.3;
+        check(runDecision(field, decide, "chase") == "auto_visual_kick",
+              "power-kick possibility prevents immediate SDK handoff");
+        field.data->tmImLead = false;
+        check(runDecision(field, decide, "chase") == "assist", "fast kick bypasses ownership");
+        field.data->tmImLead = true; field.data->ballFromTeammate = true;
+        check(runDecision(field, decide, "chase") == "chase", "fast kick trusts a shared-only ball");
+    }
+
+    Brain guards; useMatchKickParameters(guards); guards.angleGood = false;
+    StrikerDecide guard("decide", {}, &guards);
+    localBall(guards, 1.6, 0.0, 0.0);
+    check(runDecision(guards, guard, "chase") == "chase", "far ball bypasses approach");
+    localBall(guards, 0.6, 0.0, 1.3);
+    check(runDecision(guards, guard, "adjust") == "reposition", "wrong-side ball bypasses orbit");
+    localBall(guards, 0.6, 1.0, 0.0);
+    check(runDecision(guards, guard, "adjust") != "auto_visual_kick", "side ball bypasses turning");
+    localBall(guards, 0.7, 0.5, 0.2);
+    guards.blocked = true;
+    check(runDecision(guards, guard, "adjust") == "kick_wait", "fast kick bypasses teammate clearance");
+    guards.blocked = false;
+    for (const auto source : {kick_strategy::BallSource::none, kick_strategy::BallSource::memory,
+                              kick_strategy::BallSource::predicted}) {
+        guards.source = source;
+        check(runDecision(guards, guard, "adjust") != "auto_visual_kick", "stale/predicted ball starts fast kick");
+        RLVisionKick action("visual", {}, &guards);
+        check(action.onStart() == NodeStatus::SUCCESS && guards.client->publisher->sent.empty(),
+              "action starts a kick with no recent real ball");
+    }
+
+    Brain rejected; useMatchKickParameters(rejected);
+    RLVisionKick retryAction("visual", {}, &rejected); request(rejected, retryAction);
+    respond(rejected, sentStart(rejected), "{\"status\":9}"); retryAction.onRunning();
+    advanceClock(rejected, 140);
+    check(retryAction.onRunning() == NodeStatus::SUCCESS && cancelled(rejected), "rejection does not exit");
+    StrikerDecide retry("decide", {}, &rejected);
+    advanceClock(rejected, 159);
+    check(runDecision(rejected, retry, "adjust") == "kick_wait", "failed start skips retry interval");
+    advanceClock(rejected, 1);
+    check(runDecision(rejected, retry, "adjust") == "auto_visual_kick", "retry still waits the old 1000 ms");
+
+    Brain goalie; useMatchKickParameters(goalie);
+    goalie.tree->setEntry("goalie_mode", string("block_kick"));
+    RLVisionKick clearance("visual", {}, &goalie); clearance.onStart();
+    advanceClock(goalie, 40); clearance.onRunning();
+    check(goalie.client->visualKickStartState() == kick_strategy::StartState::pending,
+          "goalie still waits the old 80 ms startup delay");
+    clearance.onHalted();
+    cout << "Fast match kick: first-tick priority, 40 ms request, 200 ms cooldown, 300 ms retry, guards passed\n";
 }
 
 void approachHandoffFlow() {
@@ -622,6 +740,7 @@ void sharedRecoveryFlow() {
 
 int main() {
     try {
+        fastKickFlow();
         sharedRecoveryFlow();
         approachBoundaryFlow();
         approachHandoffFlow();
