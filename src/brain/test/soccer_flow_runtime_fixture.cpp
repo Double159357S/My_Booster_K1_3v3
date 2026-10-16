@@ -206,6 +206,7 @@ public:
     }
     template<class T> void get_parameter(const string &key, T &value) const { value = static_cast<T>(get_parameter(key).value); }
     auto getKickBallSource() const { return source; }
+    void updateKickoffMemory();
     bool teammateBlocksKick() const { return blocked; }
     double teammateDistance() const { return blocked ? 0.4 : 100.0; }
     bool isAngleGood(double, const string &) const { return angleGood; }
@@ -738,8 +739,74 @@ void sharedRecoveryFlow() {
           "fresh local detection fails to end shared search and resume real-ball tracking/kicking");
 }
 
+void kickoffFlow() {
+    Brain b;
+    b.tree->setEntry<int>("gc_protocol_version", 20);
+    b.tree->setEntry<int>("gc_secondary_time", 600);
+    b.tree->setEntry<string>("gc_game_sub_state_type", "NONE");
+    b.tree->setEntry<string>("gc_game_sub_state", "PLAY");
+    b.tree->setEntry<string>("gc_game_state", "SET");
+    b.tree->setEntry<bool>("gc_is_kickoff_side", false);
+    b.updateKickoffMemory();
+    check(b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "opponent kickoff must wait");
+    // Referee corrects the kickoff team after SET, or awards the next kickoff to us.
+    b.tree->setEntry<bool>("gc_is_kickoff_side", true);
+    b.tree->setEntry<string>("gc_game_state", "PLAY");
+    b.updateKickoffMemory();
+    check(!b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "our kickoff retained opponent wait");
+
+    b.tree->setEntry<bool>("gc_is_kickoff_side", false);
+    b.tree->setEntry<string>("gc_game_state", "SET");
+    b.updateKickoffMemory();
+    b.tree->setEntry<string>("gc_game_state", "PLAY");
+    b.data->ball.posToRobot.x += 0.5;
+    b.updateKickoffMemory();
+    check(b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "v20 opponent kickoff released before Ball Free");
+    b.tree->setEntry<int>("gc_secondary_time", 0);
+    b.updateKickoffMemory();
+    check(!b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "Ball Free did not release opponent wait");
+
+    for (int protocol : {12, 20}) {
+        b.tree->setEntry<int>("gc_protocol_version", protocol);
+        b.tree->setEntry<int>("gc_set_play", protocol == 20 ? 1 : 0);
+        b.tree->setEntry<string>("gc_game_sub_state_type", "FREE_KICK");
+        b.tree->setEntry<string>("gc_game_sub_state", "SET");
+        b.tree->setEntry<bool>("gc_is_kickoff_side", true);
+        b.tree->setEntry<bool>("gc_is_sub_state_kickoff_side", false);
+        b.updateKickoffMemory();
+        check(b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "opponent set play ignored its own kickoff side");
+        b.tree->setEntry<bool>("gc_is_sub_state_kickoff_side", true);
+        b.updateKickoffMemory();
+        check(!b.tree->getEntry<bool>("wait_for_opponent_kickoff"), "our set play retained opponent wait");
+    }
+    b.tree->setEntry<int>("gc_set_play", 0);
+    b.tree->setEntry<string>("gc_game_sub_state_type", "NONE");
+    b.tree->setEntry<string>("gc_game_sub_state", "PLAY");
+    b.tree->setEntry<bool>("gc_is_kickoff_side", true);
+    b.updateKickoffMemory();
+
+    // A 5v5 owner may have a different latched half-field rank after ball movement/handoff.
+    b.config->numOfPlayers = 5;
+    b.data->isKickingOff = true;
+    b.data->kickoffStrikerGroupLatched = true;
+    b.data->kickoffStrikerGroupRank = 2;
+    b.data->ball.posToField.x = 0.5;
+    b.data->ball.posToRobot.x = 2.0;
+    b.data->ball.range = 2.0;
+    StrikerDecide owner("decide", {}, &b);
+    owner.tick();
+    check(owner.strings["decision_out"] == "chase", "kickoff owner is parked by half-field group");
+    b.data->tmImLead = false;
+    owner.tick();
+    check(owner.strings["decision_out"] == "kickoff_hold", "non-owner must retain kickoff formation");
+    b.config->numOfPlayers = 3;
+    owner.tick();
+    check(owner.strings["decision_out"] == "assist", "3v3 must use support instead of 5v5 hold");
+}
+
 int main() {
     try {
+        kickoffFlow();
         fastKickFlow();
         sharedRecoveryFlow();
         approachBoundaryFlow();

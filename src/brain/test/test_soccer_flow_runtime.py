@@ -55,6 +55,7 @@ def main():
     args = parser.parse_args()
     brain = Path(__file__).resolve().parents[1]
     tree = (brain / "src/brain_tree.cpp").read_text(encoding="utf-8")
+    brain_source = (brain / "src/brain.cpp").read_text(encoding="utf-8")
     headers = (brain / "include/brain_tree.h").read_text(encoding="utf-8")
     client = (brain / "src/robot_client.cpp").read_text(encoding="utf-8")
     client_header = (brain / "include/robot_client.h").read_text(encoding="utf-8")
@@ -76,7 +77,7 @@ def main():
     fixture = Path(__file__).with_name("soccer_flow_runtime_fixture.cpp").read_text(encoding="utf-8")
     fixture = fixture.replace("// CLIENT_DECLARATION", block(client_header, "class RobotClient\n").replace("private:", "public:") + ";")
     fixture = fixture.replace("// TREE_DECLARATIONS", declarations)
-    fixture = fixture.replace("// PRODUCTION_FUNCTIONS", block(tree, "namespace\n{") + "\n" + methods + "\n" + rpc)
+    fixture = fixture.replace("// PRODUCTION_FUNCTIONS", block(tree, "namespace\n{") + "\n" + methods + "\n" + rpc + "\n" + block(brain_source, "void Brain::updateKickoffMemory()"))
     fixture = fixture.replace("// MATCH_KICK_PARAMETERS", match_kick_parameters(
         (brain / "config/config.yaml").read_text(encoding="utf-8")))
     with tempfile.TemporaryDirectory(prefix="k1-soccer-flow-") as directory:

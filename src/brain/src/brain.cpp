@@ -1467,8 +1467,17 @@ void Brain::updateKickoffMemory() {
         tree->getEntry<int>("gc_protocol_version") >= 20
         && !opponentSetPlay
         && opponentSetPlayLatched;
+    const bool setPlayActive = tree->getEntry<int>("gc_set_play") != 0 ||
+        tree->getEntry<string>("gc_game_sub_state_type") == "FREE_KICK";
+    const bool ourRestart = setPlayActive
+        ? tree->getEntry<bool>("gc_is_sub_state_kickoff_side")
+        : tree->getEntry<bool>("gc_is_kickoff_side");
 
-    if (isV20OpponentSetPlayFinished) {
+    if (ourRestart) {
+        // 开球方更正或进入下一轮我方开球时，不能保留上一轮对方的等待锁存。
+        tree->setEntry<bool>("wait_for_opponent_kickoff", false);
+        waitingForOpponentPrimaryKickoff = false;
+    } else if (isV20OpponentSetPlayFinished) {
         // 新版裁判机用 set_play 从非 0 变为 0 表示定位球结束，即 Ball Free。
         tree->setEntry<bool>("wait_for_opponent_kickoff", false);
         waitingForOpponentPrimaryKickoff = false;

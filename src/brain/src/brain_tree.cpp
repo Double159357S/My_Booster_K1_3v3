@@ -1709,7 +1709,9 @@ NodeStatus StrikerDecide::tick() {
         (assignedOpponentHalf == ballInOpponentHalf);
     // The four-striker half-field groups belong to 5v5. In 3v3 the non-owner
     // supports the owner instead of putting both strikers in the same group.
-    const bool kickoffHold = kickoffPhase && brain->config->numOfPlayers > 3 && !kickoffAttack;
+    // 球移动或球权交接后，主控可能不属于锁存的半场组；不能让唯一上球者待命。
+    const bool kickoffHold = kickoffPhase && brain->config->numOfPlayers > 3 &&
+        !kickoffAttack && !brain->data->tmImLead;
 
     // No strategy calculation below may consume a placeholder ball. During a
     // kickoff we can still choose the latched stand group without a live ball.
